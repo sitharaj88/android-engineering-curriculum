@@ -174,7 +174,7 @@ const config: Config = {
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
-      additionalLanguages: ['bash', 'json', 'kotlin', 'java', 'groovy', 'gradle', 'xml', 'yaml', 'sql'],
+      additionalLanguages: ['bash', 'json', 'kotlin', 'java', 'groovy', 'markup', 'yaml', 'sql', 'toml', 'properties', 'diff'],
     },
     tableOfContents: {
       minHeadingLevel: 2,
