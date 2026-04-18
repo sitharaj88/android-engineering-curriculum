@@ -1,0 +1,269 @@
+---
+id: overview
+title: Module 10 — Performance Optimization
+sidebar_label: Overview
+description: Memory management, LeakCanary, layout performance, app startup, R8/ProGuard, APK shrinking, baseline profiles.
+---
+
+import { Callout, StepList, FeatureGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 10 of 13</span>
+  <span><strong>Duration:</strong> 2 weeks</span>
+  <span><strong>Topics:</strong> 2 · 4 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 01–09</span>
+</div>
+
+# Performance Optimization
+
+A slow app feels broken. A janky scroll feels broken. A 2-second startup
+feels broken. This module teaches you to **measure first**, then optimize
+the things that matter — using the same tools the Android team uses
+internally.
+
+<Callout kind="tip" title="Measure, don't guess">
+The biggest performance mistake is optimizing without data. Always **profile
+first** — Android Studio's profilers, perfetto traces, and Macrobenchmark
+will tell you exactly where the time goes. Premature optimization is still
+the root of all evil.
+</Callout>
+
+## Topic 1 · Profiling
+
+### Memory management & LeakCanary
+
+The JVM garbage collector frees objects no longer reachable. **A leak occurs
+when something keeps a reference longer than it should** — preventing GC.
+Common culprits on Android:
+
+- Inner classes / lambdas holding the outer Activity
+- Static references to Context
+- Listeners not unregistered
+- Coroutines launched on the wrong scope
+
+**LeakCanary** catches leaks automatically in debug builds:
+
+```kotlin
+// app/build.gradle.kts
+debugImplementation("com.squareup.leakcanary:leakcanary-android:2.14")
+```
+
+When LeakCanary detects a leaked Activity/Fragment/View, it dumps the heap,
+shows the **leak trace**, and points at the exact reference holding the
+object. Fix leaks immediately — they compound and cause OOM crashes in the
+wild.
+
+### Layout performance
+
+In Compose, the main perf risks are:
+
+- **Excessive recomposition** — composables recomposing when nothing visible changed
+- **Lazy lists without keys** — items recompose on reorder
+- **Heavy work in composition** — read DB, do network, parse JSON in a `@Composable`
+
+```kotlin
+// BAD — recomposes on EVERY parent recomposition because mutableListOf creates a new list
+@Composable
+fun BadList() {
+    val items = mutableListOf(1, 2, 3)              // ← new instance every recomposition
+    LazyColumn { items(items) { Text("$it") } }
+}
+
+// GOOD — remember keeps the same instance, with a stable key
+@Composable
+fun GoodList() {
+    val items = remember { listOf(1, 2, 3) }
+    LazyColumn { items(items, key = { it }) { Text("$it") } }
+}
+```
+
+Enable **Layout Inspector → Recomposition counts** in Android Studio to spot
+hot composables.
+
+For XML layouts: prefer **ConstraintLayout** (flat hierarchies), avoid
+nested `RelativeLayout`/`LinearLayout`, and watch the **GPU profiler** for
+overdraw.
+
+### App startup optimization
+
+Startup has three phases the platform measures:
+
+| Phase                       | What happens                                |
+|-----------------------------|---------------------------------------------|
+| **Cold start**              | Process create, Application.onCreate, first frame |
+| **Warm start**              | Activity recreated, no process create       |
+| **Hot start**               | Activity already in memory, brought to front |
+
+To improve cold start:
+
+- **Defer initialization** with **App Startup library** instead of running everything in `Application.onCreate`.
+- Avoid heavy DI graph eager init (Hilt is already lazy).
+- Use **SplashScreen API** (Android 12+) — the system shows the splash for free.
+- Move first-frame work to **Compose's `LaunchedEffect`** so it doesn't block layout.
+
+```kotlin
+// App Startup — declarative, lazy initialization
+class AnalyticsInitializer : Initializer<AnalyticsClient> {
+    override fun create(ctx: Context): AnalyticsClient = AnalyticsClient(ctx)
+    override fun dependencies() = emptyList<Class<out Initializer<*>>>()
+}
+```
+
+```xml
+<!-- AndroidManifest.xml -->
+<provider
+    android:name="androidx.startup.InitializationProvider"
+    android:authorities="${applicationId}.androidx-startup"
+    android:exported="false"
+    tools:node="merge">
+    <meta-data
+        android:name="com.example.AnalyticsInitializer"
+        android:value="androidx.startup" />
+</provider>
+```
+
+---
+
+## Topic 2 · Optimization
+
+### R8 / ProGuard — code shrinking, obfuscation, optimization
+
+R8 (Google's replacement for ProGuard) does three things at release build:
+
+1. **Shrinking** — removes unused classes, methods, fields.
+2. **Optimization** — inlines methods, removes dead code, unboxes primitives.
+3. **Obfuscation** — renames classes/methods to short names (a, b, c) to shrink and obscure.
+
+```kotlin
+// app/build.gradle.kts
+android {
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+}
+```
+
+You'll need **keep rules** for code accessed via reflection (e.g., Retrofit
+interfaces, Moshi-generated adapters, custom Compose `@Stable` types):
+
+```text
+# proguard-rules.pro
+-keepattributes *Annotation*, Signature, InnerClasses
+
+# Retrofit
+-keep,allowobfuscation,allowshrinking interface retrofit2.Call
+-keep,allowobfuscation,allowshrinking class kotlin.coroutines.Continuation
+
+# Moshi
+-keep class **JsonAdapter { *; }
+```
+
+<Callout kind="warning" title="Always test the release build">
+Many crashes only appear in `release` (R8 strips classes used only by
+reflection). Build a **release variant locally**, install it, and run your
+critical flows before every release.
+</Callout>
+
+### APK size reduction
+
+| Technique                   | Typical savings              |
+|-----------------------------|------------------------------|
+| Enable R8 with shrinkResources | 30–50%                    |
+| Use **App Bundles** (.aab)  | 15–25% per device download   |
+| WebP / AVIF for images      | 25–35% vs PNG                |
+| Vector drawables for icons  | 100x vs raster at all densities |
+| Remove unused languages with `resConfigs` | a few hundred KB |
+
+```kotlin
+android {
+    defaultConfig {
+        resourceConfigurations += listOf("en", "hi", "es", "fr")  // ship only these locales
+    }
+    bundle {
+        language { enableSplit = true }                            // per-language splits
+        density  { enableSplit = true }
+        abi      { enableSplit = true }
+    }
+}
+```
+
+### Baseline profiles
+
+Baseline profiles ship with your APK telling ART **which methods to AOT-compile
+at install time**. The result: **20–40% faster startup and smoother first
+launches** of critical screens.
+
+```kotlin
+// macrobenchmark module — generate the profile
+@RunWith(AndroidJUnit4::class)
+class StartupBenchmark {
+    @get:Rule val rule = MacrobenchmarkRule()
+
+    @Test fun startup() = rule.measureRepeated(
+        packageName = "com.example.app",
+        metrics = listOf(StartupTimingMetric()),
+        iterations = 5,
+        startupMode = StartupMode.COLD
+    ) {
+        pressHome()
+        startActivityAndWait()
+    }
+}
+
+@RunWith(AndroidJUnit4::class)
+class BaselineProfileGenerator {
+    @get:Rule val rule = BaselineProfileRule()
+
+    @Test fun generate() = rule.collect(packageName = "com.example.app") {
+        pressHome()
+        startActivityAndWait()
+        // walk through critical user flows here
+    }
+}
+```
+
+The generated `baseline-prof.txt` ships in `src/main/` and is consumed
+automatically by the Android build system.
+
+### Other tools you'll use
+
+<FeatureGrid columns={2} features={[
+  { icon: '📊', title: 'Android Studio CPU Profiler', description: 'Sample method traces, see where time is spent on the main thread.' },
+  { icon: '🧠', title: 'Memory Profiler', description: 'Track allocations, find retained objects, force GC, dump heaps.' },
+  { icon: '🌡️', title: 'Energy Profiler', description: 'See CPU, network, and location wakelocks combined into a battery score.' },
+  { icon: '🔍', title: 'Perfetto traces', description: 'Microsecond-level system traces — the same tool Google uses internally.' },
+  { icon: '⏱️', title: 'Macrobenchmark', description: 'Measure startup time, frame timing, and scrolling on real devices in CI.' },
+  { icon: '🪶', title: 'Firebase Performance', description: 'Production trace collection — see real-user metrics from real devices.' }
+]} />
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Performance rules">
+- **Measure first**, optimize second. Use Profiler, perfetto, Macrobenchmark.
+- LeakCanary in **every** debug build — catch leaks before they ship.
+- Use **`remember`** and **stable keys** in Compose to avoid wasted recomposition.
+- Defer init with **App Startup**; show the splash with **SplashScreen API**.
+- Enable **R8** in release; always test the release build locally.
+- Generate **baseline profiles** for critical journeys — free 30% startup win.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Add LeakCanary', description: 'Install LeakCanary in your debug build and intentionally create a leak (static reference to an Activity). Observe the leak trace.' },
+  { title: 'Measure recomposition', description: 'Use Layout Inspector in Compose mode to find a composable recomposing too often, then fix it with derivedStateOf or remember.' },
+  { title: 'Generate baseline profile', description: 'Set up the macrobenchmark module and generate a baseline profile for your app\'s startup flow.' }
+]} />
+
+## Next module
+
+Continue to **[Module 11 — Google Play Store & Publishing](/docs/publishing/overview)** to ship the optimized app to users.

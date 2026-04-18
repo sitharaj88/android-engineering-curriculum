@@ -1,0 +1,276 @@
+---
+id: overview
+title: Module 12 — Advanced & Trending Topics
+sidebar_label: Overview
+description: Kotlin Multiplatform, ML Kit + TensorFlow Lite, Wear OS, Android TV, BLE/IoT, accessibility, security, adaptive layouts.
+---
+
+import { Callout, StepList, FeatureGrid, LibraryGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 12 of 13</span>
+  <span><strong>Duration:</strong> 3 weeks</span>
+  <span><strong>Topics:</strong> 3 · 6 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 01–11</span>
+</div>
+
+# Advanced & Trending Topics
+
+Once you've shipped a production app, the next frontier is **reach**:
+multiple form factors (foldables, tablets, Wear, TV), multiple platforms
+(iOS via KMP), and intelligent on-device features (ML Kit). This module is
+your survey of what's new and what's next.
+
+## Topic 1 · Cross-Platform
+
+### Kotlin Multiplatform (KMP)
+
+KMP lets you share **Kotlin code** across Android, iOS, web, and desktop —
+typically the business layer (use cases, repositories, networking, models)
+while keeping UI native. **It is not React Native.** UI on iOS stays
+SwiftUI; UI on Android stays Compose; Kotlin powers everything in between.
+
+```text
+shared/
+├── commonMain/    # Pure Kotlin — business logic, models, networking
+├── androidMain/   # Android-specific (ContentResolver, Context-bound APIs)
+└── iosMain/       # iOS-specific (NSURLSession bridges, Keychain)
+```
+
+A typical shared module:
+
+```kotlin
+// shared/commonMain
+class GetWeatherUseCase(private val api: WeatherApi) {
+    suspend operator fun invoke(city: String): Weather = api.fetch(city)
+}
+
+interface WeatherApi {
+    suspend fun fetch(city: String): Weather
+}
+
+// shared/commonMain — multiplatform Ktor client
+class WeatherApiImpl(private val client: HttpClient) : WeatherApi {
+    override suspend fun fetch(city: String): Weather =
+        client.get("/weather") { parameter("q", city) }.body()
+}
+```
+
+The Android app `implements project(":shared")` and consumes `GetWeatherUseCase`
+just like a regular Kotlin class. The iOS app imports the generated `shared`
+framework via Swift Package Manager.
+
+**Compose Multiplatform** (CMP) is JetBrains' Compose-on-iOS effort — for
+when you want to share UI too. It's production-ready on Android and Desktop;
+iOS is rapidly maturing.
+
+### AI & ML integration: ML Kit + TensorFlow Lite
+
+**ML Kit** ships pre-trained on-device models behind a simple API: barcode
+scanning, face detection, text recognition, translation, smart reply, pose
+detection.
+
+```kotlin
+val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+
+val image = InputImage.fromBitmap(bitmap, 0)
+recognizer.process(image)
+    .addOnSuccessListener { result ->
+        result.textBlocks.forEach { block ->
+            Log.d("OCR", block.text)
+        }
+    }
+```
+
+**TensorFlow Lite** lets you run **your own** models on-device (image
+classification, object detection, NLP, custom recommendation). Use the
+**LiteRT** runtime and `.tflite` model files.
+
+<Callout kind="tip" title="On-device wins">
+On-device ML eliminates server costs, eliminates network latency, and keeps
+user data private. The tradeoff is model size — quantize aggressively and
+ship via dynamic feature delivery if needed.
+</Callout>
+
+---
+
+## Topic 2 · Platform Extensions
+
+### Wear OS development
+
+Wear OS apps run on smartwatches and use **Compose for Wear OS** — a
+specialized Compose toolkit with circular layouts, swipe-to-dismiss,
+rotary input, and tile-based glanceable content.
+
+```kotlin
+@Composable
+fun WearApp() {
+    WearAppTheme {
+        ScalingLazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            item { ListHeader { Text("Workouts") } }
+            items(workouts) { w ->
+                Chip(
+                    onClick = { startWorkout(w) },
+                    label = { Text(w.name) },
+                    secondaryLabel = { Text("${w.minutes} min") }
+                )
+            }
+        }
+    }
+}
+```
+
+Pair Wear apps with phone apps using the **Data Layer API** (`MessageClient`,
+`DataClient`).
+
+### Android TV development
+
+Android TV apps use **Leanback** (legacy XML) or the **TV Compose libraries**
+(modern, recommended). Focus on the **D-pad navigation model** — every
+interactive element must be reachable via four directional keys.
+
+### Bluetooth, BLE & IoT
+
+For wireless device integration:
+
+| API                | Use for                                |
+|--------------------|----------------------------------------|
+| Classic Bluetooth  | Audio, file transfer (legacy)          |
+| **BLE (Bluetooth Low Energy)** | Wearables, sensors, beacons — modern, low power |
+| Wi-Fi Direct       | Peer-to-peer file/data without a router|
+| Nearby Share       | Cross-device sharing API               |
+
+Modern apps almost always want **BLE**:
+
+```kotlin
+val scanner = bluetoothManager.adapter.bluetoothLeScanner
+scanner.startScan(object : ScanCallback() {
+    override fun onScanResult(callbackType: Int, result: ScanResult) {
+        if (result.device.name?.contains("Heart") == true) {
+            connectGatt(result.device)
+        }
+    }
+})
+```
+
+---
+
+## Topic 3 · Best Practices
+
+### Accessibility
+
+Accessibility (a11y) is not optional — it's how users with vision, motor,
+or cognitive impairments use your app. It's also legally required in many
+jurisdictions. The wins:
+
+- Provide `contentDescription` on every meaningful image/icon
+- Use semantic Composables (`Button`, `IconButton`) over generic `Box` with `clickable`
+- Ensure tap targets are ≥ 48dp
+- Maintain **4.5:1 contrast ratio** for text
+- Support **dynamic font scaling** (don't use `dp` for text — use `sp`)
+- Test with **TalkBack** and **Switch Access**
+
+```kotlin
+Icon(
+    imageVector = Icons.Default.Share,
+    contentDescription = stringResource(R.string.share_post),  // a11y label
+    modifier = Modifier
+        .size(48.dp)                      // tappable target
+        .clickable(onClick = onShare)
+        .semantics { role = Role.Button } // explicit role
+)
+```
+
+### Localization (i18n)
+
+Externalize **every** string into `res/values/strings.xml`, then provide
+translations in `res/values-<locale>/strings.xml`. Use placeholders, not
+concatenation:
+
+```xml
+<!-- WRONG: concatenation breaks word order in other languages -->
+<string name="welcome">Welcome, </string>
+
+<!-- RIGHT: positional placeholder -->
+<string name="welcome">Welcome, %1$s!</string>
+```
+
+Use **plurals** for count-aware translations:
+
+```xml
+<plurals name="cart_items">
+    <item quantity="one">%d item in cart</item>
+    <item quantity="other">%d items in cart</item>
+</plurals>
+```
+
+### Security best practices
+
+<FeatureGrid columns={2} features={[
+  { icon: '🔐', title: 'Network Security Config', description: 'Block cleartext traffic, pin certificates, restrict trusted CAs.' },
+  { icon: '🗝️', title: 'Android Keystore', description: 'Generate and store cryptographic keys in hardware (TEE / StrongBox).' },
+  { icon: '🚫', title: 'Disable backup of secrets', description: 'Use rules.xml to exclude tokens, DBs, and PII from auto-backup.' },
+  { icon: '🛡️', title: 'App signing & integrity', description: 'Verify with Play Integrity API to detect tampering and emulators.' },
+  { icon: '🔒', title: 'Biometric Strong', description: 'Use BIOMETRIC_STRONG class — cryptographic proof, not just face match.' },
+  { icon: '📦', title: 'Dependency hygiene', description: 'Run dependency-check and Gradle scans; subscribe to GitHub security advisories.' }
+]} />
+
+### Adaptive layouts
+
+Android runs on phones, foldables, tablets, Chromebooks, and TVs. Use the
+**Window Size Class** API to adapt layouts:
+
+```kotlin
+@Composable
+fun AdaptiveScaffold() {
+    val windowSize = calculateWindowSizeClass(LocalContext.current as Activity)
+
+    when (windowSize.widthSizeClass) {
+        WindowWidthSizeClass.Compact  -> PhoneLayout()                 // < 600 dp
+        WindowWidthSizeClass.Medium   -> FoldableOrSmallTabletLayout() // 600–840 dp
+        WindowWidthSizeClass.Expanded -> TabletOrDesktopLayout()       // ≥ 840 dp
+    }
+}
+```
+
+For two-pane experiences on larger screens, use the **Material 3 Adaptive
+library** with `NavigableListDetailPaneScaffold`.
+
+---
+
+## Companion ecosystem
+
+<LibraryGrid libraries={[
+  { name: 'Ktor', tagline: 'Multiplatform HTTP', description: 'Coroutine-first HTTP client written in Kotlin — works on Android, iOS, JVM, JS.', url: 'https://ktor.io/' },
+  { name: 'SQLDelight', tagline: 'Multiplatform DB', description: 'Type-safe SQL on every Kotlin platform; compile-time-checked queries.', url: 'https://cashapp.github.io/sqldelight/' },
+  { name: 'Compose Multiplatform', tagline: 'UI on every platform', description: 'JetBrains\' Compose for Desktop, Web, and iOS — one Composable codebase.', url: 'https://www.jetbrains.com/lp/compose-multiplatform/' },
+  { name: 'Health Connect', tagline: 'Unified health data', description: 'Single API to read/write health data across Android health and fitness apps.', url: 'https://developer.android.com/health-and-fitness/guides/health-connect' },
+  { name: 'CameraX Extensions', tagline: 'Bokeh, HDR, Night', description: 'Vendor-tuned camera modes through a unified API.', url: 'https://developer.android.com/media/camera/camerax/extensions' },
+  { name: 'ProtoBuf + gRPC-Kotlin', tagline: 'High-perf RPC', description: 'Strongly typed, code-generated client/server APIs over HTTP/2.', url: 'https://github.com/grpc/grpc-kotlin' }
+]} />
+
+## Key takeaways
+
+<Callout kind="success" title="What's worth investing in">
+- **KMP** for sharing business logic — the highest-leverage cross-platform tool today.
+- **ML Kit** before TFLite — only roll your own model when the task is unique to you.
+- **Compose for Wear OS / TV** — modern API surfaces that match what you already know.
+- **Accessibility is engineering**, not polish. Bake it in from day one.
+- Treat **security** as a layered discipline: network config, keystore, signing, dependency hygiene.
+- Design for **every screen size** with Window Size Classes from the start.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Add a shared KMP module', description: 'Move a Kotlin model + repository from your app into a :shared module that targets Android. Optional: add iOS target.' },
+  { title: 'On-device OCR', description: 'Use ML Kit Text Recognition to scan a business card photo and extract email/phone.' },
+  { title: 'TalkBack pass', description: 'Enable TalkBack in Settings → Accessibility and walk through your app. Fix every unlabeled control.' }
+]} />
+
+## Next module
+
+Continue to **[Module 13 — Version Control & Collaboration](/docs/version-control/overview)** to wrap up with team workflows.

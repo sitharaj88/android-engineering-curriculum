@@ -1,0 +1,221 @@
+---
+id: project-structure
+title: Project Structure & Conventions
+sidebar_label: Project Structure
+description: Folder layout, Gradle module catalog, naming conventions, and setup that scales from one developer to a full team.
+---
+
+import { Callout, StepList } from '@site/src/components/Doc';
+
+# Project Structure & Conventions
+
+Conventions remove friction. When every project on your team uses the same
+folder names, Gradle catalog, and package structure, switching between
+codebases is painless. This page is the convention this curriculum uses.
+
+## Top-level layout
+
+```text
+my-app/
+├── app/                              # :app module — wires everything
+├── core/
+│   ├── design/                       # :core:design — theme, tokens
+│   ├── ui/                           # :core:ui — reusable Composables
+│   └── testing/                      # :core:testing — fixtures, rules
+├── domain/                           # :domain — pure Kotlin
+├── data/                             # :data — repository impls
+├── feature/
+│   ├── catalog/                      # :feature:catalog
+│   ├── detail/                       # :feature:detail
+│   └── checkout/                     # :feature:checkout
+├── build-logic/                      # convention plugins (shared Gradle config)
+├── gradle/
+│   └── libs.versions.toml            # version catalog (single source of truth)
+├── build.gradle.kts                  # root build script
+├── settings.gradle.kts               # module list
+└── gradle.properties                 # JVM args, AndroidX flags
+```
+
+## Version catalog (`libs.versions.toml`)
+
+The catalog centralizes every dependency version. Modules reference them via
+type-safe accessors (`libs.androidx.core.ktx`).
+
+```toml
+[versions]
+agp                  = "8.7.2"
+kotlin               = "2.0.21"
+compose-bom          = "2024.10.01"
+hilt                 = "2.52"
+retrofit             = "2.11.0"
+moshi                = "1.15.1"
+room                 = "2.6.1"
+coroutines           = "1.9.0"
+lifecycle            = "2.8.7"
+nav-compose          = "2.8.4"
+
+[libraries]
+androidx-core-ktx        = { module = "androidx.core:core-ktx", version = "1.15.0" }
+androidx-activity-compose= { module = "androidx.activity:activity-compose", version = "1.9.3" }
+compose-bom              = { module = "androidx.compose:compose-bom", version.ref = "compose-bom" }
+compose-ui               = { module = "androidx.compose.ui:ui" }
+compose-material3        = { module = "androidx.compose.material3:material3" }
+hilt-android             = { module = "com.google.dagger:hilt-android", version.ref = "hilt" }
+hilt-compiler            = { module = "com.google.dagger:hilt-compiler", version.ref = "hilt" }
+retrofit                 = { module = "com.squareup.retrofit2:retrofit", version.ref = "retrofit" }
+retrofit-moshi           = { module = "com.squareup.retrofit2:converter-moshi", version.ref = "retrofit" }
+moshi                    = { module = "com.squareup.moshi:moshi", version.ref = "moshi" }
+moshi-kotlin             = { module = "com.squareup.moshi:moshi-kotlin", version.ref = "moshi" }
+room-runtime             = { module = "androidx.room:room-runtime", version.ref = "room" }
+room-ktx                 = { module = "androidx.room:room-ktx", version.ref = "room" }
+room-compiler            = { module = "androidx.room:room-compiler", version.ref = "room" }
+coroutines-core          = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+coroutines-android       = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+nav-compose              = { module = "androidx.navigation:navigation-compose", version.ref = "nav-compose" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library     = { id = "com.android.library", version.ref = "agp" }
+kotlin-android      = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-jvm          = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+hilt                = { id = "com.google.dagger.hilt.android", version.ref = "hilt" }
+ksp                 = { id = "com.google.devtools.ksp", version = "2.0.21-1.0.27" }
+```
+
+A module then declares dependencies as:
+
+```kotlin
+dependencies {
+    implementation(platform(libs.compose.bom))
+    implementation(libs.compose.ui)
+    implementation(libs.compose.material3)
+    implementation(libs.hilt.android)
+    ksp(libs.hilt.compiler)
+}
+```
+
+## Convention plugins (`build-logic/`)
+
+Repetitive `build.gradle.kts` blocks live in **convention plugins** so adding
+a new module is a one-liner. Typical plugins:
+
+- `myapp.android.application` — applies AGP, Hilt, Compose, Kotlin, common config
+- `myapp.android.library` — same for library modules
+- `myapp.android.feature` — adds Hilt + Compose + nav for feature modules
+- `myapp.kotlin.library` — pure Kotlin module config
+- `myapp.android.test` — instrumented test setup
+
+A new feature module then looks like:
+
+```kotlin
+// :feature:catalog/build.gradle.kts
+plugins {
+    id("myapp.android.feature")
+}
+
+android {
+    namespace = "com.example.feature.catalog"
+}
+
+dependencies {
+    implementation(projects.domain)
+    implementation(projects.core.ui)
+    implementation(projects.core.design)
+}
+```
+
+## Package naming
+
+Within each module, packages mirror the architecture layer they live in:
+
+```text
+com.example.feature.catalog/
+├── CatalogScreen.kt          // top-level composable
+├── CatalogViewModel.kt
+├── components/               // private composables for this screen
+│   ├── ProductRow.kt
+│   └── EmptyCatalog.kt
+└── di/
+    └── CatalogModule.kt      // Hilt module if needed
+```
+
+Domain packages organize by feature, not by layer:
+
+```text
+com.example.domain/
+├── product/
+│   ├── Product.kt
+│   ├── ProductRepository.kt
+│   └── usecase/GetProductUseCase.kt
+├── wishlist/
+└── checkout/
+```
+
+## File and class naming
+
+| Element              | Convention                    | Example                          |
+|----------------------|-------------------------------|----------------------------------|
+| Activity             | `*Activity`                   | `MainActivity`                   |
+| Fragment             | `*Fragment`                   | `LoginFragment`                  |
+| ViewModel            | `*ViewModel`                  | `CatalogViewModel`               |
+| Composable screen    | `*Screen`                     | `CatalogScreen`                  |
+| State holder         | `*UiState`                    | `CatalogUiState`                 |
+| Use case             | `*UseCase`                    | `GetCatalogUseCase`              |
+| Repository interface | `*Repository`                 | `ProductRepository`              |
+| Repository impl      | `*RepositoryImpl`             | `ProductRepositoryImpl`          |
+| Network DTO          | `*Dto`                        | `ProductDto`                     |
+| Room entity          | `*Entity`                     | `ProductEntity`                  |
+| DAO                  | `*Dao`                        | `ProductDao`                     |
+| Hilt module          | `*Module`                     | `NetworkModule`                  |
+| Test class           | `*Test`                       | `CatalogViewModelTest`           |
+
+## Source sets
+
+Tests live in standard locations:
+
+```text
+src/main/kotlin/         -> production code
+src/test/kotlin/         -> JVM unit tests (no device, fast)
+src/androidTest/kotlin/  -> instrumented tests (run on device/emulator)
+src/debug/kotlin/        -> debug-only sources (LeakCanary helpers, etc.)
+src/release/kotlin/      -> release-only sources (no-op stubs)
+```
+
+## .editorconfig
+
+Enforce style automatically across IDEs:
+
+```ini
+root = true
+
+[*]
+charset = utf-8
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.{kt,kts}]
+ktlint_code_style = intellij_idea
+ij_kotlin_imports_layout = *,java.**,javax.**,kotlin.**,^
+
+[*.{xml,yml,yaml}]
+indent_size = 2
+```
+
+## A starter checklist for new projects
+
+<StepList steps={[
+  { title: 'Init the catalog', description: 'Create gradle/libs.versions.toml with the bundles you know you\'ll need.' },
+  { title: 'Set up convention plugins', description: 'Build-logic with myapp.android.application + myapp.android.library + myapp.android.feature.' },
+  { title: 'Create the layered modules', description: ':app, :domain, :data, :core:design, :core:ui — even if empty for now.' },
+  { title: 'Wire Hilt', description: '@HiltAndroidApp on the Application class; one Hilt module per source.' },
+  { title: 'Add the quality gate', description: 'Spotless + Detekt + Lint + Kover. Wire them into ./gradlew check.' },
+  { title: 'CI from day 1', description: 'GitHub Actions running check on every PR. Block merges that don\'t pass.' }
+]} />
+
+<Callout kind="success" title="Conventions pay compounding interest">
+Every minute spent on conventions early saves hours of confusion later. New
+contributors find files instantly. Refactors are safer. PRs read uniformly.
+This is the cheapest leverage available to a software team.
+</Callout>

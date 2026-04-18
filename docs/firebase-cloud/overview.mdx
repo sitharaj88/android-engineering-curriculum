@@ -1,0 +1,296 @@
+---
+id: overview
+title: Module 07 — Firebase & Cloud Services
+sidebar_label: Overview
+description: Firebase setup, Auth (Email/Google/Phone), Cloud Firestore, Cloud Storage, FCM push notifications, Analytics, Crashlytics, Remote Config.
+---
+
+import { Callout, StepList, FeatureGrid, LibraryGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 07 of 13</span>
+  <span><strong>Duration:</strong> 3 weeks</span>
+  <span><strong>Topics:</strong> 3 · 6 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 01–06</span>
+</div>
+
+# Firebase & Cloud Services
+
+Firebase is Google's **backend-as-a-service** platform — you get auth, a
+real-time database, file storage, push notifications, analytics, and crash
+reporting without spinning up servers. For solo developers and small teams
+shipping production apps, Firebase often replaces an entire backend.
+
+<Callout kind="tip" title="When to choose Firebase">
+Firebase is ideal when you need to ship fast, your data model fits a
+document store, and you don't want to manage infrastructure. For complex
+relational queries, server-side business logic, or strict cost control at
+scale, supplement (or replace) it with a custom backend.
+</Callout>
+
+## Topic 1 · Authentication
+
+### Setup & configuration
+
+1. Create a Firebase project at console.firebase.google.com.
+2. Add your Android app — supply the package name and SHA-1.
+3. Download `google-services.json` into `app/` (never commit it to public repos).
+4. Apply plugins:
+
+```kotlin
+// settings.gradle.kts
+plugins {
+    id("com.google.gms.google-services") version "4.4.2" apply false
+    id("com.google.firebase.crashlytics") version "3.0.2" apply false
+}
+
+// app/build.gradle.kts
+plugins {
+    id("com.google.gms.google-services")
+    id("com.google.firebase.crashlytics")
+}
+dependencies {
+    implementation(platform("com.google.firebase:firebase-bom:33.5.0"))   // BoM = consistent versions
+    implementation("com.google.firebase:firebase-auth-ktx")
+    implementation("com.google.firebase:firebase-firestore-ktx")
+    implementation("com.google.firebase:firebase-storage-ktx")
+    implementation("com.google.firebase:firebase-messaging-ktx")
+    implementation("com.google.firebase:firebase-analytics-ktx")
+    implementation("com.google.firebase:firebase-crashlytics-ktx")
+    implementation("com.google.firebase:firebase-config-ktx")
+}
+```
+
+### Email/password, Google Sign-In, Phone OTP
+
+```kotlin
+class AuthRepository @Inject constructor(
+    private val auth: FirebaseAuth
+) {
+    val currentUser: Flow<FirebaseUser?> = callbackFlow {
+        val listener = FirebaseAuth.AuthStateListener { trySend(it.currentUser) }
+        auth.addAuthStateListener(listener)
+        awaitClose { auth.removeAuthStateListener(listener) }
+    }
+
+    suspend fun signUp(email: String, password: String): Result<FirebaseUser> = runCatching {
+        auth.createUserWithEmailAndPassword(email, password).await().user!!
+    }
+
+    suspend fun signIn(email: String, password: String): Result<FirebaseUser> = runCatching {
+        auth.signInWithEmailAndPassword(email, password).await().user!!
+    }
+
+    suspend fun signInWithGoogle(idToken: String): Result<FirebaseUser> = runCatching {
+        val credential = GoogleAuthProvider.getCredential(idToken, null)
+        auth.signInWithCredential(credential).await().user!!
+    }
+
+    fun signOut() = auth.signOut()
+}
+```
+
+For **Google Sign-In** on Android, use the **Credential Manager API** (not
+the deprecated `GoogleSignInClient`) — it integrates with passkeys and
+Sign-In with Google in one flow.
+
+For **Phone OTP**, Firebase handles SMS delivery, code verification, and
+auto-retrieval. Always require **App Check** in production to prevent abuse.
+
+<Callout kind="warning" title="Secure your auth setup">
+Enable **App Check** with Play Integrity in the Firebase console. Without it,
+attackers can call your Firebase APIs from outside your app. Also enable
+**Anonymous Auth** if you want users to try the app before signing up.
+</Callout>
+
+---
+
+## Topic 2 · Database & Storage
+
+### Cloud Firestore — CRUD, queries, real-time listeners
+
+Firestore is a **document-oriented NoSQL** database with real-time sync,
+offline support, and granular security rules. Data lives in **collections** of
+**documents**:
+
+```text
+users (collection)
+  └── userId123 (document)
+       ├── name: "Aarav"
+       ├── email: "a@x.com"
+       └── posts (subcollection)
+            └── postId456 (document)
+                 ├── title: "Hello"
+                 └── createdAt: Timestamp
+```
+
+```kotlin
+class PostRepository @Inject constructor(
+    private val db: FirebaseFirestore
+) {
+    private val posts = db.collection("posts")
+
+    suspend fun create(post: Post): String {
+        val ref = posts.add(post.toMap()).await()
+        return ref.id
+    }
+
+    fun observeFeed(userId: String): Flow<List<Post>> = callbackFlow {
+        val sub = posts
+            .whereEqualTo("authorId", userId)
+            .orderBy("createdAt", Query.Direction.DESCENDING)
+            .limit(50)
+            .addSnapshotListener { snap, err ->
+                if (err != null) { close(err); return@addSnapshotListener }
+                trySend(snap?.documents.orEmpty().mapNotNull { it.toPost() })
+            }
+        awaitClose { sub.remove() }
+    }
+}
+```
+
+**Security rules** are non-negotiable — they're your real backend
+authorization layer:
+
+```javascript
+// firestore.rules
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    match /posts/{postId} {
+      allow read: if true;                                    // public posts
+      allow create: if request.auth != null
+                    && request.resource.data.authorId == request.auth.uid;
+      allow update, delete: if resource.data.authorId == request.auth.uid;
+    }
+  }
+}
+```
+
+### Cloud Storage — file upload & download
+
+```kotlin
+class MediaRepository @Inject constructor(
+    private val storage: FirebaseStorage
+) {
+    suspend fun uploadAvatar(userId: String, bytes: ByteArray): String {
+        val ref = storage.reference.child("avatars/$userId.jpg")
+        ref.putBytes(bytes).await()
+        return ref.downloadUrl.await().toString()
+    }
+}
+```
+
+Apply Storage Security Rules just like Firestore — restrict who can read,
+write, and to which paths.
+
+---
+
+## Topic 3 · Services
+
+### Push notifications with FCM
+
+Firebase Cloud Messaging delivers messages to your app — both when the app is
+running and when it's not.
+
+```kotlin
+class AppMessagingService : FirebaseMessagingService() {
+
+    override fun onNewToken(token: String) {
+        // Persist token in your backend so you can target this device
+        ServiceLocator.tokenSync.uploadToken(token)
+    }
+
+    override fun onMessageReceived(message: RemoteMessage) {
+        // Data-only payloads always reach this method.
+        // Notification payloads bypass it when the app is in background.
+        showNotification(
+            title = message.notification?.title ?: message.data["title"].orEmpty(),
+            body  = message.notification?.body  ?: message.data["body"].orEmpty(),
+            deepLink = message.data["deepLink"]
+        )
+    }
+}
+```
+
+```xml
+<!-- AndroidManifest.xml -->
+<service
+    android:name=".messaging.AppMessagingService"
+    android:exported="false">
+    <intent-filter>
+        <action android:name="com.google.firebase.MESSAGING_EVENT" />
+    </intent-filter>
+</service>
+```
+
+<Callout kind="info" title="Notification channels are required (Android 8+)">
+Create channels in your Application's `onCreate` — system settings group
+notifications by channel and let users mute them individually.
+</Callout>
+
+### Analytics, Crashlytics, Remote Config
+
+```kotlin
+// Analytics — log custom events
+Firebase.analytics.logEvent("checkout_started") {
+    param("cart_value", cart.totalCents.toLong())
+    param("item_count", cart.items.size.toLong())
+}
+
+// Crashlytics — capture non-fatal errors with context
+Firebase.crashlytics.setUserId(currentUser.id)
+Firebase.crashlytics.setCustomKey("subscription_tier", "pro")
+runCatching { riskyOperation() }
+    .onFailure { Firebase.crashlytics.recordException(it) }
+
+// Remote Config — change values without shipping a new APK
+val remoteConfig = Firebase.remoteConfig.apply {
+    setConfigSettingsAsync(remoteConfigSettings { minimumFetchIntervalInSeconds = 3600 })
+    setDefaultsAsync(R.xml.remote_defaults)
+}
+remoteConfig.fetchAndActivate().await()
+val showNewCheckout = remoteConfig.getBoolean("show_new_checkout")
+```
+
+<Callout kind="success" title="Use Remote Config for kill switches">
+When a feature explodes in production, you don't have time for a Play Store
+review. A Remote Config flag lets you disable a code path **instantly** —
+make this part of every risky launch.
+</Callout>
+
+---
+
+## Companion services
+
+<LibraryGrid libraries={[
+  { name: 'Firebase Auth', tagline: 'Drop-in authentication', description: 'Email, phone, Google, Apple, Facebook, anonymous — managed for you with secure session handling.', url: 'https://firebase.google.com/docs/auth' },
+  { name: 'Cloud Firestore', tagline: 'Real-time NoSQL DB', description: 'Document store with offline cache, real-time listeners, and granular security rules.', url: 'https://firebase.google.com/docs/firestore' },
+  { name: 'FCM', tagline: 'Push notifications', description: 'Send to single devices, topics, or millions of users. Free at any scale.', url: 'https://firebase.google.com/docs/cloud-messaging' },
+  { name: 'Crashlytics', tagline: 'Crash reporting', description: 'Symbolicated stack traces, breadcrumbs, custom keys — see exactly what users hit.', url: 'https://firebase.google.com/docs/crashlytics' },
+  { name: 'Remote Config', tagline: 'Server-driven flags', description: 'A/B tests, feature flags, kill switches without a Play Store release.', url: 'https://firebase.google.com/docs/remote-config' },
+  { name: 'App Check', tagline: 'Abuse protection', description: 'Verify requests come from your real app via Play Integrity.', url: 'https://firebase.google.com/docs/app-check' }
+]} />
+
+## Key takeaways
+
+<Callout kind="success" title="Firebase rules">
+- Use the **Firebase BoM** so all SDK versions stay aligned.
+- Wrap every Firestore listener in a `callbackFlow` for coroutine integration.
+- Write **security rules**; don't rely on client-side checks.
+- Enable **App Check** in production to block abuse.
+- Send **data-only payloads** when you need full control over notifications.
+- Use **Remote Config** for kill switches on risky features.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Email + Google sign-in', description: 'Build an auth screen with Firebase Auth + Credential Manager. Persist the FirebaseUser as a Flow in your AuthRepository.' },
+  { title: 'Firestore feed', description: 'Build a real-time chat collection with security rules: anyone can read, only authenticated users can post their own messages.' },
+  { title: 'Push deep link', description: 'Send an FCM message with a deepLink data field; tap the notification to open the matching screen.' }
+]} />
+
+## Next module
+
+Continue to **[Module 08 — Advanced Android Components](/docs/advanced-components/overview)** to learn services, WorkManager, sensors, biometrics, and Glance widgets.

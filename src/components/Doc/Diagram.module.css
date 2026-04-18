@@ -1,0 +1,74 @@
+.diagram {
+  margin: 2rem 0;
+  padding: 0;
+  border-radius: 16px;
+  overflow: hidden;
+  background: linear-gradient(135deg, #FAFBFF 0%, #F1F4FF 100%);
+  border: 1px solid rgba(79, 70, 229, 0.08);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04), 0 8px 24px rgba(79, 70, 229, 0.06);
+}
+
+:global([data-theme='dark']) .diagram {
+  background: linear-gradient(135deg, #0F172A 0%, #1E1B4B 100%);
+  border-color: rgba(129, 140, 248, 0.15);
+}
+
+.title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: #6366F1;
+  padding: 0.875rem 1.25rem;
+  border-bottom: 1px solid rgba(79, 70, 229, 0.08);
+  background: rgba(255, 255, 255, 0.4);
+  backdrop-filter: blur(8px);
+}
+
+:global([data-theme='dark']) .title {
+  color: #A5B4FC;
+  background: rgba(15, 23, 42, 0.4);
+  border-bottom-color: rgba(129, 140, 248, 0.12);
+}
+
+.canvas {
+  padding: 2rem 1.5rem;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  overflow-x: auto;
+}
+
+.canvas svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+.caption {
+  padding: 0.875rem 1.25rem;
+  font-size: 0.8125rem;
+  color: #64748B;
+  text-align: center;
+  border-top: 1px solid rgba(79, 70, 229, 0.06);
+  background: rgba(255, 255, 255, 0.3);
+  line-height: 1.55;
+  font-style: italic;
+}
+
+:global([data-theme='dark']) .caption {
+  color: #94A3B8;
+  background: rgba(15, 23, 42, 0.3);
+}
+
+.centered .canvas {
+  justify-content: center;
+}
+
+.flow .canvas {
+  padding: 2.5rem 1.5rem;
+}
+
+@media (max-width: 768px) {
+  .canvas { padding: 1.5rem 1rem; }
+}

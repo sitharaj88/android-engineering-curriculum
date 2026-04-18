@@ -1,0 +1,158 @@
+---
+id: intro
+title: Welcome to the Android Development Guide
+sidebar_position: 1
+slug: /intro
+description: Your complete roadmap from Kotlin fundamentals to publishing production Android apps on Google Play.
+---
+
+import { Callout, FeatureGrid, StepList, LibraryGrid, ComparisonCard } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Duration:</strong> 34 weeks</span>
+  <span><strong>Modules:</strong> 13</span>
+  <span><strong>Topics:</strong> 73+</span>
+  <span><strong>Content:</strong> 120 hours</span>
+  <span><strong>Difficulty:</strong> Beginner → Production-Ready</span>
+</div>
+
+# Android Development — Complete Guide
+
+This program is the **most comprehensive Android curriculum** you can follow as
+a self-learner, student, or working professional. It covers every layer of a
+production app — from the Kotlin language itself to publishing on Google Play —
+using the patterns, libraries, and tools that real engineering teams use today.
+
+<Callout kind="tip" title="What makes this guide different">
+We don't stop at "how" — every concept is explained with the **why** behind it.
+You'll understand *why* `viewModelScope` is preferred over `GlobalScope`, *why*
+`StateFlow` replaced `LiveData`, *why* Compose recomposes the way it does, and
+*why* baseline profiles cut startup time by 40%. The reasoning is what makes
+you senior.
+</Callout>
+
+## Why learn Android in 2026?
+
+Android runs on **3+ billion active devices** worldwide and remains the
+dominant mobile OS in every market except the US. With the rise of **Kotlin
+Multiplatform**, **Wear OS**, **Android TV**, **foldables**, and **AI-powered
+on-device experiences via ML Kit**, Android engineering is more relevant — and
+more rewarding — than ever.
+
+Modern Android development is also **far more pleasant** than it used to be.
+Java is gone. XML layouts are giving way to declarative Compose. Coroutines
+make async code readable. Hilt removes DI boilerplate. The platform finally
+feels modern — and this guide teaches you that modern stack from the ground
+up.
+
+<FeatureGrid columns={3} features={[
+  { icon: '🎯', title: 'Production-Focused', description: 'Every example mirrors patterns used in shipping apps — not toy demos.' },
+  { icon: '🧠', title: 'Concept-First', description: 'You learn the model behind each tool so you can adapt when libraries change.' },
+  { icon: '🛠️', title: 'Hands-On Projects', description: '5 end-to-end apps reinforce architecture, networking, persistence, and publishing.' }
+]} />
+
+## How this guide is organized
+
+The 13 modules are designed to be followed in order. Each builds on concepts
+introduced in the previous one:
+
+<StepList steps={[
+  { title: 'Module 01 — Kotlin Foundation', description: 'The language. Variables, OOP, null safety, collections, lambdas, scope functions, and coroutines basics.' },
+  { title: 'Module 02 — Android Fundamentals', description: 'Platform architecture, Activities, Intents, Fragments, ViewGroups — the runtime you target.' },
+  { title: 'Module 03 — Jetpack Compose', description: 'Declarative UI, state hoisting, Material 3, navigation, animations.' },
+  { title: 'Module 04 — Architecture & Patterns', description: 'MVVM, Clean Architecture, Repository pattern, Hilt DI, StateFlow.' },
+  { title: 'Module 05 — Data & Persistence', description: 'DataStore, Room, migrations, encrypted storage, caching.' },
+  { title: 'Module 06 — Networking & API', description: 'Retrofit, Moshi, OkHttp, coroutines on the network layer, Paging 3, image loading.' },
+  { title: 'Module 07 — Firebase & Cloud', description: 'Auth, Firestore, Cloud Storage, FCM, Analytics, Crashlytics, Remote Config.' },
+  { title: 'Module 08 — Advanced Components', description: 'Services, WorkManager, notifications, permissions, CameraX, sensors, biometrics, Glance.' },
+  { title: 'Module 09 — Testing & Quality', description: 'JUnit 5, MockK, Turbine, Espresso, Compose Testing, TDD, CI/CD.' },
+  { title: 'Module 10 — Performance', description: 'Memory profiling, LeakCanary, R8, baseline profiles, startup tracing.' },
+  { title: 'Module 11 — Publishing', description: 'Play Console, App Bundles, signing, in-app purchases, AdMob, ASO.' },
+  { title: 'Module 12 — Advanced & Trending', description: 'Kotlin Multiplatform, ML Kit, Wear OS, Android TV, BLE/IoT, accessibility, security.' },
+  { title: 'Module 13 — Version Control', description: 'Git fundamentals, branching, pull requests, code reviews, conventional commits.' }
+]} />
+
+## The modern Android stack at a glance
+
+<ComparisonCard
+  left={{
+    label: 'Legacy Android',
+    title: 'What we avoid',
+    variant: 'old',
+    points: [
+      'Java with verbose null-handling',
+      'XML layouts + findViewById / view binding',
+      'AsyncTask, callbacks, RxJava chains',
+      'Manual Dagger 2 with subcomponents',
+      'LiveData + DataBinding',
+      'AsyncTask + Loaders for background work'
+    ]
+  }}
+  right={{
+    label: 'Modern Android',
+    title: 'What we teach',
+    variant: 'new',
+    points: [
+      'Kotlin with first-class null safety',
+      'Jetpack Compose (declarative, reactive)',
+      'Coroutines + Flow for async',
+      'Hilt for zero-boilerplate DI',
+      'StateFlow / SharedFlow for UI state',
+      'WorkManager + coroutines for background'
+    ]
+  }}
+/>
+
+## Prerequisites
+
+You don't need any Android experience. You **do** need:
+
+- **Basic programming knowledge** in any language (variables, loops, functions, conditionals)
+- A computer with **8 GB+ RAM** running Windows, macOS, or Linux
+- **Curiosity** and willingness to build real projects
+
+We install Android Studio together in Module 02. Bring your own machine and a
+willingness to break things — that's how you learn.
+
+## Projects you'll build
+
+By the end of this program you'll have shipped **five complete apps**, each
+designed to reinforce a different layer of the stack:
+
+<FeatureGrid columns={2} features={[
+  { icon: '🛒', title: 'E-Commerce App', description: 'Catalog, cart, payments, and order tracking — Compose, Hilt, Room, Retrofit.' },
+  { icon: '💬', title: 'Social Media App', description: 'Real-time chat with Firestore, push via FCM, media in Cloud Storage.' },
+  { icon: '🍔', title: 'Food Delivery App', description: 'Live tracking with Maps, Location services, WebSocket status updates.' },
+  { icon: '💪', title: 'Fitness Tracker', description: 'Sensors, Wear OS companion, Health Connect, DataStore persistence.' },
+  { icon: '📰', title: 'News Aggregator', description: 'Offline-first reading with Room, Paging 3, WorkManager, and Coil.' }
+]} />
+
+## How to use this guide
+
+<Callout kind="info" title="Recommended pace">
+- **Self-learner**: 8–12 hours per week → finish in ~6 months.
+- **Student**: 4–6 hours per week → finish in ~9 months alongside coursework.
+- **Working professional**: 6–10 hours per week → finish in ~5 months.
+
+Don't rush. **Build the projects.** Reading the code is not the same as writing
+it.
+</Callout>
+
+## What you'll be able to do at the end
+
+- Build production-ready Android apps with Kotlin and Jetpack Compose
+- Implement MVVM and Clean Architecture with Hilt and StateFlow
+- Integrate Firebase for auth, real-time data, push, and analytics
+- Write unit, integration, and UI tests with confidence
+- Profile and optimize app performance for low-end devices
+- Publish, sign, and monetize apps on Google Play
+
+## Ready to start?
+
+Head over to **[Module 01 — Kotlin Foundation](/docs/kotlin-foundation/overview)**
+and let's begin.
+
+<Callout kind="success" title="Tip">
+Bookmark the **Architecture Guide** and **Design Patterns** sections in the
+sidebar — you'll come back to them often as you build the projects.
+</Callout>

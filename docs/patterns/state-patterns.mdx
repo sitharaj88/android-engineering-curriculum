@@ -1,0 +1,219 @@
+---
+id: state-patterns
+title: State Patterns — UiState, MVI, and Effects
+sidebar_label: State Patterns
+description: Modern state-management patterns for Compose — sealed UiState classes, MVI with single state + intents, and the right way to model one-shot events.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# State Patterns
+
+State management is **the** central problem in UI engineering. Get it wrong
+and your app becomes a maze of mutually-inconsistent flags. Get it right and
+features become trivially testable, predictable, and refactorable.
+
+## The single-UiState pattern
+
+A screen's render is a pure function of one immutable state object. No flags
+scattered across multiple Flows. No "if loading and not error and data not
+null". One class, one source of truth.
+
+```kotlin
+data class CatalogUiState(
+    val isLoading: Boolean = false,
+    val products: List<Product> = emptyList(),
+    val filter: CatalogFilter = CatalogFilter.All,
+    val error: String? = null,
+    val isRefreshing: Boolean = false
+)
+```
+
+The Composable becomes a pure render:
+
+```kotlin
+@Composable
+fun CatalogScreen(state: CatalogUiState, onIntent: (CatalogIntent) -> Unit) {
+    when {
+        state.isLoading && state.products.isEmpty() -> LoadingView()
+        state.error != null && state.products.isEmpty() -> ErrorView(state.error, onRetry = { onIntent(CatalogIntent.Refresh) })
+        else -> CatalogList(
+            products = state.products,
+            isRefreshing = state.isRefreshing,
+            onRefresh = { onIntent(CatalogIntent.Refresh) },
+            onProductClick = { onIntent(CatalogIntent.OpenProduct(it.id)) }
+        )
+    }
+}
+```
+
+## Reducer / MVI pattern
+
+When state transitions get complex, model them with an **Intent → Reducer →
+State** loop. This is **MVI (Model-View-Intent)** — and it's exactly how
+Redux, Flux, and many Compose libraries work.
+
+```kotlin
+sealed interface CatalogIntent {
+    data object Refresh                  : CatalogIntent
+    data class OpenProduct(val id: String) : CatalogIntent
+    data class ChangeFilter(val filter: CatalogFilter) : CatalogIntent
+    data object Retry                    : CatalogIntent
+}
+
+@HiltViewModel
+class CatalogViewModel @Inject constructor(
+    private val getCatalog: GetCatalogUseCase
+) : ViewModel() {
+
+    private val _state = MutableStateFlow(CatalogUiState(isLoading = true))
+    val state: StateFlow<CatalogUiState> = _state.asStateFlow()
+
+    private val _events = MutableSharedFlow<CatalogEvent>()
+    val events: SharedFlow<CatalogEvent> = _events.asSharedFlow()
+
+    init { loadCatalog() }
+
+    fun onIntent(intent: CatalogIntent) {
+        when (intent) {
+            CatalogIntent.Refresh        -> loadCatalog(showRefreshing = true)
+            is CatalogIntent.OpenProduct -> viewModelScope.launch { _events.emit(CatalogEvent.NavigateToDetail(intent.id)) }
+            is CatalogIntent.ChangeFilter-> _state.update { it.copy(filter = intent.filter) }
+            CatalogIntent.Retry          -> loadCatalog()
+        }
+    }
+
+    private fun loadCatalog(showRefreshing: Boolean = false) = viewModelScope.launch {
+        _state.update {
+            if (showRefreshing) it.copy(isRefreshing = true, error = null)
+            else it.copy(isLoading = true, error = null)
+        }
+        runCatching { getCatalog() }
+            .onSuccess { products ->
+                _state.update { it.copy(isLoading = false, isRefreshing = false, products = products, error = null) }
+            }
+            .onFailure { e ->
+                _state.update { it.copy(isLoading = false, isRefreshing = false, error = e.message) }
+            }
+    }
+}
+```
+
+<Callout kind="success" title="The MVI win">
+Every state mutation goes through `_state.update { ... }`. To debug a
+"sometimes the screen looks wrong" bug, you set one breakpoint inside that
+update lambda — and you've found every offender.
+</Callout>
+
+## State vs Event — get this right
+
+A piece of UI is **state** if it can be re-rendered correctly after rotation.
+An **event** is something that should fire **once**, regardless of rotation.
+
+| Looks like                  | State or Event?  | Why                                                |
+|-----------------------------|------------------|----------------------------------------------------|
+| A list of products          | State            | Re-renders identically                             |
+| An error banner             | State            | Should remain visible after rotation               |
+| A snackbar                  | Event            | Showing the same one twice on rotation is wrong    |
+| A navigation intent         | Event            | Re-navigating on rotation is wrong                 |
+| A loading spinner           | State            | Should still spin if still loading after rotation  |
+| Vibration feedback          | Event            | Vibrating again is annoying                        |
+| Selected tab index          | State            | Survives rotation                                  |
+
+```kotlin
+sealed interface CatalogEvent {
+    data class NavigateToDetail(val productId: String) : CatalogEvent
+    data class ShowSnackbar(val message: String)       : CatalogEvent
+}
+
+@Composable
+fun CatalogRoute(viewModel: CatalogViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val snackbarHost = remember { SnackbarHostState() }
+    val nav = LocalNavController.current
+
+    LaunchedEffect(viewModel) {
+        viewModel.events.collect { event ->
+            when (event) {
+                is CatalogEvent.NavigateToDetail -> nav.navigate(Detail(event.productId))
+                is CatalogEvent.ShowSnackbar     -> snackbarHost.showSnackbar(event.message)
+            }
+        }
+    }
+
+    Scaffold(snackbarHost = { SnackbarHost(snackbarHost) }) { padding ->
+        CatalogScreen(state = state, onIntent = viewModel::onIntent, modifier = Modifier.padding(padding))
+    }
+}
+```
+
+<Callout kind="danger" title="Don't put events in state">
+A common anti-pattern: `data class UiState(val toast: String? = null, ...)`.
+After the toast shows, you must reset `toast = null`. On rotation, if you
+forget, the toast shows again. Use `SharedFlow<Event>` instead — it's
+designed for one-shots.
+</Callout>
+
+## Choosing patterns: complexity vs benefit
+
+<ComparisonCard
+  left={{
+    label: 'Plain MVVM',
+    title: 'Use when...',
+    variant: 'neutral',
+    points: [
+      'Screen has < 3 state branches',
+      '1–2 user intents',
+      'No complex async sequences',
+      'Solo developer or small team',
+      'Most CRUD screens'
+    ]
+  }}
+  right={{
+    label: 'MVI + Reducer',
+    title: 'Use when...',
+    variant: 'new',
+    points: [
+      'State has 5+ fields with constraints',
+      'Many intents driving transitions',
+      'Complex orchestration (debounce, retry)',
+      'Multiple devs sharing the screen',
+      'Needs deterministic time-travel debugging'
+    ]
+  }}
+/>
+
+## Side effects and the `LaunchedEffect` family
+
+| Effect              | When to use                                                    |
+|---------------------|----------------------------------------------------------------|
+| `LaunchedEffect(k)` | Run a coroutine when `k` changes; cancel on dispose            |
+| `rememberCoroutineScope` | Launch from event handlers (button onClick)              |
+| `DisposableEffect`  | Run setup; provide an `onDispose { }` for cleanup              |
+| `SideEffect`        | Run after every successful recomposition (analytics, logging)  |
+| `produceState`      | Convert non-Compose async source into a `State<T>`             |
+| `derivedState`      | Memoize an expensive computation derived from other states     |
+
+```kotlin
+@Composable
+fun ProductRow(product: Product) {
+    // SideEffect — fires on every successful recomposition
+    SideEffect { analytics.logVisible("product_row", product.id) }
+
+    // derivedStateOf — only recomposes downstream when result changes,
+    // even if other inputs change
+    val isOnSale by remember(product) {
+        derivedStateOf { product.discountPercent >= 10 }
+    }
+
+    Row { /* ... */ }
+}
+```
+
+## Practice
+
+<StepList steps={[
+  { title: 'Convert a stateful screen to MVI', description: 'Pick a screen that uses multiple var booleans. Collapse them into a UiState data class and an Intent sealed interface.' },
+  { title: 'Audit your state vs events', description: 'List every observable in your ViewModel. Mark each as state or event. Migrate misclassified ones.' },
+  { title: 'Use derivedStateOf', description: 'Find a place you compute the same value on every recomposition. Wrap it in derivedStateOf and verify recompositions drop in Layout Inspector.' }
+]} />

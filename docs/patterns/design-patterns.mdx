@@ -1,0 +1,233 @@
+---
+id: design-patterns
+title: Design Patterns in Android
+sidebar_label: Design Patterns
+description: The classic GoF and Android-specific patterns you'll use every day — Factory, Builder, Observer, Strategy, Adapter, Decorator, Singleton, Repository.
+---
+
+import { Callout, FeatureGrid } from '@site/src/components/Doc';
+
+# Design Patterns in Android
+
+Patterns are **named solutions to recurring problems**. You'll spot them in
+every Android API: `Notification.Builder`, `OkHttpClient.Builder`, `LiveData`
+(observer), `ViewModelProvider.Factory`. Knowing the names helps you read
+code, communicate with teammates, and choose the right shape for new code.
+
+## Creational
+
+### Singleton — exactly one instance
+
+```kotlin
+// Hilt manages the singleton scope for you
+@Module @InstallIn(SingletonComponent::class)
+object NetworkModule {
+    @Provides @Singleton
+    fun provideOkHttp(): OkHttpClient = OkHttpClient.Builder().build()
+}
+```
+
+In pure Kotlin, the `object` keyword creates a thread-safe singleton:
+
+```kotlin
+object Logger { fun d(tag: String, msg: String) = Log.d(tag, msg) }
+```
+
+<Callout kind="warning" title="Singletons are a trade-off">
+Singletons are easy to use but hard to test. Prefer DI-managed singletons
+(Hilt) over `object` for anything you might want to swap in tests.
+</Callout>
+
+### Factory — centralize construction
+
+```kotlin
+class ViewModelFactory @Inject constructor(
+    private val repo: UserRepository
+) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        require(modelClass == ProfileViewModel::class.java) { "Unknown VM" }
+        @Suppress("UNCHECKED_CAST")
+        return ProfileViewModel(repo) as T
+    }
+}
+```
+
+Hilt's `@HiltViewModel` is the modern replacement — you rarely write factories by hand.
+
+### Builder — step-by-step construction
+
+```kotlin
+val notification = NotificationCompat.Builder(ctx, CHANNEL_ID)
+    .setSmallIcon(R.drawable.ic_notification)
+    .setContentTitle("Order shipped")
+    .setContentText("Arriving Friday")
+    .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+    .setAutoCancel(true)
+    .build()
+```
+
+Kotlin's `apply` scope function makes builders even nicer:
+
+```kotlin
+val request = OneTimeWorkRequestBuilder<SyncWorker>().apply {
+    setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+    setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+}.build()
+```
+
+## Structural
+
+### Adapter — convert one interface to another
+
+The classic Android example is `RecyclerView.Adapter` — it adapts your data
+to the View recycling protocol. In modern code, **mappers** are adapters in
+disguise:
+
+```kotlin
+fun ProductDto.toEntity() = ProductEntity(
+    id = id,
+    name = name,
+    priceCents = priceCents,
+    fetchedAt = System.currentTimeMillis()
+)
+
+fun ProductEntity.toDomain() = Product(
+    id = id,
+    name = name,
+    price = Money.fromCents(priceCents)
+)
+```
+
+### Decorator — add behavior at runtime
+
+```kotlin
+class CachingProductRepository(
+    private val delegate: ProductRepository,
+    private val cache: Cache<String, Product>
+) : ProductRepository {
+    override suspend fun fetch(id: String): Product =
+        cache.getOrPut(id) { delegate.fetch(id) }
+}
+```
+
+Compose's `Modifier` chain is a decorator pipeline — each modifier wraps
+the previous behavior:
+
+```kotlin
+Modifier
+    .padding(8.dp)            // outer padding
+    .clip(RoundedCornerShape(8.dp))
+    .background(Color.Red)
+    .clickable { onClick() }  // click hits the rounded background
+    .padding(16.dp)           // inner padding
+```
+
+### Facade — simplify a complex subsystem
+
+A repository **is** a facade. Callers see `userRepo.fetch(id)`; behind it sit
+Retrofit, OkHttp, Moshi, Room, and a dispatcher. The complexity is hidden.
+
+## Behavioral
+
+### Observer — push updates to subscribers
+
+`StateFlow` and `SharedFlow` are observers. The Compose `State<T>` mechanism
+is also an observer — it tracks reads inside a composition and triggers
+recomposition on writes.
+
+```kotlin
+class CartViewModel : ViewModel() {
+    private val _items = MutableStateFlow<List<CartItem>>(emptyList())
+    val items: StateFlow<List<CartItem>> = _items.asStateFlow()
+}
+
+@Composable
+fun CartBadge(viewModel: CartViewModel) {
+    val items by viewModel.items.collectAsStateWithLifecycle()
+    BadgedBox(badge = { Badge { Text("${items.size}") } }) { Icon(Icons.Default.ShoppingCart, null) }
+}
+```
+
+### Strategy — interchangeable algorithms
+
+```kotlin
+interface SortStrategy {
+    fun sort(products: List<Product>): List<Product>
+}
+
+object PriceAscending : SortStrategy {
+    override fun sort(p: List<Product>) = p.sortedBy { it.price.cents }
+}
+
+object NewestFirst : SortStrategy {
+    override fun sort(p: List<Product>) = p.sortedByDescending { it.createdAt }
+}
+
+class CatalogViewModel(private val sort: SortStrategy) : ViewModel() {
+    val sorted = source.map { sort.sort(it) }
+}
+```
+
+### Command — encapsulate a request as an object
+
+Use cases (Module 04) are commands. Each one encapsulates a single intent
+that can be executed, queued, or undone:
+
+```kotlin
+class CheckoutUseCase @Inject constructor(
+    private val cart: CartRepository,
+    private val payment: PaymentGateway
+) {
+    suspend operator fun invoke(method: PaymentMethod): OrderId {
+        val items = cart.items()
+        val charge = payment.charge(items.total, method)
+        cart.clear()
+        return charge.orderId
+    }
+}
+```
+
+### State — encode behavior in state objects
+
+Sealed classes shine for state machines:
+
+```kotlin
+sealed interface DownloadState {
+    data object Idle                                : DownloadState
+    data class  Downloading(val progress: Int)      : DownloadState
+    data class  Done(val file: File)                : DownloadState
+    data class  Failed(val error: Throwable)        : DownloadState
+}
+
+@Composable
+fun DownloadView(state: DownloadState, onRetry: () -> Unit) {
+    when (state) {
+        DownloadState.Idle           -> Button(onClick = { /* start */ }) { Text("Download") }
+        is DownloadState.Downloading -> LinearProgressIndicator(progress = { state.progress / 100f })
+        is DownloadState.Done        -> Text("Saved to ${state.file.name}")
+        is DownloadState.Failed      -> ErrorRow(state.error.message ?: "Failed", onRetry)
+    }
+}
+```
+
+## Android-specific patterns
+
+<FeatureGrid columns={2} features={[
+  { icon: '🗄️', title: 'Repository', description: 'Hide the source-of-truth (network/DB/cache) behind a single interface for the rest of the app.' },
+  { icon: '🧩', title: 'Use Case', description: 'Encapsulate a single business operation as an object — testable, composable, undoable.' },
+  { icon: '🔄', title: 'Unidirectional Data Flow', description: 'State flows down, events flow up. The single rule that makes Compose tractable.' },
+  { icon: '💉', title: 'Dependency Injection', description: 'Hilt builds the object graph; you focus on declaring needs, not constructing them.' },
+  { icon: '📦', title: 'Sealed UI State', description: 'One UiState class per screen describes everything the View renders.' },
+  { icon: '⚡', title: 'Reducer / MVI', description: 'Single state, intents in, state out. The most disciplined version of MVVM.' }
+]} />
+
+<Callout kind="success" title="Patterns are vocabulary">
+You don't memorize patterns to use them — you memorize them to **recognize**
+them in code, talk about them with teammates, and choose the right shape for
+new code. The names matter as much as the implementations.
+</Callout>
+
+## Continue reading
+
+- **[State Patterns](/docs/patterns/state-patterns)** — sealed UiState, MVI, side-effect handling
+- **[Component Patterns](/docs/patterns/component-patterns)** — composable composition, slots, content lambdas

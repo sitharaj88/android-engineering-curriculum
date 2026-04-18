@@ -1,0 +1,177 @@
+---
+id: clean-architecture
+title: Clean Architecture for Android
+sidebar_label: Clean Architecture
+description: The Domain · Data · Presentation breakdown applied to a real Android app — with concrete folder layout, examples, and trade-offs.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Clean Architecture
+
+Clean Architecture is a **disciplined separation of concerns** popularized
+by Robert C. Martin. Applied to Android, it produces apps that are easy to
+test, easy to refactor, and resilient to library changes.
+
+## The dependency rule
+
+> **Source code dependencies must point only inward.** Inner layers know
+> nothing about outer layers.
+
+```text
+  Outer (Frameworks, Android, Retrofit, Room, Compose)
+        ▼ depends on
+   Presentation (ViewModels, Composables)
+        ▼ depends on
+        Domain (use cases, entities, repository interfaces)  ← knows nothing else
+        ▲ implemented by
+        Data (repository impls, DAOs, Retrofit services)
+```
+
+The **Domain** layer is pure Kotlin. No `import androidx.*`, no `import retrofit2.*`.
+This is what makes it portable to KMP and trivial to unit test.
+
+## Concrete project layout
+
+```text
+:app                                   -> Application class, DI roots
+:core
+  :design                              -> theme, typography, design tokens (Compose)
+  :ui                                  -> reusable Composables (Button styles, EmptyState)
+  :testing                             -> shared test fixtures and rules
+:domain
+  └── product/
+      ├── Product.kt                   -- entity (data class with no annotations)
+      ├── ProductRepository.kt         -- interface
+      └── usecase/
+          ├── GetProductUseCase.kt
+          └── ToggleWishlistUseCase.kt
+:data
+  └── product/
+      ├── ProductRepositoryImpl.kt     -- implements domain interface
+      ├── remote/
+      │   ├── ProductApi.kt            -- Retrofit interface
+      │   └── ProductDto.kt
+      └── local/
+          ├── ProductDao.kt            -- Room DAO
+          └── ProductEntity.kt
+:feature
+  :catalog                             -> CatalogScreen + CatalogViewModel
+  :detail                              -> ProductDetailScreen + ProductDetailViewModel
+  :wishlist                            -> WishlistScreen + WishlistViewModel
+```
+
+Each `:feature:*` module:
+- Depends on `:domain` (for use cases & entities) and `:core:ui`/`:core:design`.
+- **Does not** depend on `:data` directly — Hilt wires the implementation in `:app`.
+- **Does not** depend on other feature modules.
+
+## A request flow, end to end
+
+### 1. The user taps a product card
+
+```kotlin
+// :feature:catalog
+@Composable
+fun CatalogScreen(viewModel: CatalogViewModel = hiltViewModel(), onProductClick: (String) -> Unit) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    LazyColumn {
+        items(state.products, key = { it.id }) { product ->
+            ProductRow(product, onClick = { onProductClick(product.id) })
+        }
+    }
+}
+```
+
+### 2. The ViewModel calls the use case
+
+```kotlin
+// :feature:catalog
+@HiltViewModel
+class CatalogViewModel @Inject constructor(
+    private val getCatalog: GetCatalogUseCase
+) : ViewModel() {
+    val state: StateFlow<CatalogUiState> = getCatalog()
+        .map { CatalogUiState(products = it) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CatalogUiState())
+}
+```
+
+### 3. The use case orchestrates repositories
+
+```kotlin
+// :domain
+class GetCatalogUseCase @Inject constructor(
+    private val productRepo: ProductRepository,
+    private val wishlistRepo: WishlistRepository
+) {
+    operator fun invoke(): Flow<List<Product>> = combine(
+        productRepo.observeAll(),
+        wishlistRepo.observeIds()
+    ) { products, wishIds ->
+        products.map { it.copy(isInWishlist = it.id in wishIds) }
+    }
+}
+```
+
+### 4. The repository hides the source of truth
+
+```kotlin
+// :data
+class ProductRepositoryImpl @Inject constructor(
+    private val api: ProductApi,
+    private val dao: ProductDao,
+    @IoDispatcher private val io: CoroutineDispatcher
+) : ProductRepository {
+    override fun observeAll(): Flow<List<Product>> = dao.observeAll()
+        .map { entities -> entities.map(ProductEntity::toDomain) }
+        .onStart { withContext(io) { runCatching { refresh() } } }
+
+    private suspend fun refresh() {
+        val fresh = api.list()
+        dao.replaceAll(fresh.map(ProductDto::toEntity))
+    }
+}
+```
+
+## Trade-offs to be honest about
+
+<ComparisonCard
+  left={{
+    label: 'Wins',
+    title: 'Why teams adopt this',
+    variant: 'new',
+    points: [
+      'Domain is trivially unit-testable',
+      'Library swaps (Retrofit → Ktor) only touch :data',
+      'Modules build in parallel — faster CI',
+      'Clear ownership boundaries between teams',
+      'KMP-ready: :domain compiles on any platform'
+    ]
+  }}
+  right={{
+    label: 'Costs',
+    title: 'What you pay',
+    variant: 'old',
+    points: [
+      'More files for the same feature',
+      'Mappers (DTO ↔ Entity ↔ Domain) feel like duplication',
+      'Onboarding takes longer for juniors',
+      'Trivial use cases that just delegate add noise',
+      'Gradle module graph requires care'
+    ]
+  }}
+/>
+
+## Pragmatic rules
+
+<Callout kind="success" title="Apply judgment">
+- Skip use cases when a ViewModel calls one repo method with no extra logic.
+- Don't extract a `:feature:foo` module for a single screen.
+- Mappers earn their keep: keep DTOs nullable + lenient, keep Domain models strict + non-null.
+- Modularize when build times exceed 90 seconds incremental, not before.
+</Callout>
+
+## Continue reading
+
+- **[Project Structure](/docs/architecture/project-structure)** — naming conventions, Gradle catalog, source sets.

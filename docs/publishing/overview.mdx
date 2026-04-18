@@ -1,0 +1,244 @@
+---
+id: overview
+title: Module 11 — Google Play Store & Publishing
+sidebar_label: Overview
+description: Play Console setup, app signing, App Bundles, in-app purchases, subscriptions, AdMob monetization, and ASO strategies.
+---
+
+import { Callout, StepList, FeatureGrid, ComparisonCard } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 11 of 13</span>
+  <span><strong>Duration:</strong> 2 weeks</span>
+  <span><strong>Topics:</strong> 2 · 4 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 01–10</span>
+</div>
+
+# Google Play Store & Publishing
+
+Building the app is half the job. Getting it into users' hands — and getting
+paid — is the other half. This module covers the entire publishing pipeline
+from your first signing key to your first paying customer.
+
+## Topic 1 · Publishing
+
+### Play Console setup & app signing
+
+Create a developer account at **play.google.com/console** ($25 one-time fee).
+Create your app entry, fill out store listing, content rating, target audience,
+data safety, and privacy policy URL.
+
+**Play App Signing** is mandatory: you upload an **App Bundle signed with an
+upload key**, and Google re-signs the artifacts that ship to users with the
+**app signing key** (which Google holds securely on your behalf).
+
+```bash
+# Generate an upload keystore (do this ONCE; back it up safely)
+keytool -genkey -v \
+  -keystore upload-keystore.jks \
+  -keyalg RSA -keysize 2048 -validity 10000 \
+  -alias upload
+```
+
+Configure signing in Gradle (load from `~/.gradle/gradle.properties`, never commit credentials):
+
+```kotlin
+// app/build.gradle.kts
+android {
+    signingConfigs {
+        create("release") {
+            storeFile = file(System.getenv("UPLOAD_KEYSTORE_PATH") ?: "upload-keystore.jks")
+            storePassword = System.getenv("UPLOAD_STORE_PASSWORD")
+            keyAlias       = System.getenv("UPLOAD_KEY_ALIAS")
+            keyPassword    = System.getenv("UPLOAD_KEY_PASSWORD")
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = true
+            isShrinkResources = true
+        }
+    }
+}
+```
+
+<Callout kind="danger" title="Lose the upload key, lose nothing — lose the app signing key, lose the app">
+With Play App Signing, a lost **upload key** can be reset by Google support
+(2–3 days). Without Play App Signing (legacy), losing the **app signing
+key** means you can never update the app again. Always enable Play App
+Signing.
+</Callout>
+
+### Building the App Bundle
+
+Android App Bundles (.aab) ship the universal artifact to Google Play; Play
+generates per-device APKs, reducing download size by 15–25%.
+
+```bash
+# Local build
+./gradlew bundleRelease
+
+# Output
+app/build/outputs/bundle/release/app-release.aab
+```
+
+Upload the `.aab` to a release track (Internal → Closed → Open → Production).
+Use **Internal Testing** for your team, **Closed Testing** for beta groups,
+**Open Testing** for public betas.
+
+### Release tracks & staged rollouts
+
+| Track            | Audience                                   | Use for                          |
+|------------------|--------------------------------------------|----------------------------------|
+| Internal         | Up to 100 testers via email                | Daily smoke tests                |
+| Closed           | Email lists or Google groups               | Beta partners, regulated testing |
+| Open             | Anyone with the testing URL                | Public betas                     |
+| Production       | Everyone — staged rollouts available        | Live releases                    |
+
+Always use **staged rollout** for production (e.g., 1% → 5% → 20% → 50% → 100%
+over 5–7 days). Watch Crashlytics during each phase and **halt the rollout**
+if you see new crash spikes.
+
+---
+
+## Topic 2 · Monetization
+
+### In-app purchases & subscriptions
+
+Use the **Google Play Billing Library 7+**. It supports one-time purchases
+(consumable & non-consumable) and subscriptions with offers, upgrades, and
+free trials.
+
+```kotlin
+// 1. Connect to Play Billing
+val billingClient = BillingClient.newBuilder(ctx)
+    .setListener { result, purchases -> /* handle results */ }
+    .enablePendingPurchases(PendingPurchasesParams.newBuilder().enableOneTimeProducts().build())
+    .build()
+
+billingClient.startConnection(object : BillingClientStateListener {
+    override fun onBillingSetupFinished(result: BillingResult) { /* ready */ }
+    override fun onBillingServiceDisconnected() { /* reconnect */ }
+})
+
+// 2. Query products
+val params = QueryProductDetailsParams.newBuilder()
+    .setProductList(listOf(
+        QueryProductDetailsParams.Product.newBuilder()
+            .setProductId("pro_subscription")
+            .setProductType(BillingClient.ProductType.SUBS)
+            .build()
+    ))
+    .build()
+
+val (result, products) = billingClient.queryProductDetails(params)
+
+// 3. Launch purchase flow
+val flowParams = BillingFlowParams.newBuilder()
+    .setProductDetailsParamsList(listOf(
+        BillingFlowParams.ProductDetailsParams.newBuilder()
+            .setProductDetails(products!!.first())
+            .setOfferToken(products.first().subscriptionOfferDetails?.firstOrNull()?.offerToken!!)
+            .build()
+    ))
+    .build()
+
+billingClient.launchBillingFlow(activity, flowParams)
+```
+
+<Callout kind="warning" title="Always verify on your server">
+Client-side purchase verification is trivially bypassed. Send the purchase
+token to your backend and verify it with the **Google Play Developer API**.
+Only then unlock entitlements.
+</Callout>
+
+### Ad monetization with AdMob
+
+For ad-supported apps, integrate **Google Mobile Ads SDK**. Three primary ad
+formats:
+
+| Format         | Best for                              |
+|----------------|---------------------------------------|
+| **Banner**     | Persistent low-intrusion (small bottom strip) |
+| **Interstitial** | Natural break points (level end, screen transition) |
+| **Rewarded**   | Optional value exchange (extra lives, hint, premium content) |
+
+Show ads sparingly. Two interstitials in a five-minute session destroys
+retention faster than zero ads.
+
+### App Store Optimization (ASO)
+
+ASO is SEO for the Play Store. The factors that matter:
+
+<FeatureGrid columns={2} features={[
+  { icon: '🔑', title: 'Title & short description', description: 'Include 1–2 high-volume keywords; first 80 characters of description matter most.' },
+  { icon: '🎨', title: 'Icon, screenshots, video', description: 'A great icon raises CTR 30%+. Screenshots tell the story; the first three are most viewed.' },
+  { icon: '⭐', title: 'Ratings & reviews', description: 'Above 4.4 ★ unlocks featured placements. Use the in-app review API at the right moment.' },
+  { icon: '⚡', title: 'Install speed & retention', description: 'Play\'s ranking model rewards apps users keep open. Optimize startup and onboarding.' },
+  { icon: '🌍', title: 'Localization', description: 'Localize at least the title, description, and screenshots for your top 5 markets.' },
+  { icon: '📈', title: 'A/B testing', description: 'Use Play Console Store Listing Experiments to test icon/screenshot/description variants.' }
+]} />
+
+```kotlin
+// In-app review prompt — choose a moment of high satisfaction
+val reviewManager = ReviewManagerFactory.create(ctx)
+val flow = reviewManager.requestReviewFlow().await()
+reviewManager.launchReviewFlow(activity, flow).await()
+```
+
+---
+
+## Pre-launch checklist
+
+<ComparisonCard
+  left={{
+    label: 'Before submitting',
+    title: 'Must-have',
+    variant: 'new',
+    points: [
+      'Privacy policy URL filled in',
+      'Data safety form completed accurately',
+      'Target API level meets Play requirements',
+      'App signing via Play App Signing enabled',
+      'ProGuard / R8 enabled and tested',
+      'Crashlytics + Analytics live'
+    ]
+  }}
+  right={{
+    label: 'Easy to forget',
+    title: 'Often missed',
+    variant: 'old',
+    points: [
+      'Permission rationale strings localized',
+      'Backup rules (no secrets in backup)',
+      'Network security config (no cleartext)',
+      'Adaptive icon variants',
+      'App Bundle device targeting checked',
+      'Phased rollout configured'
+    ]
+  }}
+/>
+
+## Key takeaways
+
+<Callout kind="success" title="Publishing rules">
+- Always enable **Play App Signing** — protects you against key loss.
+- Always upload an **App Bundle**, never an APK.
+- Use **staged rollouts** and watch Crashlytics during each phase.
+- Verify in-app purchases **server-side** via the Play Developer API.
+- Optimize the **store listing** — icon, screenshots, first 80 chars of description.
+- Localize for your top markets and run **store listing experiments**.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Build & sign a release bundle', description: 'Generate an upload keystore, configure signing in Gradle, and produce app-release.aab.' },
+  { title: 'In-app review', description: 'Show the in-app review prompt after a user completes their third successful action.' },
+  { title: 'ASO audit', description: 'Take a real public app on Play Store and write a critique of its title, icon, screenshots, and description.' }
+]} />
+
+## Next module
+
+Continue to **[Module 12 — Advanced & Trending Topics](/docs/advanced-trending/overview)** for KMP, ML Kit, Wear OS, BLE, and more.

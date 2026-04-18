@@ -1,0 +1,246 @@
+---
+id: overview
+title: Module 13 — Version Control & Collaboration
+sidebar_label: Overview
+description: Git fundamentals, branching strategies, pull requests, code reviews, and conventional commits for team workflows.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 13 of 13</span>
+  <span><strong>Duration:</strong> 1 week</span>
+  <span><strong>Topics:</strong> 1 · 2 subtopics</span>
+  <span><strong>Prerequisites:</strong> Any module — but valuable from day one</span>
+</div>
+
+# Version Control & Collaboration
+
+Code that isn't in Git might as well not exist. This module gives you the
+**Git workflow vocabulary** every team uses — branching, pull requests,
+reviews, and conventional commits — so you can join any modern Android
+team and contribute on day one.
+
+## Topic 1 · Git & Collaboration
+
+### Git fundamentals
+
+The mental model: a Git repository is a **graph of commits**, each commit
+being a **snapshot of every file** plus a pointer to its parent(s). Branches
+are just **named pointers** to commits.
+
+```bash
+# One-time setup
+git config --global user.name  "Sitharaj S."
+git config --global user.email "sitharaj.info@gmail.com"
+git config --global init.defaultBranch main
+git config --global pull.rebase true
+
+# Daily workflow
+git checkout -b feature/profile-screen        # branch from main
+# ...edit files...
+git add -p                                    # stage changes interactively
+git commit -m "feat(profile): add bio editor"
+git push -u origin feature/profile-screen
+# ...open a Pull Request, get reviewed, merge...
+git checkout main && git pull
+git branch -d feature/profile-screen          # local cleanup
+```
+
+Key concepts:
+
+| Concept       | What it does                                              |
+|---------------|-----------------------------------------------------------|
+| **commit**    | A snapshot with author, timestamp, and message            |
+| **branch**    | A movable pointer to a commit                             |
+| **HEAD**      | Where you are right now (usually a branch tip)            |
+| **stage**     | The index — what will go into the next commit             |
+| **remote**    | A reference to another repo (typically GitHub origin)     |
+| **fetch**     | Download remote changes; don't merge them                 |
+| **pull**      | fetch + merge (or rebase, with `pull.rebase=true`)        |
+| **rebase**    | Replay commits onto a new base — produces linear history  |
+| **merge**     | Combine two branches with a merge commit                  |
+
+### Branching strategies
+
+<ComparisonCard
+  left={{
+    label: 'Trunk-based',
+    title: 'Modern, continuous',
+    variant: 'new',
+    points: [
+      'Short-lived feature branches (< 1 day)',
+      'Frequent merges to main',
+      'CI runs on every push',
+      'Feature flags hide unfinished work',
+      'Used at Google, Facebook, Netflix'
+    ]
+  }}
+  right={{
+    label: 'GitFlow',
+    title: 'Heavy, release-train',
+    variant: 'old',
+    points: [
+      'Long-lived develop + release branches',
+      'Hotfix branches diverge from main',
+      'Release-cycle waterfalls',
+      'Heavy ceremony for each merge',
+      'Suits scheduled enterprise releases'
+    ]
+  }}
+/>
+
+For most modern Android teams, **trunk-based with short-lived feature
+branches** is the right default. Use feature flags (Module 07: Remote Config)
+to hide work-in-progress from production users.
+
+### Pull Requests & code reviews
+
+A **Pull Request (PR)** is a proposal to merge your branch into main. Reviewers
+read your diff, suggest changes, and approve when satisfied.
+
+What makes a great PR:
+
+- **Small** (< 400 lines changed). Big PRs get rubber-stamped.
+- **Focused** — one logical change. No drive-by refactors.
+- **Tested** — new tests for new behavior; updated tests for changed behavior.
+- **Descriptive title and body** — *why* the change exists, not just *what*.
+- **Self-reviewed first** — you spot half the issues before anyone else looks.
+- **Screenshots / GIFs** for UI changes.
+
+What makes a great review:
+
+- Be **kind, specific, and timely** — within one business day.
+- Suggest **alternatives**, not just objections.
+- Distinguish blocking issues (`please change`) from preferences (`nit:`).
+- **Approve when good enough**, not when perfect.
+
+```text
+# A good PR description
+
+## Why
+Login fails silently when network is offline — users see a spinner forever.
+
+## What changed
+- AuthRepository now wraps API call in safeApiCall() (Module 06 pattern)
+- LoginViewModel exposes a UiError state
+- LoginScreen shows a snackbar with retry on UiError.Network
+
+## Testing
+- Unit: AuthRepositoryTest::loginPropagatesNetworkError
+- Manual: airplane mode + Login → snackbar appears within 2s
+```
+
+### Conventional Commits
+
+A convention for commit message format that powers automatic CHANGELOGs and
+semantic-version bumps:
+
+```text
+<type>(<scope>): <short summary>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+Common types:
+
+| Type      | Meaning                                       | Triggers          |
+|-----------|-----------------------------------------------|-------------------|
+| `feat`    | New feature                                   | Minor version     |
+| `fix`     | Bug fix                                       | Patch version     |
+| `docs`    | Documentation only                            | None              |
+| `refactor`| Code change, no behavior change               | None              |
+| `test`    | Adding/fixing tests                           | None              |
+| `chore`   | Build, deps, tooling                          | None              |
+| `perf`    | Performance improvement                       | Patch             |
+| `feat!:`  | Breaking change (or `BREAKING CHANGE` footer) | Major             |
+
+```text
+feat(profile): add bio editor with 280-char limit
+
+The Profile screen now supports inline bio editing using a
+multi-line OutlinedTextField with character count. Persists
+through ProfileRepository.
+
+Closes #248
+```
+
+<Callout kind="tip" title="Make commits speak">
+A year from now, `git blame` will quote these messages back to you. Future
+you will thank present you for "feat(checkout): handle Razorpay UPI failures
+when SDK returns null txnId" instead of "fix bug".
+</Callout>
+
+### Useful Git tooling
+
+| Tool                  | Why                                              |
+|-----------------------|--------------------------------------------------|
+| **GitHub CLI (`gh`)** | Open PRs, review, merge from terminal           |
+| **lazygit**           | Beautiful TUI for staging, history, branches    |
+| **pre-commit hooks**  | Run lint, format, secrets scan before commit    |
+| **commitlint**        | Enforce Conventional Commits in CI              |
+
+Install commitlint + Husky-equivalent for Gradle teams via a Git hook:
+
+```bash
+# .git/hooks/commit-msg (or use cz-cli / commitizen)
+#!/bin/sh
+npx --no -- commitlint --edit "$1"
+```
+
+---
+
+## Working with GitHub day-to-day
+
+```bash
+gh pr create --fill                    # open a PR using current branch + commits
+gh pr checks                           # see CI status on the current PR
+gh pr review --approve -b "LGTM"       # approve from terminal
+gh pr merge --squash --delete-branch   # squash-merge and clean up
+```
+
+**Squash, rebase, or merge?**
+
+- **Squash** — collapse your branch into one commit on main. Cleanest history; default for most teams.
+- **Rebase** — preserve individual commits but linearize history. Good when commits tell a clean story.
+- **Merge** — keep both branches' commits with an explicit merge commit. Useful for long-lived release branches.
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Git rules to live by">
+- **Commit early, push often.** Local-only work is a single point of failure.
+- **Branch per change**, never directly on main. Always open a PR.
+- **Conventional Commits** — pay 30 seconds now to save hours later.
+- **Trunk-based** for most teams. Use feature flags for unfinished work.
+- **Reviews are conversations**, not gatekeeping. Be kind and specific.
+- **Small PRs ship faster** — break work into reviewable slices.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'PR your own work', description: 'Take any project from this curriculum, push it to GitHub, and open a PR with a Conventional-Commits title and a structured body.' },
+  { title: 'Interactive rebase', description: 'On a feature branch with 5+ messy commits, run git rebase -i HEAD~5 and squash/reword to a clean 2–3 commit story.' },
+  { title: 'Set up commitlint', description: 'Add a Git hook that rejects commit messages not matching the Conventional Commits format.' }
+]} />
+
+## You've finished the curriculum 🎉
+
+You've covered Kotlin, Android fundamentals, Compose, architecture,
+persistence, networking, Firebase, advanced components, testing, performance,
+publishing, advanced topics, and now collaboration. The next step is the
+hardest and most rewarding: **build something real and ship it.**
+
+Pick one of the **5 portfolio projects** from the landing page and execute
+end-to-end. Use the **Architecture Guide** and **Design Patterns** sections
+in the sidebar as your reference while you build.
+
+<Callout kind="info" title="Stay current">
+Android moves fast. Subscribe to the **Android Developers Blog**, **Now in
+Android** podcast, and Google I/O sessions every May. Star the Jetpack
+release notes — that's how you stay sharp.
+</Callout>

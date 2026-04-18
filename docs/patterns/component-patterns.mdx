@@ -1,0 +1,258 @@
+---
+id: component-patterns
+title: Component Patterns in Compose
+sidebar_label: Component Patterns
+description: How to design Composables that compose well — slot APIs, content lambdas, stateful vs stateless, and the rules that keep your design system flexible.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Component Patterns
+
+Compose's superpower isn't that it's reactive — it's that **Composables
+compose**. A well-designed component slots into any context like Lego.
+Designing for composition is the difference between a UI kit you fight and
+one you fly.
+
+## Stateless and stateful pairs
+
+For every reusable component, ship **two layers**:
+
+1. A **stateless** version that takes state and callbacks as parameters.
+2. A **stateful** wrapper that owns state internally for convenience.
+
+```kotlin
+// Stateless — works anywhere, perfectly testable
+@Composable
+fun PasswordField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    visible: Boolean,
+    onVisibilityToggle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = modifier,
+        visualTransformation = if (visible) VisualTransformation.None else PasswordVisualTransformation(),
+        trailingIcon = {
+            IconButton(onClick = onVisibilityToggle) {
+                Icon(if (visible) Icons.Default.Visibility else Icons.Default.VisibilityOff, null)
+            }
+        }
+    )
+}
+
+// Stateful — convenient default for most callers
+@Composable
+fun PasswordField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var visible by rememberSaveable { mutableStateOf(false) }
+    PasswordField(value, onValueChange, visible, { visible = !visible }, modifier)
+}
+```
+
+Now teams who need full control use the first; everyone else uses the
+second.
+
+## Slot APIs — the most powerful Compose pattern
+
+A **slot** is a `@Composable` lambda parameter. Slots invert control:
+the parent decides **what** goes in a position; the component decides **how**
+it's laid out.
+
+This is exactly how `Scaffold`, `Card`, `Button`, and every Material
+component work:
+
+```kotlin
+@Composable
+fun AppCard(
+    title: String,
+    modifier: Modifier = Modifier,
+    leading: @Composable (() -> Unit)? = null,         // optional slot
+    trailing: @Composable (() -> Unit)? = null,        // optional slot
+    content: @Composable ColumnScope.() -> Unit        // required content slot
+) {
+    Card(modifier = modifier) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                leading?.invoke()
+                if (leading != null) Spacer(Modifier.width(12.dp))
+                Text(title, modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                trailing?.invoke()
+            }
+            Spacer(Modifier.height(12.dp))
+            content()
+        }
+    }
+}
+
+// Caller decides exactly what each slot looks like
+AppCard(
+    title = "Profile",
+    leading = { Icon(Icons.Default.Person, null) },
+    trailing = { TextButton(onClick = ::edit) { Text("Edit") } }
+) {
+    Text("Aarav")
+    Text("aarav@example.com")
+}
+```
+
+<Callout kind="success" title="Slots beat dozens of parameters">
+Without slots, you'd add `iconResource: Int? = null`, `iconTint: Color = ...`,
+`iconContentDescription: String? = null`, `actionLabel: String? = null`,
+`onActionClick: (() -> Unit)? = null` — and you still couldn't accommodate
+the next caller. Slots let callers express anything.
+</Callout>
+
+## The `Modifier` parameter convention
+
+Every public composable should accept a `modifier: Modifier = Modifier` as
+the first optional parameter. This lets callers position, size, and decorate
+your component without hacks.
+
+```kotlin
+@Composable
+fun ProductRow(
+    product: Product,                          // 1. required state
+    onClick: () -> Unit,                        // 2. required callbacks
+    modifier: Modifier = Modifier,             // 3. modifier (always 3rd or first optional)
+    showPrice: Boolean = true                  // 4. component-specific options
+)
+```
+
+Apply the modifier to the **outermost layout** of the component, before any
+internal modifiers:
+
+```kotlin
+@Composable
+fun ProductRow(product: Product, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier              // ← caller's modifier first
+            .fillMaxWidth()              // ← then component's defaults
+            .clickable(onClick = onClick)
+            .padding(16.dp)
+    ) { /* ... */ }
+}
+```
+
+## Hoist state the right amount
+
+A common mistake is hoisting state too far up — driving every text-field's
+value through a top-level ViewModel. The rule:
+
+> Hoist state to the **lowest common ancestor** of all composables that read
+> or write it.
+
+If only one component reads/writes the state, leave it local. If two siblings
+need it, hoist to their parent. If a screen-level event modifies it, hoist
+to the ViewModel. **Stop there.**
+
+## Driving state from props with `key`
+
+`remember` keeps the same value across recompositions. To **reset** when an
+input changes, pass it as a key:
+
+```kotlin
+@Composable
+fun ImageZoomBox(imageUrl: String) {
+    // Reset zoom every time imageUrl changes
+    var scale by remember(imageUrl) { mutableFloatStateOf(1f) }
+    // ...
+}
+```
+
+## Performance hygiene for components
+
+<ComparisonCard
+  left={{
+    label: 'Avoid',
+    title: 'Common perf mistakes',
+    variant: 'old',
+    points: [
+      'Allocating lists/maps inside @Composable',
+      'Calling System.currentTimeMillis() in composition',
+      'Reading large objects through unstable wrappers',
+      'Lambdas captured by changing scopes (re-allocated)',
+      'Forgetting key on items() in lazy lists'
+    ]
+  }}
+  right={{
+    label: 'Do',
+    title: 'Faster patterns',
+    variant: 'new',
+    points: [
+      'remember { listOf(...) } once',
+      'derivedStateOf to memoize expensive computation',
+      'Mark data classes @Stable / @Immutable when safe',
+      'Pass method references (vm::onClick) instead of lambdas',
+      'Always provide stable keys'
+    ]
+  }}
+/>
+
+## Theming a component
+
+Components should consume **MaterialTheme tokens**, not hardcoded values.
+This makes them automatically adapt to light/dark and dynamic color.
+
+```kotlin
+@Composable
+fun StatusBadge(text: String, kind: StatusKind, modifier: Modifier = Modifier) {
+    val (bg, fg) = when (kind) {
+        StatusKind.Success -> MaterialTheme.colorScheme.primaryContainer   to MaterialTheme.colorScheme.onPrimaryContainer
+        StatusKind.Warning -> MaterialTheme.colorScheme.tertiaryContainer  to MaterialTheme.colorScheme.onTertiaryContainer
+        StatusKind.Error   -> MaterialTheme.colorScheme.errorContainer     to MaterialTheme.colorScheme.onErrorContainer
+    }
+    Surface(color = bg, shape = MaterialTheme.shapes.small, modifier = modifier) {
+        Text(
+            text = text,
+            color = fg,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+        )
+    }
+}
+```
+
+## Previews — design and document at once
+
+Every public component should ship with `@Preview` definitions covering its
+key states. Previews double as **visual documentation** in Android Studio.
+
+```kotlin
+@Preview(name = "Light", showBackground = true)
+@Preview(name = "Dark", uiMode = Configuration.UI_MODE_NIGHT_YES)
+@Composable
+private fun ProductRowPreview() {
+    AppTheme {
+        ProductRow(
+            product = Product("1", "Wireless Earbuds", Money.fromCents(4999)),
+            onClick = {}
+        )
+    }
+}
+```
+
+For systematic component-library coverage, organize previews into a
+`PreviewGallery` screen — your team gets a live design-system browser without
+extra tooling.
+
+## A component checklist
+
+<StepList steps={[
+  { title: 'Stateless first', description: 'Build the stateless version. Add a stateful wrapper only if it earns its place.' },
+  { title: 'Modifier param', description: 'Accept modifier as the first optional parameter; apply it to the outermost layout.' },
+  { title: 'Slots over flags', description: 'When tempted to add isFooVisible, add a foo: @Composable () -> Unit slot instead.' },
+  { title: 'Theme tokens', description: 'No hex colors, no hardcoded sp. Use MaterialTheme.colorScheme / typography / shapes.' },
+  { title: 'Preview the states', description: 'At least light + dark + empty/loading/error if applicable.' }
+]} />
+
+<Callout kind="success" title="Compose in one line">
+**State down, events up, slots out.** Get those three right and your
+components compose forever.
+</Callout>

@@ -1,0 +1,99 @@
+---
+id: overview
+title: Architecture Guide — Overview
+sidebar_label: Overview
+description: A cross-cutting view of Android app architecture — how MVVM, Clean Architecture, modularization, and reactive state work together in real apps.
+---
+
+import { Callout, FeatureGrid } from '@site/src/components/Doc';
+
+# Architecture Guide
+
+This section is the **reference companion** to the curriculum modules. While
+each module teaches one slice of the stack, this guide steps back and shows
+how those slices fit together in a production codebase.
+
+<Callout kind="tip" title="When to read this">
+Read this **after** Module 04 (Architecture & Patterns). Re-read it whenever
+you start a new project or join a new team — it's the map you keep open
+while you build.
+</Callout>
+
+## The big picture
+
+A modern Android app is a **layered, reactive, dependency-injected** system:
+
+```text
+                ┌────────────────────────────────────────┐
+                │       Compose UI (Composables)          │
+                │                                         │
+                │   ─── observes StateFlow / SharedFlow ──┘
+                ▼                                         
+      ┌────────────────┐    sends events    ┌────────────────┐
+      │   ViewModel    │◀──────────────────│      User       │
+      │ (StateFlow,    │                    └────────────────┘
+      │  SharedFlow)   │
+      └───────┬────────┘
+              │ calls suspend / Flow
+              ▼
+      ┌────────────────┐
+      │   Use Case     │   pure Kotlin business rule
+      └───────┬────────┘
+              │
+              ▼
+      ┌────────────────┐    interface only
+      │  Repository    │◀──── Domain knows the contract
+      └───────┬────────┘
+              │ implemented in :data
+              ▼
+      ┌──────────────────────────────────────────┐
+      │  Network · Database · DataStore · Cache  │
+      └──────────────────────────────────────────┘
+```
+
+Three principles drive every decision:
+
+<FeatureGrid columns={3} features={[
+  { icon: '🧭', title: 'Single Source of Truth', description: 'For every piece of data, one place owns it. Everyone else observes.' },
+  { icon: '🔄', title: 'Reactive Streams', description: 'State propagates automatically via Flow / StateFlow — no manual notification.' },
+  { icon: '🪜', title: 'Dependency Inversion', description: 'Outer layers depend on inner abstractions. Domain depends on no Android, no library.' }
+]} />
+
+## Pick the right architecture for the project
+
+Not every app needs full Clean Architecture. Be honest about the size:
+
+| App size                          | Recommended architecture                              |
+|-----------------------------------|-------------------------------------------------------|
+| Hackathon / proof of concept      | MVVM + Repository, single module                      |
+| Indie app, < 20 screens           | MVVM + Repository + Hilt, optional `:domain` module   |
+| Production, 20+ screens, team     | Clean Architecture + modularization + KMP-ready       |
+| Multi-platform (Android + iOS)    | Clean Architecture + KMP `:shared` module             |
+
+**Over-engineering is the most common mistake.** A use case that just calls
+one repository method adds boilerplate with no benefit. Start lean, evolve
+toward Clean Architecture as the codebase grows.
+
+## State as the contract
+
+A screen has **one UI state class** that fully describes what to render:
+
+```kotlin
+data class ProductDetailUiState(
+    val isLoading: Boolean = false,
+    val product: Product? = null,
+    val isInWishlist: Boolean = false,
+    val error: String? = null
+)
+```
+
+The View renders deterministically from this state. The ViewModel updates
+it. Tests assert the state transitions. Nothing else changes UI.
+
+For **events** (one-shot — navigation, snackbar, toast), use a separate
+`SharedFlow<Event>`. Don't put events in state — they'll replay on rotation.
+
+## Continue reading
+
+- **[Clean Architecture](/docs/architecture/clean-architecture)** — the layered Domain/Data/Presentation breakdown
+- **[Project Structure](/docs/architecture/project-structure)** — Gradle modules, package layout, naming conventions

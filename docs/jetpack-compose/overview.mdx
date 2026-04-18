@@ -1,0 +1,380 @@
+---
+id: overview
+title: Module 03 — Modern UI with Jetpack Compose
+sidebar_label: Overview
+description: Declarative UI, modifiers, Material 3 theming, state hoisting, navigation, animations, and Compose-XML interop.
+---
+
+import { Callout, ComparisonCard, StepList, FeatureGrid, LibraryGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 03 of 13</span>
+  <span><strong>Duration:</strong> 4 weeks</span>
+  <span><strong>Topics:</strong> 4 · 8 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 01–02</span>
+</div>
+
+# Modern UI with Jetpack Compose
+
+Jetpack Compose is **the recommended way** to build Android UIs. It replaces
+XML layouts and the imperative View system with a **declarative**, **reactive**
+toolkit written entirely in Kotlin. Once you internalize the mental model —
+"UI is a function of state" — building screens becomes dramatically faster
+and less error-prone.
+
+<Callout kind="tip" title="Why declarative beats imperative">
+With XML + Views, you mutate UI elements directly: `binding.title.text = "X"`,
+`binding.button.isEnabled = false`. As state grows, keeping these mutations
+consistent becomes a nightmare. Compose flips this: you describe **what** the
+UI should look like for the current state, and the framework figures out
+**how** to update the screen efficiently.
+</Callout>
+
+## Topic 1 · Compose Fundamentals
+
+### Declarative UI & the Compose philosophy
+
+A **Composable function** describes a piece of UI. It takes parameters (state)
+and emits UI. When the state changes, Compose calls the function again — a
+process called **recomposition**.
+
+```kotlin
+@Composable
+fun Greeting(name: String) {
+    Text(text = "Hello, $name!")
+}
+
+// Use it
+@Composable
+fun App() {
+    Column(modifier = Modifier.padding(16.dp)) {
+        Greeting(name = "Aarav")
+        Greeting(name = "Diya")
+    }
+}
+```
+
+A `@Composable` function:
+- Returns `Unit` — it emits UI as a side effect of being called.
+- Can only be called from another `@Composable` function or a `setContent { }` block.
+- Should be **idempotent** — given the same parameters, produce the same UI.
+- Should have **no side effects** in the function body itself; use `LaunchedEffect`/`SideEffect` for those.
+
+### Composables, modifiers, and layouts
+
+**Modifiers** are how you decorate a composable: padding, size, background,
+clicks, gestures, semantics. Order matters!
+
+```kotlin
+@Composable
+fun ProfileCard(user: User, onClick: () -> Unit) {
+    Row(
+        // Modifiers are applied left-to-right — clip happens AFTER background here
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .clickable(onClick = onClick)
+            .padding(16.dp),                   // inner padding (after clickable)
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        AsyncImage(
+            model = user.avatarUrl,
+            contentDescription = null,
+            modifier = Modifier
+                .size(48.dp)
+                .clip(CircleShape)
+        )
+        Spacer(Modifier.width(12.dp))
+        Column {
+            Text(user.name, style = MaterialTheme.typography.titleMedium)
+            Text(user.email, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+```
+
+The three foundational layouts are `Row`, `Column`, and `Box`. For lists you
+use `LazyColumn` / `LazyRow` / `LazyVerticalGrid` — they only compose visible
+items, like RecyclerView.
+
+---
+
+## Topic 2 · State & Theming
+
+### State management — `remember`, `mutableStateOf`, hoisting
+
+State in Compose is **observable** — when you read a `State<T>` inside a
+composable, that composable will recompose whenever the value changes.
+
+```kotlin
+@Composable
+fun Counter() {
+    // 'remember' preserves state across recompositions.
+    // 'mutableStateOf' creates an observable state holder.
+    var count by remember { mutableIntStateOf(0) }
+
+    Column {
+        Text("Count: $count")
+        Button(onClick = { count++ }) {
+            Text("Increment")
+        }
+    }
+}
+```
+
+`remember { }` survives recomposition but **not** configuration changes
+(rotation) or process death. For that, use `rememberSaveable { }`:
+
+```kotlin
+var draft by rememberSaveable { mutableStateOf("") }
+```
+
+### State hoisting — the most important pattern
+
+A composable that **owns** state is called *stateful*. A composable that
+**receives** state and event callbacks as parameters is *stateless*. Stateless
+composables are easier to test, preview, and reuse.
+
+**Hoist state up** to the lowest common ancestor of all composables that read
+or write it.
+
+```kotlin
+// STATEFUL — owns state, hard to reuse
+@Composable
+fun NameField() {
+    var name by remember { mutableStateOf("") }
+    OutlinedTextField(value = name, onValueChange = { name = it })
+}
+
+// STATELESS — state and callbacks are parameters; reusable everywhere
+@Composable
+fun NameField(name: String, onNameChange: (String) -> Unit) {
+    OutlinedTextField(value = name, onValueChange = onNameChange)
+}
+
+// Caller hoists state; in real apps, this comes from a ViewModel
+@Composable
+fun ProfileScreen(viewModel: ProfileViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    NameField(name = state.name, onNameChange = viewModel::onNameChange)
+}
+```
+
+<Callout kind="success" title="The hoisting rule">
+**State flows down, events flow up.** A composable should receive the data it
+needs to render and emit events when the user interacts. Don't let leaf
+components own meaningful state — they become impossible to test and reuse.
+</Callout>
+
+### Material Design 3 theming
+
+Material 3 (Material You) supports **dynamic color** on Android 12+ — your
+app can adopt the user's wallpaper-derived palette automatically.
+
+```kotlin
+@Composable
+fun AppTheme(
+    darkTheme: Boolean = isSystemInDarkTheme(),
+    dynamicColor: Boolean = true,
+    content: @Composable () -> Unit
+) {
+    val colorScheme = when {
+        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+            val ctx = LocalContext.current
+            if (darkTheme) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
+        }
+        darkTheme -> darkColorScheme()
+        else      -> lightColorScheme()
+    }
+
+    MaterialTheme(
+        colorScheme = colorScheme,
+        typography = Typography,
+        content = content
+    )
+}
+```
+
+Reference theme tokens via `MaterialTheme.colorScheme.primary`, `.typography.titleLarge`, etc. — never hardcode hex values.
+
+---
+
+## Topic 3 · Lists & Navigation
+
+### Lazy lists — `LazyColumn`, `LazyRow`, `LazyVerticalGrid`
+
+```kotlin
+@Composable
+fun MessageList(messages: List<Message>, onMessageClick: (Message) -> Unit) {
+    LazyColumn(
+        contentPadding = PaddingValues(vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        items(
+            items = messages,
+            key = { it.id }   // stable keys help Compose track items across reorders
+        ) { message ->
+            MessageRow(message = message, onClick = { onMessageClick(message) })
+        }
+    }
+}
+```
+
+<Callout kind="warning" title="Always provide a `key`">
+Without a stable `key`, lazy lists treat items by position. After insertion or
+reordering, Compose recomposes everything and animations break. With a `key`,
+Compose can match old and new items and animate them properly.
+</Callout>
+
+### Navigation in Compose
+
+The official solution is **Navigation Compose** with type-safe routes (introduced in 2.8):
+
+```kotlin
+@Serializable data object Home
+@Serializable data class Profile(val userId: String)
+@Serializable data object Settings
+
+@Composable
+fun AppNavHost() {
+    val navController = rememberNavController()
+
+    NavHost(navController = navController, startDestination = Home) {
+        composable<Home> {
+            HomeScreen(
+                onProfileClick = { id -> navController.navigate(Profile(id)) },
+                onSettingsClick = { navController.navigate(Settings) }
+            )
+        }
+        composable<Profile> { backStackEntry ->
+            val args = backStackEntry.toRoute<Profile>()
+            ProfileScreen(userId = args.userId, onBack = { navController.popBackStack() })
+        }
+        composable<Settings> { SettingsScreen(onBack = { navController.popBackStack() }) }
+    }
+}
+```
+
+Type-safe routes catch mistyped argument names at compile time and eliminate
+manual URL encoding.
+
+---
+
+## Topic 4 · Advanced Compose
+
+### Animations
+
+Compose makes animations declarative. Three families to know:
+
+```kotlin
+// 1. animate*AsState — interpolates a value when its target changes
+@Composable
+fun ToggleBox() {
+    var expanded by remember { mutableStateOf(false) }
+    val size by animateDpAsState(
+        targetValue = if (expanded) 200.dp else 100.dp,
+        animationSpec = spring(),
+        label = "boxSize"
+    )
+    Box(
+        Modifier
+            .size(size)
+            .background(MaterialTheme.colorScheme.primary)
+            .clickable { expanded = !expanded }
+    )
+}
+
+// 2. AnimatedVisibility — animate appearance/disappearance
+AnimatedVisibility(
+    visible = isLoaded,
+    enter = fadeIn() + slideInVertically(),
+    exit = fadeOut()
+) {
+    SuccessBanner()
+}
+
+// 3. Crossfade — swap composables with a fade
+Crossfade(targetState = uiState, label = "screen") { state ->
+    when (state) {
+        is UiState.Loading -> LoadingView()
+        is UiState.Success -> ContentView(state.data)
+        is UiState.Error   -> ErrorView(state.error)
+    }
+}
+```
+
+### Side effects
+
+Side effects let composables interact with the non-Compose world (network,
+analytics, lifecycle):
+
+```kotlin
+@Composable
+fun ProfileScreen(viewModel: ProfileViewModel) {
+    // LaunchedEffect — runs in a coroutine; restarts when 'key1' changes
+    LaunchedEffect(viewModel) {
+        viewModel.events.collect { event ->
+            // handle one-shot events: navigation, toast, etc.
+        }
+    }
+
+    // DisposableEffect — runs setup + cleanup tied to the composition lifetime
+    DisposableEffect(Unit) {
+        analytics.logScreenView("profile")
+        onDispose { analytics.logScreenLeave("profile") }
+    }
+}
+```
+
+### Compose ↔ XML interop
+
+You can host Composables inside XML (`ComposeView`) and Views inside
+Composables (`AndroidView`). Useful for incremental migration:
+
+```kotlin
+@Composable
+fun MapView(coords: Coords) {
+    AndroidView(
+        factory = { ctx ->
+            MapView(ctx).apply { onCreate(null); onResume() }
+        },
+        update = { it.moveCamera(coords) }
+    )
+}
+```
+
+---
+
+## Companion libraries you'll use constantly
+
+<LibraryGrid libraries={[
+  { name: 'Coil', tagline: 'Async image loading', description: 'Coroutine-based, Compose-first image loader. AsyncImage handles caching, transformations, and placeholders.', url: 'https://coil-kt.github.io/coil/' },
+  { name: 'Accompanist', tagline: 'Compose extensions', description: 'Permissions, system UI, pager indicators, and other utilities while features mature into the official toolkit.', url: 'https://google.github.io/accompanist/' },
+  { name: 'Navigation Compose', tagline: 'Type-safe navigation', description: 'Official routing for Compose with type-safe arguments and deep links.', url: 'https://developer.android.com/jetpack/compose/navigation' },
+  { name: 'Lottie Compose', tagline: 'Vector animations', description: 'Render Adobe After Effects animations natively with one Composable.', url: 'https://github.com/airbnb/lottie/blob/master/android-compose.md' }
+]} />
+
+## Key takeaways
+
+<Callout kind="success" title="Master these patterns">
+- UI is a function of state. State changes → recomposition.
+- Hoist state to the lowest common ancestor; pass state down, events up.
+- Use `rememberSaveable` for state that must survive process death.
+- Always provide stable `key`s in `LazyColumn` / `LazyRow`.
+- Use Material 3 tokens (`MaterialTheme.colorScheme.*`) — never hex colors.
+- `LaunchedEffect` for coroutines, `DisposableEffect` for setup+teardown.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Refactor to stateless', description: 'Take a stateful Counter composable and refactor it into a stateless one with hoisted state.' },
+  { title: 'List with animations', description: 'Build a LazyColumn of cards. Tapping a card expands its description with animateContentSize().' },
+  { title: 'Navigation flow', description: 'Implement Home → ProductList → ProductDetail with type-safe routes and back navigation.' }
+]} />
+
+## Next module
+
+Continue to **[Module 04 — Architecture & Design Patterns](/docs/architecture-patterns/overview)** to organize your Compose code with MVVM, Clean Architecture, and Hilt.

@@ -1,0 +1,351 @@
+---
+id: overview
+title: Module 04 — Architecture & Design Patterns
+sidebar_label: Overview
+description: MVVM, Clean Architecture, Repository pattern, Hilt dependency injection, ViewModel + StateFlow, modular architecture.
+---
+
+import { Callout, ComparisonCard, StepList, FeatureGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 04 of 13</span>
+  <span><strong>Duration:</strong> 3 weeks</span>
+  <span><strong>Topics:</strong> 3 · 7 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 01–03</span>
+</div>
+
+# Architecture & Design Patterns
+
+Most Android apps fail not because of bad UI code, but because of **bad
+structure**. Without architecture, your `MainActivity` grows to 2,000 lines,
+your business logic is tangled with Android framework calls, and a single
+schema change breaks ten files. This module fixes that.
+
+<Callout kind="tip" title="Architecture is not theory">
+Every pattern in this module solves a concrete pain: testability,
+reusability, replaceability of dependencies, and survivability across config
+changes. We'll explain *why* each pattern exists before showing how to use it.
+</Callout>
+
+## Topic 1 · Architecture
+
+### MVVM — Model-View-ViewModel
+
+MVVM separates **what the user sees** (View) from **what the app remembers
+and computes** (ViewModel + Model). The View observes state and forwards
+events; it contains no business logic.
+
+```text
+       ┌──────────┐  observes state  ┌────────────┐  calls       ┌─────────────┐
+       │   View   │ ←─────────────── │ ViewModel  │ ────────────→│  Repository │
+       │ (Compose)│ ───events───────→│ (state +   │              │ (data layer)│
+       └──────────┘                  │  intents)  │              └──────┬──────┘
+                                     └────────────┘                     │
+                                                                        ▼
+                                                         ┌──────────────────────────┐
+                                                         │  Network · DB · DataStore │
+                                                         └──────────────────────────┘
+```
+
+**Why a ViewModel and not just `remember { }`?** A ViewModel survives
+configuration changes (rotation), so your network call doesn't restart on
+every rotation. It also outlives composition, making it easy to share state
+across screens.
+
+```kotlin
+data class ProfileUiState(
+    val isLoading: Boolean = false,
+    val user: User? = null,
+    val error: String? = null
+)
+
+@HiltViewModel
+class ProfileViewModel @Inject constructor(
+    private val repository: UserRepository,
+    savedStateHandle: SavedStateHandle
+) : ViewModel() {
+
+    private val userId: String = checkNotNull(savedStateHandle["userId"])
+
+    private val _state = MutableStateFlow(ProfileUiState(isLoading = true))
+    val state: StateFlow<ProfileUiState> = _state.asStateFlow()
+
+    init { load() }
+
+    fun load() {
+        viewModelScope.launch {
+            _state.update { it.copy(isLoading = true, error = null) }
+            runCatching { repository.fetch(userId) }
+                .onSuccess { user -> _state.update { it.copy(isLoading = false, user = user) } }
+                .onFailure { e -> _state.update { it.copy(isLoading = false, error = e.message) } }
+        }
+    }
+
+    fun onRetry() = load()
+}
+```
+
+The View becomes thin and dumb:
+
+```kotlin
+@Composable
+fun ProfileScreen(viewModel: ProfileViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+
+    when {
+        state.isLoading      -> LoadingView()
+        state.error != null  -> ErrorView(message = state.error!!, onRetry = viewModel::onRetry)
+        state.user != null   -> ProfileContent(user = state.user!!)
+    }
+}
+```
+
+### Clean Architecture — Domain · Data · Presentation
+
+Clean Architecture (Uncle Bob's variation) introduces a **Domain** layer
+between presentation and data. The Domain contains pure Kotlin — no Android,
+no Retrofit, no Room — making business logic trivially testable.
+
+```text
+┌──────────────────── Presentation ────────────────────┐
+│  Composables   ViewModels   UI mappers                │
+└──────────────────────┬───────────────────────────────┘
+                       │ depends on (interfaces only)
+                       ▼
+┌──────────────────────  Domain  ──────────────────────┐
+│  Use Cases       Entities       Repository interfaces│
+└──────────────────────┬───────────────────────────────┘
+                       │ implemented by
+                       ▼
+┌──────────────────────  Data    ──────────────────────┐
+│  Repository impls   DAOs   Retrofit services   DTOs  │
+└──────────────────────────────────────────────────────┘
+```
+
+**The dependency rule**: outer layers depend on inner layers, never the other
+way around. The Domain has zero Android dependencies.
+
+```kotlin
+// domain/UserRepository.kt — an interface, NOT an implementation
+interface UserRepository {
+    suspend fun fetch(id: String): User
+    fun observe(id: String): Flow<User>
+}
+
+// domain/usecase/GetUserUseCase.kt — pure Kotlin, easy to unit test
+class GetUserUseCase @Inject constructor(
+    private val repo: UserRepository
+) {
+    suspend operator fun invoke(id: String): User = repo.fetch(id)
+}
+
+// data/UserRepositoryImpl.kt — knows about Retrofit, Room, mapping
+class UserRepositoryImpl @Inject constructor(
+    private val api: UserApi,
+    private val dao: UserDao
+) : UserRepository {
+    override suspend fun fetch(id: String): User {
+        val dto = api.getUser(id)               // network DTO
+        dao.upsert(dto.toEntity())              // cache locally
+        return dto.toDomain()                   // map to domain model
+    }
+    override fun observe(id: String): Flow<User> =
+        dao.observe(id).map { it.toDomain() }
+}
+```
+
+### Repository pattern & data source abstraction
+
+The Repository hides the **source of truth** from the rest of the app. The
+ViewModel doesn't know whether data came from network, cache, or DataStore —
+it just asks the repo.
+
+```kotlin
+class UserRepositoryImpl @Inject constructor(
+    private val remote: UserRemoteDataSource,   // Retrofit
+    private val local: UserLocalDataSource,     // Room
+    private val ioDispatcher: CoroutineDispatcher
+) : UserRepository {
+
+    // Single source of truth: the local DB. Always read from local;
+    // refresh from network in the background.
+    override fun observe(id: String): Flow<User> = local.observe(id).onStart {
+        // Trigger background refresh once when collection starts
+        runCatching { withContext(ioDispatcher) { refresh(id) } }
+    }
+
+    private suspend fun refresh(id: String) {
+        val fresh = remote.getUser(id)
+        local.upsert(fresh)
+    }
+}
+```
+
+---
+
+## Topic 2 · Dependency Injection
+
+### Hilt — DI without the boilerplate
+
+Hilt is Google's recommended DI framework, built on Dagger but with
+Android-specific scopes pre-wired. You declare what you need, Hilt builds the
+graph.
+
+```kotlin
+// 1. Annotate your Application
+@HiltAndroidApp
+class MyApp : Application()
+
+// 2. Annotate Activities/Fragments that receive injections
+@AndroidEntryPoint
+class MainActivity : ComponentActivity() { /* ... */ }
+
+// 3. Annotate ViewModels
+@HiltViewModel
+class ProfileViewModel @Inject constructor(
+    private val repo: UserRepository,
+    savedStateHandle: SavedStateHandle
+) : ViewModel()
+
+// 4. Provide bindings via modules
+@Module
+@InstallIn(SingletonComponent::class)
+object DataModule {
+
+    @Provides @Singleton
+    fun provideRetrofit(): Retrofit = Retrofit.Builder()
+        .baseUrl("https://api.example.com/")
+        .addConverterFactory(MoshiConverterFactory.create())
+        .build()
+
+    @Provides @Singleton
+    fun provideUserApi(retrofit: Retrofit): UserApi = retrofit.create()
+}
+
+// 5. Bind interfaces to implementations
+@Module
+@InstallIn(SingletonComponent::class)
+abstract class RepoModule {
+    @Binds @Singleton
+    abstract fun bindUserRepository(impl: UserRepositoryImpl): UserRepository
+}
+```
+
+**Why Hilt?** Without DI, every class manually constructs its dependencies —
+making testing painful (you can't swap a real `Retrofit` for a fake) and
+coupling tight. Hilt centralizes construction, manages scopes, and lets you
+override modules in tests.
+
+### ViewModel & Lifecycle-aware data
+
+ViewModels survive configuration changes. The trick is **collecting their
+flows lifecycle-aware** so you don't waste CPU when the screen is off:
+
+```kotlin
+@Composable
+fun ProfileScreen(vm: ProfileViewModel = hiltViewModel()) {
+    // collectAsStateWithLifecycle suspends collection when the lifecycle is
+    // STOPPED. Use it instead of collectAsState() to save battery.
+    val state by vm.state.collectAsStateWithLifecycle()
+    /* ... */
+}
+```
+
+---
+
+## Topic 3 · Advanced Patterns
+
+### StateFlow & SharedFlow for reactive programming
+
+| Type           | Use when                                                            |
+|----------------|---------------------------------------------------------------------|
+| `StateFlow`    | UI state — has a current value, replays the latest to new collectors|
+| `SharedFlow`   | Events (one-shot) — replay configurable, no current value           |
+| `Flow`         | Cold streams — DB queries, network as Flow                          |
+
+```kotlin
+class CartViewModel @Inject constructor(
+    private val cart: CartRepository
+) : ViewModel() {
+
+    // StateFlow for the screen's state
+    val items: StateFlow<List<CartItem>> = cart.observeItems()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000), // keep alive 5s after last subscriber
+            initialValue = emptyList()
+        )
+
+    // SharedFlow for one-shot navigation events
+    private val _events = MutableSharedFlow<CartEvent>()
+    val events: SharedFlow<CartEvent> = _events.asSharedFlow()
+
+    fun checkout() = viewModelScope.launch {
+        runCatching { cart.checkout() }
+            .onSuccess { _events.emit(CartEvent.NavigateToConfirmation(it.orderId)) }
+            .onFailure { _events.emit(CartEvent.ShowError(it.message ?: "Unknown")) }
+    }
+}
+```
+
+<Callout kind="warning" title="State vs events — don't mix them">
+Use `StateFlow` for state the user can re-observe (current cart, profile data).
+Use `SharedFlow` (with `replay = 0`) for events that should fire **once** (a
+toast, a navigation). Stuffing events into state causes them to replay on
+rotation — showing the same toast again.
+</Callout>
+
+### Modular architecture
+
+Splitting a single `:app` module into many Gradle modules brings **faster
+incremental builds**, **enforced boundaries**, and **dynamic feature
+delivery**. A typical layout:
+
+```text
+:app                       -> wires everything; Application + entry points
+:core:design               -> theme, typography, design tokens
+:core:ui                   -> reusable Composables
+:core:data                 -> Retrofit, Room, repository impls
+:core:domain               -> entities, use cases, repo interfaces
+:feature:profile           -> ProfileScreen + ProfileViewModel
+:feature:cart              -> CartScreen + CartViewModel
+:feature:checkout          -> CheckoutScreen + CheckoutViewModel
+```
+
+Feature modules depend only on `:core:domain` and `:core:ui`. They have **no
+visibility** into other features, so a careless import can't create a hidden
+dependency.
+
+### Common design patterns in Android
+
+<FeatureGrid columns={2} features={[
+  { icon: '🏭', title: 'Factory', description: 'Centralize object creation — Retrofit Builder, ViewModelProvider.Factory.' },
+  { icon: '🔁', title: 'Observer', description: 'Reactive streams via Flow/StateFlow — UI subscribes, data emits.' },
+  { icon: '🎯', title: 'Strategy', description: 'Interchangeable algorithms — different sort orders, different cache eviction policies.' },
+  { icon: '🛠️', title: 'Builder', description: 'Step-by-step object construction — Notification.Builder, OkHttpClient.Builder.' },
+  { icon: '🧱', title: 'Adapter', description: 'Convert one interface to another — DTO ↔ Entity ↔ Domain mappers.' },
+  { icon: '🪞', title: 'Decorator', description: 'Add behavior at runtime — OkHttp Interceptors, Compose Modifiers.' }
+]} />
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Architecture in one paragraph">
+ViewModels hold state and survive rotation. Repositories hide the source of
+truth. The Domain layer is pure Kotlin and trivially testable. Hilt builds
+the dependency graph. `StateFlow` is for state, `SharedFlow` is for events.
+Modularize when build times hurt or boundaries blur.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Refactor to MVVM', description: 'Take a stateful Composable and extract its logic into a ViewModel exposing a StateFlow<UiState>.' },
+  { title: 'Add a use case', description: 'Introduce GetUserUseCase between ProfileViewModel and UserRepository. Notice the testability improvement.' },
+  { title: 'Modularize', description: 'Move the Profile feature into a :feature:profile module. Set up dependencies in libs.versions.toml.' }
+]} />
+
+## Next module
+
+Continue to **[Module 05 — Data Storage & Persistence](/docs/data-persistence/overview)** to learn DataStore, Room, migrations, and encrypted storage.

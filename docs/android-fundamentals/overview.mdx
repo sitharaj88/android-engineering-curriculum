@@ -1,0 +1,333 @@
+---
+id: overview
+title: Module 02 — Android Fundamentals
+sidebar_label: Overview
+description: Platform architecture, Activities, Intents, Fragments, ViewGroups, ConstraintLayout, and resources — the runtime you target.
+---
+
+import { Callout, StepList, FeatureGrid, ComparisonCard } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 02 of 13</span>
+  <span><strong>Duration:</strong> 3 weeks</span>
+  <span><strong>Topics:</strong> 3 · 7 subtopics</span>
+  <span><strong>Prerequisites:</strong> Module 01 (Kotlin)</span>
+</div>
+
+# Android Fundamentals
+
+Before you build modern Compose UIs, you need to understand **the platform
+underneath them** — the OS components that decide when your code runs, how
+processes start, and how the system reclaims memory. Even pure-Compose apps
+still rely on Activities, Intents, the manifest, and resources.
+
+<Callout kind="tip" title="Why this module is non-negotiable">
+Modern Android tutorials often skip straight to Compose. This produces engineers
+who can't debug an `ANR`, don't know what an Application class is for, and
+can't explain why their work-in-progress disappears on rotation. Don't be that
+engineer.
+</Callout>
+
+## Topic 1 · Platform & Setup
+
+### Android architecture overview
+
+Android is a Linux-based OS with a **layered architecture**:
+
+| Layer                       | What lives here                                                |
+|-----------------------------|----------------------------------------------------------------|
+| **Apps**                    | Your APK — Activities, Services, Compose UI                    |
+| **Java/Kotlin Framework**   | ActivityManager, PackageManager, View, Notifications, Location |
+| **Native Libraries**        | OpenGL, SQLite, WebKit, Skia, Media codecs                     |
+| **Android Runtime (ART)**   | Ahead-of-time + JIT compiler running your DEX bytecode         |
+| **HAL (Hardware Abstraction)** | Camera, sensors, audio, Bluetooth abstractions             |
+| **Linux Kernel**            | Memory, processes, drivers, security                           |
+
+Each app runs in its **own Linux process** with its **own user ID**, sandboxed
+from every other app. Inter-app communication goes through **Binder IPC**, the
+mechanism that powers Intents and ContentProviders.
+
+<Callout kind="info" title="ART vs Dalvik">
+Pre-5.0 Android used Dalvik, a register-based JIT VM. Modern Android uses ART
+(Android Runtime), which performs **AOT compilation at install time** plus JIT
++ profile-guided optimization at runtime. This is why **baseline profiles**
+(Module 10) make startup so much faster — they ship pre-compiled hot paths.
+</Callout>
+
+### Android Studio setup & project structure
+
+Install **Android Studio** (latest stable channel) and let it download the
+SDKs. Then create a new project with **"Empty Activity (Compose)"**. The
+generated structure:
+
+```text
+MyApp/
+├── app/
+│   ├── build.gradle.kts          # Module-level config: dependencies, build types
+│   ├── src/
+│   │   ├── main/
+│   │   │   ├── AndroidManifest.xml   # Activities, permissions, app metadata
+│   │   │   ├── kotlin/com/x/myapp/   # Your Kotlin source
+│   │   │   └── res/                  # Resources: layouts, strings, drawables
+│   │   ├── test/                     # JVM unit tests (no device needed)
+│   │   └── androidTest/              # Instrumented tests (on device)
+├── build.gradle.kts              # Project-level config: plugin versions
+├── settings.gradle.kts           # Module list, dependency repositories
+├── gradle/libs.versions.toml     # Centralized version catalog (recommended)
+└── gradle.properties             # Heap size, Kotlin code style, AndroidX flags
+```
+
+**`gradle/libs.versions.toml`** is the modern way to manage dependencies — one
+file lists every library version, and modules reference them via type-safe
+accessors like `libs.androidx.core.ktx`. We use it throughout the projects.
+
+---
+
+## Topic 2 · Components
+
+### Activities & the Activity lifecycle
+
+An **Activity** is a single screen the user can interact with. It has a
+well-defined lifecycle — the system calls these methods as the user, the OS,
+or other apps cause state changes:
+
+```text
+onCreate ─→ onStart ─→ onResume ─→ [Activity is visible & interactive]
+                                       │
+                            user navigates away
+                                       ▼
+              onPause ─→ onStop ─→ onSaveInstanceState
+                                       │
+                          system reclaims memory? ──Yes──→ onDestroy
+                                       │ No
+                                       ▼
+                      user returns ──→ onRestart ─→ onStart ─→ onResume
+```
+
+```kotlin
+class ProfileActivity : ComponentActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Restore from process death using savedInstanceState
+        val draft = savedInstanceState?.getString("draft").orEmpty()
+
+        setContent {
+            AppTheme {
+                ProfileScreen(initialDraft = draft)
+            }
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // Persist transient UI state across rotation / process death
+        outState.putString("draft", viewModel.draft.value)
+    }
+}
+```
+
+<Callout kind="warning" title="Process death is real">
+The OS can kill your background app at any time to reclaim memory. When the
+user returns, your Activity is recreated **with `savedInstanceState`**.
+Always test "Don't keep activities" (Developer Options) to surface bugs that
+only appear after process death.
+</Callout>
+
+### Intents — explicit, implicit, and data passing
+
+An **Intent** is a message describing an operation. There are two flavors:
+
+```kotlin
+// EXPLICIT — name the target component directly. Used inside your own app.
+val intent = Intent(this, ProfileActivity::class.java).apply {
+    putExtra("userId", userId)
+    putExtra("source", Source.DEEPLINK.name)
+}
+startActivity(intent)
+
+// IMPLICIT — declare what you want done; the system finds an app that can do it.
+val view = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.sitharaj.in"))
+startActivity(view)
+
+val share = Intent(Intent.ACTION_SEND).apply {
+    type = "text/plain"
+    putExtra(Intent.EXTRA_TEXT, "Check out this Android guide!")
+}
+startActivity(Intent.createChooser(share, "Share via"))
+```
+
+For modern Activity Result handling, use the **ActivityResultContracts API**
+instead of the deprecated `startActivityForResult`:
+
+```kotlin
+private val pickImage = registerForActivityResult(
+    ActivityResultContracts.PickVisualMedia()
+) { uri: Uri? ->
+    uri?.let { viewModel.onImagePicked(it) }
+}
+
+// Launch from a click handler
+pickImage.launch(PickVisualMediaRequest(PickVisualMedia.ImageOnly))
+```
+
+### Fragments — lifecycle and communication
+
+A **Fragment** is a reusable UI portion hosted inside an Activity. In a
+Compose-first app you'll use fragments less, but they're still essential for
+**Navigation Component (XML graphs)**, **DialogFragments**, and integrating
+legacy XML screens.
+
+```kotlin
+class FeedFragment : Fragment(R.layout.fragment_feed) {
+
+    private val viewModel: FeedViewModel by viewModels()
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        // Use viewLifecycleOwner — NOT 'this' — to avoid leaks across config changes.
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.state.collect { render(it) }
+            }
+        }
+    }
+}
+```
+
+<Callout kind="danger" title="The fragment view lifecycle gotcha">
+A Fragment's view is created and destroyed independently of the Fragment
+itself. Always use `viewLifecycleOwner` for view-bound observers — using
+`this` causes leaks and crashes when the fragment is detached but the
+ViewModel still emits.
+</Callout>
+
+---
+
+## Topic 3 · UI Basics
+
+### Views, ViewGroups, and ConstraintLayout
+
+Even though you'll write most UIs in Compose (Module 03), every Android
+developer needs to read XML layouts — they appear in legacy code, sample
+projects, and library docs.
+
+```xml
+<!-- res/layout/activity_login.xml -->
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="@dimen/spacing_lg">
+
+    <com.google.android.material.textfield.TextInputLayout
+        android:id="@+id/emailLayout"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:hint="@string/hint_email"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+        <com.google.android.material.textfield.TextInputEditText
+            android:id="@+id/emailInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="textEmailAddress"/>
+    </com.google.android.material.textfield.TextInputLayout>
+
+    <Button
+        android:id="@+id/loginBtn"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:text="@string/action_login"
+        app:layout_constraintTop_toBottomOf="@id/emailLayout"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        android:layout_marginTop="@dimen/spacing_md"/>
+
+</androidx.constraintlayout.widget.ConstraintLayout>
+```
+
+**`ConstraintLayout`** is the modern XML root because it produces flat view
+hierarchies (faster to measure/layout) and expresses complex relationships
+declaratively. It's what `RelativeLayout` and nested `LinearLayout`s
+replaced.
+
+### Event handling
+
+For XML layouts, prefer **View Binding** over `findViewById`:
+
+```kotlin
+class LoginActivity : AppCompatActivity() {
+    private lateinit var binding: ActivityLoginBinding
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityLoginBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        // Type-safe view access — no findViewById, no casts
+        binding.loginBtn.setOnClickListener {
+            val email = binding.emailInput.text?.toString().orEmpty()
+            viewModel.login(email)
+        }
+    }
+}
+```
+
+### Resource management
+
+Android resources live under `res/` and are accessed via the auto-generated
+`R` class:
+
+| Folder         | Holds                                | Access                     |
+|----------------|--------------------------------------|----------------------------|
+| `res/values/`  | strings, colors, dimens, themes      | `R.string.app_name`        |
+| `res/drawable/`| vector drawables, PNG, shape XML     | `R.drawable.ic_logo`       |
+| `res/layout/`  | XML layout files                     | `R.layout.activity_main`   |
+| `res/mipmap/`  | launcher icons (various densities)   | `R.mipmap.ic_launcher`     |
+| `res/raw/`     | unprocessed files (audio, video)     | `R.raw.intro_video`        |
+
+**Resource qualifiers** let you provide variants by density, locale, screen
+size, night mode, etc.:
+
+```text
+res/values/strings.xml          → default
+res/values-hi/strings.xml       → Hindi
+res/values-night/colors.xml     → dark mode
+res/drawable-xxhdpi/logo.png    → 3x density
+res/layout-sw600dp/activity.xml → tablets ≥ 600dp wide
+```
+
+<Callout kind="success" title="Always externalize">
+Hardcoding strings, colors, and dimensions inside layouts (or Compose) makes
+i18n, theming, and design-system changes painful. **Always reference
+resources** even in Compose: `stringResource(R.string.action_login)`,
+`colorResource(R.color.brand_primary)`.
+</Callout>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="What you must remember">
+- Each app runs in a sandboxed Linux process; Binder IPC connects them.
+- Activities have a deterministic lifecycle — handle process death with `savedInstanceState`.
+- Use **explicit Intents** within your app, **implicit** for cross-app actions.
+- Prefer **ActivityResultContracts** over the deprecated `startActivityForResult`.
+- Use `viewLifecycleOwner` inside Fragments, not `this`.
+- Externalize every string, color, and dimen — never hardcode.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Lifecycle logger', description: 'Add Log.d in every lifecycle callback of an Activity. Rotate the device, navigate away, return, and observe the order.' },
+  { title: 'Implicit intent gallery', description: 'Build a screen with three buttons that each fire a different implicit intent: open a URL, share text, dial a number.' },
+  { title: 'Resource qualifiers', description: 'Provide a French (values-fr) translation and a tablet (layout-sw600dp) variant of one screen.' }
+]} />
+
+## Next module
+
+Continue to **[Module 03 — Modern UI with Jetpack Compose](/docs/jetpack-compose/overview)** where we replace XML layouts with declarative Composables.

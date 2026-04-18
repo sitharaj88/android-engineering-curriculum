@@ -1,0 +1,391 @@
+---
+id: overview
+title: Module 01 — Kotlin Foundation
+sidebar_label: Overview
+description: The language of modern Android — variables, OOP, null safety, collections, lambdas, scope functions, and coroutines basics.
+---
+
+import { Callout, ComparisonCard, StepList, FeatureGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 01 of 13</span>
+  <span><strong>Duration:</strong> 3 weeks</span>
+  <span><strong>Topics:</strong> 4 · 9 subtopics</span>
+  <span><strong>Prerequisites:</strong> Basic programming literacy</span>
+</div>
+
+# Kotlin Foundation
+
+Kotlin is the **official language** of Android development and the only
+language Google actively recommends. Before you write a single line of UI code
+or open Android Studio, you must be fluent in Kotlin's core constructs —
+because every Jetpack library, every Compose function, and every coroutine in
+this guide is written in idiomatic Kotlin.
+
+<Callout kind="tip" title="Why we start with the language">
+Most learners jump straight into Activities and crash into null pointer
+exceptions, lambda confusion, and coroutine misuse. Spending three weeks on
+Kotlin first makes the entire rest of the curriculum **dramatically easier**.
+You'll read source code instead of fighting it.
+</Callout>
+
+## Why Kotlin won
+
+Kotlin replaced Java on Android because it solved problems that hurt teams
+every day — verbosity, nullability, and async code. Designed by JetBrains and
+adopted by Google in 2017 (Kotlin-first in 2019), it interoperates 100% with
+Java but eliminates entire categories of bugs.
+
+<ComparisonCard
+  left={{
+    label: 'Java',
+    title: 'The verbose past',
+    variant: 'old',
+    points: [
+      'Nullable by default → NullPointerException everywhere',
+      'Anonymous inner classes for callbacks',
+      'No data classes — write equals/hashCode/toString manually',
+      'Checked exceptions force try/catch noise',
+      'Static utility classes everywhere'
+    ]
+  }}
+  right={{
+    label: 'Kotlin',
+    title: 'The expressive present',
+    variant: 'new',
+    points: [
+      'Non-null by default; nullable opt-in with `?`',
+      'Lambdas and higher-order functions are first-class',
+      'Data classes auto-generate everything',
+      'No checked exceptions — coroutines model failure better',
+      'Top-level functions and extension functions'
+    ]
+  }}
+/>
+
+---
+
+## Topic 1 · Kotlin Basics
+
+### Variables, data types, and operators
+
+Kotlin has two variable keywords: `val` (immutable reference, like `final` in
+Java) and `var` (mutable). **Prefer `val` always** — immutability eliminates
+entire classes of concurrency bugs and makes code easier to reason about.
+
+```kotlin
+// 'val' creates a read-only reference. The compiler enforces immutability.
+val pi = 3.14159              // type inferred as Double
+val name: String = "Sitharaj" // explicit type annotation when helpful
+
+// 'var' allows reassignment — use sparingly
+var counter = 0
+counter += 1                  // OK
+// pi = 3.14                  // ERROR: val cannot be reassigned
+
+// Kotlin's primitive types map to JVM primitives at runtime,
+// but at the language level they are objects with methods.
+val age: Int = 25
+val isAdult: Boolean = age >= 18
+val grade: Char = 'A'
+val pricing: Double = 99.99
+val flagged: Long = 1_000_000_000L  // underscores improve readability
+```
+
+**Why `val` first?** A `val` cannot be reassigned, so when you read code you
+know the value is stable. This is the cornerstone of functional thinking and
+makes refactors safer.
+
+### Control flow: `if`/`else`, `when`, loops
+
+Kotlin's control flow constructs are **expressions**, not statements. They
+return a value, which means you can assign them directly:
+
+```kotlin
+// 'if' is an expression — the last line of each branch is the result
+val max = if (a > b) a else b   // ternary operator is unnecessary
+
+// 'when' replaces the verbose Java switch and is far more powerful
+val description = when (val status = response.status) {
+    in 200..299 -> "Success"
+    in 300..399 -> "Redirect"
+    in 400..499 -> "Client error: $status"
+    in 500..599 -> "Server error: $status"
+    else        -> "Unknown"
+}
+
+// 'when' on an instance smart-casts inside each branch
+fun describe(obj: Any): String = when (obj) {
+    is Int     -> "Integer of value $obj"
+    is String  -> "String of length ${obj.length}"   // smart-cast to String
+    is List<*> -> "List with ${obj.size} elements"
+    else       -> "Unknown type"
+}
+
+// Loops: 'for' iterates over anything Iterable
+for (i in 1..10) print(i)               // 1 to 10 inclusive
+for (i in 1 until 10) print(i)          // 1 to 9
+for (i in 10 downTo 1 step 2) print(i)  // 10, 8, 6, 4, 2
+```
+
+<Callout kind="info" title="Smart casts">
+Once you check `if (obj is String)`, the compiler knows `obj` is a `String`
+inside that block — no manual cast needed. This is one of Kotlin's most
+loved features.
+</Callout>
+
+---
+
+## Topic 2 · Functions & OOP
+
+### Functions, parameters, defaults, and named arguments
+
+```kotlin
+// Single-expression function — concise and readable
+fun square(x: Int) = x * x
+
+// Default parameter values eliminate the need for overloads
+fun greet(name: String, greeting: String = "Hello", punctuation: String = "!"): String =
+    "$greeting, $name$punctuation"
+
+greet("Aarav")                                    // "Hello, Aarav!"
+greet("Aarav", "Welcome")                         // "Welcome, Aarav!"
+greet(name = "Aarav", punctuation = ".")          // named args — order doesn't matter
+```
+
+**Why this matters**: In Java you'd write four overloaded methods. In Kotlin
+one function with defaults handles every call site, and named arguments make
+intent obvious at the caller — `setMargin(start = 8, end = 8)` reads better
+than `setMargin(8, 0, 8, 0)`.
+
+### Classes, inheritance, interfaces, abstract classes
+
+```kotlin
+// Classes are 'final' by default — explicitly mark 'open' to allow inheritance.
+// This prevents the fragile-base-class problem.
+open class Animal(val name: String) {
+    open fun speak() = println("$name makes a sound")
+}
+
+class Dog(name: String, val breed: String) : Animal(name) {
+    override fun speak() = println("$name barks")
+}
+
+// Data classes auto-generate equals(), hashCode(), toString(), copy(), and
+// componentN() for destructuring. Indispensable for models and DTOs.
+data class User(val id: String, val name: String, val email: String)
+
+val a = User("1", "Aarav", "a@x.com")
+val b = a.copy(email = "b@x.com")  // immutable update — perfect for state
+val (id, name) = a                 // destructuring
+
+// Interfaces can have default method bodies — like Java 8+ default methods
+interface Repository<T> {
+    suspend fun fetch(id: String): T
+    suspend fun list(): List<T> = emptyList()  // default implementation
+}
+
+// Abstract classes cannot be instantiated and may have abstract members
+abstract class BaseViewModel {
+    abstract fun onCleared()
+    fun log(msg: String) = println("[VM] $msg")
+}
+```
+
+<Callout kind="warning" title="Open by intent">
+Marking a class `open` is a deliberate design decision. If a class is meant to
+be extended, mark it; otherwise leave it final and prefer composition. This
+matches Effective Java Item 19: *Design and document for inheritance or else
+prohibit it.*
+</Callout>
+
+---
+
+## Topic 3 · Null Safety & Collections
+
+### The billion-dollar mistake — fixed
+
+Tony Hoare called nulls "my billion-dollar mistake." Kotlin solves this at the
+type level: a variable cannot hold `null` unless its type explicitly allows
+it.
+
+```kotlin
+var name: String = "Aarav"   // non-null
+// name = null               // ERROR: null cannot be a value of non-null type
+
+var nickname: String? = null // nullable — opt in with '?'
+
+// To use a nullable, you must handle the null case
+val length = nickname?.length          // safe call → returns Int?
+val safeLength = nickname?.length ?: 0 // Elvis operator → fallback when null
+val forced = nickname!!.length         // !! throws NPE — avoid except for assertions
+
+// Smart-cast after a null check
+if (nickname != null) {
+    println(nickname.length)  // smart-cast to non-null String
+}
+
+// 'let' runs a block only when the receiver is non-null
+nickname?.let { nick ->
+    println("Hi, $nick!")
+}
+```
+
+**Why this is huge**: Most NullPointerExceptions become **compile-time errors**.
+The compiler forces you to think about nullability where it matters.
+
+### Collections — read-only vs mutable
+
+Kotlin distinguishes between **read-only** (`List`, `Set`, `Map`) and
+**mutable** (`MutableList`, `MutableSet`, `MutableMap`) collections at the
+type level:
+
+```kotlin
+val readOnly: List<Int> = listOf(1, 2, 3)
+// readOnly.add(4)                          // ERROR: no add() on List
+
+val mutable: MutableList<Int> = mutableListOf(1, 2, 3)
+mutable.add(4)                              // OK
+
+// Functional operations return new collections — chain them safely
+val users = listOf(
+    User("1", "Aarav",  "a@x.com"),
+    User("2", "Diya",   "d@x.com"),
+    User("3", "Kabir",  "k@x.com")
+)
+
+val emails = users
+    .filter { it.name.startsWith("A") }     // keep names starting with A
+    .map    { it.email }                    // extract emails
+    .sorted()                               // sort alphabetically
+
+val grouped = users.groupBy { it.name.first() }   // Map<Char, List<User>>
+val total   = users.sumOf { it.name.length }
+val first   = users.firstOrNull { it.id == "9" }  // null if not found
+```
+
+---
+
+## Topic 4 · Advanced Kotlin
+
+### Lambdas and higher-order functions
+
+A **higher-order function** takes a function as a parameter or returns one.
+Kotlin's standard library is built on this — `filter`, `map`, `forEach`, etc.
+
+```kotlin
+// Function-typed parameter: (T) -> R reads as "function of T returning R"
+fun <T, R> List<T>.transform(transformer: (T) -> R): List<R> {
+    val result = mutableListOf<R>()
+    for (item in this) result.add(transformer(item))
+    return result
+}
+
+// Trailing-lambda syntax — when the last parameter is a function,
+// you can move it outside the parentheses for readability
+val doubled = listOf(1, 2, 3).transform { it * 2 }   // [2, 4, 6]
+
+// 'inline' functions inline the bytecode at the call site —
+// avoids lambda allocation overhead in hot paths.
+inline fun runIfDebug(action: () -> Unit) {
+    if (BuildConfig.DEBUG) action()
+}
+```
+
+### Scope functions: `let`, `run`, `with`, `apply`, `also`
+
+The five scope functions help you write idiomatic, chainable code. The
+difference is **what `this`/`it` refers to** and **what the block returns**:
+
+| Function | Receiver inside | Returns         | Typical use                                  |
+|----------|-----------------|-----------------|----------------------------------------------|
+| `let`    | `it`            | lambda result   | Null-safety, transformations                 |
+| `run`    | `this`          | lambda result   | Object configuration + computing a result    |
+| `with`   | `this`          | lambda result   | Operating on an existing object              |
+| `apply`  | `this`          | the receiver    | Builder-style configuration                  |
+| `also`   | `it`            | the receiver    | Side effects (logging, debugging)            |
+
+```kotlin
+// 'apply' — builder pattern for object configuration
+val intent = Intent(context, ProfileActivity::class.java).apply {
+    putExtra("userId", userId)
+    putExtra("source", "deeplink")
+    flags = Intent.FLAG_ACTIVITY_CLEAR_TOP
+}
+
+// 'let' — transform and null-check in one step
+val display = user?.let { "${it.name} <${it.email}>" } ?: "Anonymous"
+
+// 'also' — perform a side effect without breaking the chain
+val saved = repository.save(user)
+    .also { Log.d("UserRepo", "Saved user $it") }
+```
+
+### Coroutines basics & exception handling
+
+Coroutines make async code look like sequential code. They run on **CoroutineScopes**
+that bind their lifetime to a UI controller (Activity/Fragment/ViewModel) and
+**Dispatchers** that decide what thread to execute on.
+
+```kotlin
+import kotlinx.coroutines.*
+
+class UserViewModel : ViewModel() {
+
+    // viewModelScope is automatically cancelled when the ViewModel is cleared.
+    // This is the right scope for UI-tied work — not GlobalScope.
+    fun loadProfile(userId: String) {
+        viewModelScope.launch {
+            try {
+                // Switch to the IO dispatcher for blocking network/disk work
+                val user = withContext(Dispatchers.IO) {
+                    repository.fetch(userId)   // suspend function
+                }
+                _state.value = UiState.Success(user)
+            } catch (e: CancellationException) {
+                throw e  // ALWAYS re-throw — cancellation is cooperative
+            } catch (e: IOException) {
+                _state.value = UiState.Error("Network error")
+            }
+        }
+    }
+}
+```
+
+<Callout kind="warning" title="Never use GlobalScope">
+`GlobalScope.launch { ... }` creates a coroutine that lives for the entire
+process. It leaks resources, runs after the user navigates away, and updates
+UI that no longer exists. Always use a structured scope: `viewModelScope`,
+`lifecycleScope`, or a `CoroutineScope` you own and cancel.
+</Callout>
+
+We cover coroutines in depth in **Module 06 (Networking)** and **Module 04
+(Architecture)**. For now, internalize the three rules:
+
+1. Suspend functions must be called from a coroutine or another suspend function.
+2. Always launch from a structured scope (`viewModelScope`, `lifecycleScope`).
+3. Switch dispatchers (`withContext(Dispatchers.IO)`) for blocking work.
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Internalize before moving on">
+- Prefer `val` over `var`; immutability prevents bugs.
+- Kotlin distinguishes nullable types — let the compiler help you.
+- Use `data class` for models; use `copy()` for immutable updates.
+- Master scope functions — they're everywhere in real code.
+- Always use `viewModelScope` / `lifecycleScope`, never `GlobalScope`.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Build a User model', description: 'Create a data class with id, name, email (nullable), and roles: List<String>. Generate three sample users and write a function that filters by role.' },
+  { title: 'Implement a generic Result type', description: 'Create a sealed class Result<out T> with Success(data: T) and Failure(error: Throwable) variants. Write a fold extension that handles both cases.' },
+  { title: 'Coroutine playground', description: 'In a runBlocking { } block, launch three coroutines that simulate network calls with delay(1000). Observe how they run concurrently.' }
+]} />
+
+## Next module
+
+Continue to **[Module 02 — Android Fundamentals](/docs/android-fundamentals/overview)** to learn the platform itself: Activities, Intents, Fragments, layouts, and resources.

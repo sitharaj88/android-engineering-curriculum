@@ -1,0 +1,303 @@
+---
+id: overview
+title: Module 06 — Networking & API Integration
+sidebar_label: Overview
+description: REST + HTTP, Retrofit, Moshi/Kotlinx serialization, OkHttp interceptors, coroutines, Paging 3, image loading, and WebSockets.
+---
+
+import { Callout, StepList, LibraryGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 06 of 13</span>
+  <span><strong>Duration:</strong> 3 weeks</span>
+  <span><strong>Topics:</strong> 3 · 6 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 01–05</span>
+</div>
+
+# Networking & API Integration
+
+Almost every Android app talks to a server. The networking layer is also
+where most production bugs hide — timeouts, JSON shape changes, expired
+tokens, retries, slow connections. This module gives you a **bulletproof,
+testable HTTP stack** built on Retrofit, OkHttp, and Coroutines.
+
+## Topic 1 · REST APIs
+
+### REST concepts & HTTP methods
+
+REST is a convention for designing HTTP APIs around **resources** identified
+by URLs and manipulated with verbs:
+
+| Method   | Purpose                          | Idempotent? |
+|----------|----------------------------------|-------------|
+| `GET`    | Fetch a resource                 | Yes         |
+| `POST`   | Create a resource                | No          |
+| `PUT`    | Replace a resource entirely      | Yes         |
+| `PATCH`  | Update part of a resource        | No          |
+| `DELETE` | Remove a resource                | Yes         |
+
+Status codes you must handle in clients:
+
+- **2xx** Success
+- **3xx** Redirect (rare in mobile clients)
+- **4xx** Client error — bad request, auth, not found, conflict
+- **5xx** Server error — retry with backoff
+
+### Retrofit — type-safe HTTP
+
+Retrofit turns an interface into a working HTTP client. You declare the API
+shape once; Retrofit + a converter does the rest.
+
+```kotlin
+data class ProductDto(
+    @Json(name = "id")    val id: String,
+    @Json(name = "name")  val name: String,
+    @Json(name = "price") val priceCents: Int
+)
+
+interface ProductApi {
+
+    @GET("products")
+    suspend fun list(
+        @Query("page")     page: Int = 0,
+        @Query("pageSize") pageSize: Int = 20,
+        @Query("category") category: String? = null
+    ): List<ProductDto>
+
+    @GET("products/{id}")
+    suspend fun get(@Path("id") id: String): ProductDto
+
+    @POST("products")
+    suspend fun create(@Body product: CreateProductRequest): ProductDto
+
+    @PATCH("products/{id}")
+    suspend fun update(
+        @Path("id") id: String,
+        @Body patch: UpdateProductRequest
+    ): ProductDto
+
+    @DELETE("products/{id}")
+    suspend fun delete(@Path("id") id: String): Response<Unit>
+}
+```
+
+### OkHttp configuration & interceptors
+
+Retrofit runs on top of OkHttp. Configure timeouts, logging, auth, and
+caching at the OkHttp level — these apply to every request:
+
+```kotlin
+@Provides @Singleton
+fun provideOkHttp(
+    @ApplicationContext ctx: Context,
+    authInterceptor: AuthInterceptor
+): OkHttpClient = OkHttpClient.Builder()
+    .connectTimeout(15, TimeUnit.SECONDS)
+    .readTimeout(30, TimeUnit.SECONDS)
+    .writeTimeout(30, TimeUnit.SECONDS)
+    .cache(Cache(File(ctx.cacheDir, "http"), 10L * 1024 * 1024))   // 10 MB on-disk
+    .addInterceptor(authInterceptor)                                // attach JWT
+    .addInterceptor(HttpLoggingInterceptor().apply {
+        level = if (BuildConfig.DEBUG) BODY else NONE
+    })
+    .build()
+
+class AuthInterceptor @Inject constructor(
+    private val tokenStore: TokenStore
+) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val token = runBlocking { tokenStore.token() }
+        val req = chain.request().newBuilder()
+            .apply { token?.let { header("Authorization", "Bearer $it") } }
+            .build()
+        return chain.proceed(req)
+    }
+}
+```
+
+<Callout kind="warning" title="Interceptors should be cheap">
+Interceptors run on every request. Avoid heavy synchronous work — for token
+refresh, use an `Authenticator` instead, which only fires on 401.
+</Callout>
+
+---
+
+## Topic 2 · Data Handling
+
+### JSON parsing — Moshi vs Kotlinx Serialization vs Gson
+
+| Library                  | When to use                                              |
+|--------------------------|----------------------------------------------------------|
+| **Moshi**                | Mature, small, great Kotlin support — current default    |
+| **Kotlinx Serialization**| Multiplatform, compile-time safety, no reflection        |
+| **Gson**                 | Legacy projects only — null safety issues with Kotlin    |
+
+Example with Moshi:
+
+```kotlin
+@Provides @Singleton
+fun provideMoshi(): Moshi = Moshi.Builder()
+    .add(KotlinJsonAdapterFactory())
+    .add(InstantAdapter())                  // custom date adapter
+    .build()
+
+@Provides @Singleton
+fun provideRetrofit(client: OkHttpClient, moshi: Moshi): Retrofit = Retrofit.Builder()
+    .baseUrl(BuildConfig.API_BASE_URL)
+    .client(client)
+    .addConverterFactory(MoshiConverterFactory.create(moshi))
+    .build()
+```
+
+### Coroutines + Retrofit + error handling
+
+Retrofit interfaces marked `suspend` integrate naturally with coroutines.
+Wrap calls in a sealed `Result` for predictable error handling:
+
+```kotlin
+sealed class ApiResult<out T> {
+    data class Success<T>(val data: T) : ApiResult<T>()
+    data class Failure(val error: ApiError) : ApiResult<Nothing>()
+}
+
+sealed class ApiError(val message: String) {
+    data object Network        : ApiError("No internet connection")
+    data class Server(val code: Int) : ApiError("Server error $code")
+    data class Unknown(val cause: Throwable) : ApiError(cause.message ?: "Unknown")
+}
+
+suspend fun <T> safeApiCall(call: suspend () -> T): ApiResult<T> = try {
+    ApiResult.Success(call())
+} catch (e: CancellationException) {
+    throw e                                                    // never swallow
+} catch (e: IOException) {
+    ApiResult.Failure(ApiError.Network)
+} catch (e: HttpException) {
+    ApiResult.Failure(ApiError.Server(e.code()))
+} catch (e: Throwable) {
+    ApiResult.Failure(ApiError.Unknown(e))
+}
+```
+
+The repository becomes:
+
+```kotlin
+class ProductRepository @Inject constructor(
+    private val api: ProductApi
+) {
+    suspend fun list(page: Int): ApiResult<List<Product>> = safeApiCall {
+        api.list(page).map(ProductDto::toDomain)
+    }
+}
+```
+
+<Callout kind="danger" title="Always re-throw CancellationException">
+A `try/catch` around suspend code that swallows everything will **break
+structured concurrency**. When a parent coroutine is cancelled, child
+coroutines throw `CancellationException` to clean up — re-throw it.
+</Callout>
+
+---
+
+## Topic 3 · Advanced Networking
+
+### Pagination with Paging 3
+
+Loading thousands of items at once is slow and memory-hungry. Paging 3 fetches
+data **on demand** and integrates with Compose's `LazyColumn`:
+
+```kotlin
+class ProductPagingSource @Inject constructor(
+    private val api: ProductApi
+) : PagingSource<Int, Product>() {
+
+    override suspend fun load(params: LoadParams<Int>): LoadResult<Int, Product> = try {
+        val page = params.key ?: 0
+        val items = api.list(page = page, pageSize = params.loadSize).map(ProductDto::toDomain)
+        LoadResult.Page(
+            data = items,
+            prevKey = if (page == 0) null else page - 1,
+            nextKey = if (items.isEmpty()) null else page + 1
+        )
+    } catch (e: IOException) {
+        LoadResult.Error(e)
+    }
+
+    override fun getRefreshKey(state: PagingState<Int, Product>) =
+        state.anchorPosition?.let { state.closestPageToPosition(it)?.prevKey?.plus(1) }
+}
+
+// In ViewModel
+val products: Flow<PagingData<Product>> = Pager(
+    config = PagingConfig(pageSize = 20, prefetchDistance = 4)
+) { ProductPagingSource(api) }.flow.cachedIn(viewModelScope)
+
+// In Compose
+val items = viewModel.products.collectAsLazyPagingItems()
+LazyColumn {
+    items(items.itemCount, key = items.itemKey { it.id }) { i ->
+        items[i]?.let { ProductRow(it) } ?: ProductPlaceholder()
+    }
+}
+```
+
+### Image loading with Coil
+
+```kotlin
+AsyncImage(
+    model = ImageRequest.Builder(LocalContext.current)
+        .data(product.imageUrl)
+        .crossfade(true)
+        .placeholder(R.drawable.product_placeholder)
+        .error(R.drawable.product_error)
+        .build(),
+    contentDescription = product.name,
+    contentScale = ContentScale.Crop,
+    modifier = Modifier.size(80.dp).clip(RoundedCornerShape(8.dp))
+)
+```
+
+### WebSockets & GraphQL — when REST isn't enough
+
+**WebSockets** for full-duplex real-time (chat, live order tracking). OkHttp
+includes WebSocket support; for app-level reconnection and message routing,
+wrap it in a repository.
+
+**GraphQL** with **Apollo Kotlin** when your backend speaks it — declare
+queries in `.graphql` files and Apollo generates type-safe Kotlin classes.
+
+---
+
+## Companion libraries
+
+<LibraryGrid libraries={[
+  { name: 'Retrofit', tagline: 'Type-safe HTTP client', description: 'Industry-standard HTTP library with coroutine support and pluggable converters.', url: 'https://square.github.io/retrofit/' },
+  { name: 'OkHttp', tagline: 'HTTP & HTTP/2 client', description: 'The transport layer beneath Retrofit. Handles connection pooling, caching, interceptors, WebSockets.', url: 'https://square.github.io/okhttp/' },
+  { name: 'Moshi', tagline: 'JSON for modern Kotlin', description: 'Codegen-based JSON parser with great Kotlin support and zero reflection.', url: 'https://github.com/square/moshi' },
+  { name: 'Apollo Kotlin', tagline: 'GraphQL client', description: 'Type-safe GraphQL queries with caching, normalization, and subscriptions.', url: 'https://www.apollographql.com/docs/kotlin/' },
+  { name: 'Coil', tagline: 'Image loading', description: 'Coroutine-based image loader with Compose integration.', url: 'https://coil-kt.github.io/coil/' },
+  { name: 'Paging 3', tagline: 'Pagination', description: 'Official paging library — works with network, DB, or both.', url: 'https://developer.android.com/topic/libraries/architecture/paging/v3-overview' }
+]} />
+
+## Key takeaways
+
+<Callout kind="success" title="Production networking checklist">
+- Use **Retrofit + OkHttp + Moshi** as your default stack.
+- Add **timeouts, logging, auth interceptor, and on-disk cache** in the OkHttp config.
+- Wrap calls in a **sealed Result type** — never let raw exceptions reach the UI.
+- Always **re-throw `CancellationException`**.
+- Use **Paging 3** for any list backed by a paginated API.
+- Use **WebSockets** for true real-time, **SSE** for one-way updates, **REST** for everything else.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Build a typed API', description: 'Define a Retrofit interface for the JSONPlaceholder /posts endpoint with full CRUD methods.' },
+  { title: 'Add an Authenticator', description: 'Implement an OkHttp Authenticator that refreshes a JWT on 401 and retries the original request once.' },
+  { title: 'Paginated feed', description: 'Build a LazyColumn powered by Paging 3 against a real paginated API.' }
+]} />
+
+## Next module
+
+Continue to **[Module 07 — Firebase & Cloud Services](/docs/firebase-cloud/overview)** to add auth, real-time data, push notifications, and crash reporting.

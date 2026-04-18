@@ -1,0 +1,92 @@
+.wrap {
+  display: grid;
+  grid-template-columns: 1fr 40px 1fr;
+  gap: 0.75rem;
+  align-items: stretch;
+  margin: 1.75rem 0 2.25rem;
+}
+
+.col {
+  padding: 1.25rem;
+  border-radius: 14px;
+  border: 1px solid;
+  background: var(--col-bg);
+  border-color: var(--col-border);
+}
+
+.old     { --col-bg: #FEF2F2; --col-border: #FECACA; --accent: #EF4444; }
+.new     { --col-bg: #ECFDF5; --col-border: #A7F3D0; --accent: #10B981; }
+.neutral { --col-bg: var(--surface-secondary); --col-border: var(--border-default); --accent: #6366F1; }
+
+:global([data-theme='dark']) .old     { --col-bg: rgba(239, 68, 68, 0.08); --col-border: rgba(239, 68, 68, 0.2); }
+:global([data-theme='dark']) .new     { --col-bg: rgba(16, 185, 129, 0.08); --col-border: rgba(16, 185, 129, 0.2); }
+:global([data-theme='dark']) .neutral { --col-bg: rgba(148, 163, 184, 0.05); --col-border: rgba(148, 163, 184, 0.15); }
+
+.label {
+  display: inline-block;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: white;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 0.75rem;
+}
+
+.title {
+  margin: 0 0 0.875rem;
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.points {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.points li {
+  display: flex;
+  gap: 0.625rem;
+  align-items: flex-start;
+  font-size: 0.875rem;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.bullet {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-top: 8px;
+  flex-shrink: 0;
+}
+
+.arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ifm-color-primary);
+  opacity: 0.5;
+}
+
+.arrow svg { width: 24px; height: 24px; }
+
+@media (max-width: 768px) {
+  .wrap {
+    grid-template-columns: 1fr;
+  }
+  .arrow {
+    transform: rotate(90deg);
+    padding: 0.5rem 0;
+  }
+}

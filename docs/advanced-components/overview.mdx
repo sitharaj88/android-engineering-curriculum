@@ -1,0 +1,305 @@
+---
+id: overview
+title: Module 08 — Advanced Android Components
+sidebar_label: Overview
+description: Foreground/bound Services, WorkManager, notifications, runtime permissions, App Widgets with Glance, CameraX, Location, sensors, biometrics.
+---
+
+import { Callout, StepList, FeatureGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 08 of 13</span>
+  <span><strong>Duration:</strong> 3 weeks</span>
+  <span><strong>Topics:</strong> 3 · 6 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 01–07</span>
+</div>
+
+# Advanced Android Components
+
+This module covers everything that runs **outside the visible UI** — background
+work, system integrations, and device features. These are the APIs that make
+an app feel native instead of like a web wrapper.
+
+## Topic 1 · Background Work
+
+### Services — foreground, background, bound
+
+A **Service** is an Android component for long-running operations without UI.
+There are three flavors:
+
+| Type            | Use when                                                | Notes                          |
+|-----------------|---------------------------------------------------------|--------------------------------|
+| **Foreground**  | Ongoing user-visible work (music, navigation, fitness)  | Requires a notification        |
+| **Background**  | Brief work without user awareness                        | Heavily restricted on Android 8+ |
+| **Bound**       | A client component (Activity) needs an IPC channel      | Lifetime tied to the binding   |
+
+<Callout kind="warning" title="Background services are restricted">
+Since Android 8 (Oreo), background Services are killed within minutes. For
+deferrable work, use **WorkManager**. For ongoing user-visible work, use a
+**Foreground Service** with a persistent notification. Don't fight the
+platform — use the right tool.
+</Callout>
+
+```kotlin
+class MusicService : Service() {
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startForeground(NOTIFICATION_ID, buildNotification())
+        // Use coroutines tied to a CoroutineScope owned by the service
+        scope.launch { player.play(intent?.getStringExtra("trackId").orEmpty()) }
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+}
+```
+
+### WorkManager — deferrable, guaranteed background work
+
+WorkManager is the right tool for **anything that should eventually run**
+(uploading logs, syncing data, periodic refresh) — even after device reboot,
+even when the app is closed, even when the user clears app from recents.
+
+```kotlin
+class SyncWorker @AssistedInject constructor(
+    @Assisted ctx: Context,
+    @Assisted params: WorkerParameters,
+    private val repository: ProductRepository
+) : CoroutineWorker(ctx, params) {
+
+    override suspend fun doWork(): Result = try {
+        repository.syncAll()
+        Result.success()
+    } catch (e: IOException) {
+        if (runAttemptCount < 3) Result.retry() else Result.failure()
+    }
+}
+
+// Schedule once with constraints
+val request = OneTimeWorkRequestBuilder<SyncWorker>()
+    .setConstraints(Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.CONNECTED)
+        .setRequiresBatteryNotLow(true)
+        .build())
+    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+    .build()
+
+WorkManager.getInstance(ctx).enqueueUniqueWork(
+    "sync-once", ExistingWorkPolicy.KEEP, request
+)
+
+// Periodic — minimum interval is 15 minutes
+val periodic = PeriodicWorkRequestBuilder<SyncWorker>(2, TimeUnit.HOURS)
+    .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.UNMETERED).build())
+    .build()
+
+WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(
+    "sync-every-2h", ExistingPeriodicWorkPolicy.UPDATE, periodic
+)
+```
+
+---
+
+## Topic 2 · System Features
+
+### Notifications — channels, groups, actions
+
+Every notification on Android 8+ belongs to a **channel** the user can mute
+individually. Create channels at app start:
+
+```kotlin
+class MyApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannels(listOf(
+            NotificationChannel("orders", "Order updates", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "Order placement, tracking, and delivery alerts"
+            },
+            NotificationChannel("promos", "Promotions", NotificationManager.IMPORTANCE_LOW)
+        ))
+    }
+}
+
+// Show a rich notification with an action
+val openIntent = PendingIntent.getActivity(
+    ctx, 0,
+    Intent(ctx, OrderDetailsActivity::class.java).putExtra("orderId", "1234"),
+    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+)
+
+val notification = NotificationCompat.Builder(ctx, "orders")
+    .setSmallIcon(R.drawable.ic_notification)
+    .setContentTitle("Order #1234 shipped")
+    .setContentText("Arriving Friday")
+    .setStyle(NotificationCompat.BigTextStyle().bigText("Your order is on its way..."))
+    .setContentIntent(openIntent)
+    .setAutoCancel(true)
+    .addAction(R.drawable.ic_track, "Track", trackIntent)
+    .build()
+
+NotificationManagerCompat.from(ctx).notify(1234, notification)
+```
+
+### Runtime permissions
+
+Since Android 6.0 (Marshmallow), dangerous permissions must be requested at
+runtime. Use the **Activity Result API** with `ActivityResultContracts`:
+
+```kotlin
+private val requestPermission = registerForActivityResult(
+    ActivityResultContracts.RequestPermission()
+) { granted ->
+    if (granted) startCamera() else showRationaleSnackbar()
+}
+
+private fun ensureCameraPermission() {
+    when {
+        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED -> startCamera()
+        shouldShowRequestPermissionRationale(Manifest.permission.CAMERA) ->
+            showRationaleDialog { requestPermission.launch(Manifest.permission.CAMERA) }
+        else -> requestPermission.launch(Manifest.permission.CAMERA)
+    }
+}
+```
+
+<Callout kind="tip" title="Always explain why">
+Showing a rationale dialog (when `shouldShowRequestPermissionRationale` returns
+true) dramatically increases the grant rate. Don't surprise users with system
+prompts — explain the why first.
+</Callout>
+
+### App Widgets with Glance
+
+Glance lets you build home-screen widgets using a **Compose-like API**. No
+more `RemoteViews` XML.
+
+```kotlin
+class WeatherWidget : GlanceAppWidget() {
+    override suspend fun provideGlance(context: Context, id: GlanceId) {
+        provideContent {
+            val weather = currentState<WeatherData>()
+            Column(modifier = GlanceModifier.padding(12.dp)) {
+                Text(weather.city, style = TextStyle(fontWeight = FontWeight.Bold))
+                Text("${weather.temp}°", style = TextStyle(fontSize = 28.sp))
+            }
+        }
+    }
+}
+```
+
+---
+
+## Topic 3 · Device Features
+
+### CameraX
+
+CameraX provides a **lifecycle-aware**, backwards-compatible camera API. You
+write one set of code that works across every Android version and device.
+
+```kotlin
+@Composable
+fun CameraPreview(onPhotoCaptured: (Uri) -> Unit) {
+    val ctx = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val previewView = remember { PreviewView(ctx) }
+    val imageCapture = remember { ImageCapture.Builder().build() }
+
+    LaunchedEffect(Unit) {
+        val provider = ProcessCameraProvider.getInstance(ctx).await()
+        val preview = Preview.Builder().build().apply { setSurfaceProvider(previewView.surfaceProvider) }
+        provider.unbindAll()
+        provider.bindToLifecycle(
+            lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture
+        )
+    }
+
+    AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+}
+```
+
+### Location services
+
+Use the **Fused Location Provider** for high accuracy with battery efficiency:
+
+```kotlin
+val client = LocationServices.getFusedLocationProviderClient(ctx)
+
+val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5_000L)
+    .setMinUpdateIntervalMillis(2_000L)
+    .build()
+
+val callback = object : LocationCallback() {
+    override fun onLocationResult(result: LocationResult) {
+        result.lastLocation?.let { onLocation(it) }
+    }
+}
+client.requestLocationUpdates(request, callback, Looper.getMainLooper())
+```
+
+For background location, request **`ACCESS_BACKGROUND_LOCATION`** separately —
+the system shows a stricter dialog with permanent options.
+
+### Sensors & biometric authentication
+
+```kotlin
+// Step counter sensor
+val sensorManager = getSystemService(SensorManager::class.java)
+val stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+
+sensorManager.registerListener(object : SensorEventListener {
+    override fun onSensorChanged(event: SensorEvent) {
+        val totalSteps = event.values[0].toLong()
+        // Persist baseline to compute today's count
+    }
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+}, stepSensor, SensorManager.SENSOR_DELAY_NORMAL)
+
+// Biometric prompt
+val executor = ContextCompat.getMainExecutor(ctx)
+val prompt = BiometricPrompt(activity, executor, object : BiometricPrompt.AuthenticationCallback() {
+    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+        unlockSecureFeature()
+    }
+})
+
+val info = BiometricPrompt.PromptInfo.Builder()
+    .setTitle("Unlock vault")
+    .setNegativeButtonText("Cancel")
+    .setAllowedAuthenticators(BIOMETRIC_STRONG)
+    .build()
+
+prompt.authenticate(info)
+```
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Background work checklist">
+- **WorkManager** for deferrable guaranteed work; **Foreground Service** for ongoing user-visible work.
+- Always create **notification channels** before calling `notify()`.
+- Use **Activity Result API** for permissions — never `onRequestPermissionsResult`.
+- Use **CameraX** and the **Fused Location Provider** instead of raw platform APIs.
+- Wrap **Biometric** auth in a single helper — handle errors and user cancellation gracefully.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Periodic sync', description: 'Schedule a PeriodicWorkRequest that uploads logs every 2 hours when on unmetered Wi-Fi.' },
+  { title: 'Camera + storage', description: 'Build a screen with CameraX that captures a photo and saves it to MediaStore.' },
+  { title: 'Glance widget', description: 'Create a Glance widget that shows the next upcoming task from a Room database.' }
+]} />
+
+## Next module
+
+Continue to **[Module 09 — Testing & Quality Assurance](/docs/testing-quality/overview)** to write reliable unit, integration, and UI tests.

@@ -1,0 +1,294 @@
+---
+id: overview
+title: Module 05 — Data Storage & Persistence
+sidebar_label: Overview
+description: SharedPreferences, DataStore, Room database, entities, DAOs, migrations, ContentProviders, encrypted storage, and caching strategies.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 05 of 13</span>
+  <span><strong>Duration:</strong> 2 weeks</span>
+  <span><strong>Topics:</strong> 2 · 4 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 01–04</span>
+</div>
+
+# Data Storage & Persistence
+
+Apps that lose user data on the next launch feel broken. Apps that keep
+fetching from the network feel slow. The persistence layer is what makes an
+app feel **fast and reliable** — and Android offers the right tool for every
+shape of data.
+
+<Callout kind="tip" title="Pick the right tool">
+- **DataStore** — small key-value or typed settings (theme, tokens, flags)
+- **Room** — structured relational data (lists, search, joins, pagination)
+- **EncryptedSharedPreferences / EncryptedFile** — secrets that must stay on device
+- **Files** — large binary blobs (images, video) outside the DB
+- **ContentProvider** — share data with other apps (rare in modern apps)
+</Callout>
+
+## Topic 1 · Local Storage
+
+### SharedPreferences vs DataStore
+
+`SharedPreferences` is the legacy key-value store. It's synchronous, can
+deadlock the main thread, doesn't handle errors well, and offers no type
+safety. **Use DataStore for all new code.**
+
+<ComparisonCard
+  left={{
+    label: 'SharedPreferences',
+    title: 'Legacy — avoid',
+    variant: 'old',
+    points: [
+      'Synchronous reads block the main thread',
+      'No error signalling — silent failures',
+      'No transactional consistency guarantees',
+      'No type safety — strings everywhere',
+      'Apply vs commit confusion'
+    ]
+  }}
+  right={{
+    label: 'DataStore',
+    title: 'Modern — recommended',
+    variant: 'new',
+    points: [
+      'Asynchronous via Kotlin Flow',
+      'Transactional updates with strong guarantees',
+      'Type-safe with Proto DataStore',
+      'Coroutine-friendly, cancellable',
+      'Migration helper from SharedPreferences'
+    ]
+  }}
+/>
+
+#### Preferences DataStore (key-value)
+
+```kotlin
+// Top-level singleton — one DataStore per name per process
+val Context.settingsDataStore: DataStore<Preferences> by preferencesDataStore("settings")
+
+object SettingsKeys {
+    val DARK_MODE = booleanPreferencesKey("dark_mode")
+    val LAST_SYNC = longPreferencesKey("last_sync")
+    val AUTH_TOKEN = stringPreferencesKey("auth_token")
+}
+
+class SettingsRepository @Inject constructor(
+    @ApplicationContext private val ctx: Context
+) {
+    val darkMode: Flow<Boolean> = ctx.settingsDataStore.data
+        .catch { e -> if (e is IOException) emit(emptyPreferences()) else throw e }
+        .map { it[SettingsKeys.DARK_MODE] ?: false }
+
+    suspend fun setDarkMode(enabled: Boolean) {
+        ctx.settingsDataStore.edit { prefs ->
+            prefs[SettingsKeys.DARK_MODE] = enabled
+        }
+    }
+}
+```
+
+#### Proto DataStore (typed schema)
+
+For complex settings, use Proto DataStore — you define a `.proto` schema and
+get a generated Kotlin class with type-safe builders. No more stringly-typed
+keys.
+
+### Room database
+
+Room is an SQL database with a Kotlin-friendly API. It validates queries at
+**compile time** and generates the boilerplate you'd otherwise hand-write.
+
+```kotlin
+// 1. Entity — one row in a table
+@Entity(tableName = "users",
+        indices = [Index(value = ["email"], unique = true)])
+data class UserEntity(
+    @PrimaryKey val id: String,
+    val name: String,
+    val email: String,
+    val updatedAt: Long
+)
+
+// 2. DAO — query interface; Room generates the implementation
+@Dao
+interface UserDao {
+    @Query("SELECT * FROM users WHERE id = :id")
+    fun observe(id: String): Flow<UserEntity?>          // reactive — emits on change
+
+    @Query("SELECT * FROM users ORDER BY name ASC")
+    suspend fun list(): List<UserEntity>                // suspend — one-shot
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(user: UserEntity)
+
+    @Delete
+    suspend fun delete(user: UserEntity)
+
+    @Transaction
+    suspend fun replaceAll(users: List<UserEntity>) {
+        clear()
+        upsertAll(users)
+    }
+
+    @Query("DELETE FROM users") suspend fun clear()
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsertAll(users: List<UserEntity>)
+}
+
+// 3. Database — wires entities and DAOs
+@Database(
+    entities = [UserEntity::class],
+    version = 2,
+    exportSchema = true                      // commit /schemas to git for diffing
+)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun userDao(): UserDao
+}
+
+// 4. Provide via Hilt
+@Module @InstallIn(SingletonComponent::class)
+object DbModule {
+    @Provides @Singleton
+    fun provideDb(@ApplicationContext ctx: Context): AppDatabase =
+        Room.databaseBuilder(ctx, AppDatabase::class.java, "app.db")
+            .addMigrations(MIGRATION_1_2)
+            .build()
+
+    @Provides fun provideUserDao(db: AppDatabase) = db.userDao()
+}
+```
+
+### Migrations
+
+Every schema change requires a Migration. Room destroys data on version
+mismatch unless you provide one — never ship without migrations.
+
+```kotlin
+val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE users ADD COLUMN avatar_url TEXT")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_users_updated ON users(updatedAt)")
+    }
+}
+```
+
+<Callout kind="warning" title="Test your migrations">
+Use `MigrationTestHelper` from `androidx.room:room-testing` to assert that
+migrating from v1 schema preserves data. A broken migration in production is
+catastrophic — users lose data.
+</Callout>
+
+---
+
+## Topic 2 · Advanced Storage
+
+### ContentProviders & file storage
+
+**ContentProviders** are the official way to share data **across apps** —
+backing the Contacts, MediaStore, and Calendar systems. Inside your own app,
+prefer Room directly.
+
+For **files**, the modern approach uses **scoped storage** (Android 10+):
+
+| Where to write          | Use case                                | API                                |
+|-------------------------|-----------------------------------------|------------------------------------|
+| `context.filesDir`      | Private app data, deleted on uninstall  | `File`, `FileOutputStream`         |
+| `context.cacheDir`      | Disposable caches, OS may purge         | `File`                             |
+| `MediaStore`            | Public photos, videos, audio            | `MediaStore.Images.Media`          |
+| Storage Access Framework| User-picked files (any location)        | `ActivityResultContracts.OpenDocument` |
+
+```kotlin
+// Pick a document with the SAF — no permission needed
+private val pickFile = registerForActivityResult(
+    ActivityResultContracts.OpenDocument()
+) { uri ->
+    uri?.let {
+        contentResolver.takePersistableUriPermission(
+            it, Intent.FLAG_GRANT_READ_URI_PERMISSION
+        )
+        viewModel.onFilePicked(it)
+    }
+}
+```
+
+### Encrypted storage
+
+Sensitive data (auth tokens, PII) should be encrypted at rest. The
+**androidx.security** library provides `EncryptedSharedPreferences` and
+`EncryptedFile`, both backed by AES-256 keys stored in the Android Keystore.
+
+```kotlin
+val masterKey = MasterKey.Builder(ctx)
+    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+    .build()
+
+val securePrefs = EncryptedSharedPreferences.create(
+    ctx, "auth_secure", masterKey,
+    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+)
+
+securePrefs.edit().putString("refresh_token", token).apply()
+```
+
+<Callout kind="danger" title="Never store secrets in plain SharedPreferences">
+Plain SharedPreferences are easily readable on rooted devices and via ADB
+backups. Tokens, biometric keys, and PII must be encrypted.
+</Callout>
+
+### Caching strategies
+
+Common cache strategies you'll implement:
+
+| Strategy             | When to use                                            |
+|----------------------|--------------------------------------------------------|
+| **Cache-then-network** | Show stale data instantly; refresh in background    |
+| **Network-then-cache** | Always fetch fresh; fall back to cache on failure   |
+| **Stale-while-revalidate** | Serve cache; revalidate; emit fresh data when ready |
+| **TTL-based**          | Cache valid for N seconds/minutes; refetch on expiry|
+
+```kotlin
+class ArticleRepository @Inject constructor(
+    private val api: ArticleApi,
+    private val dao: ArticleDao
+) {
+    // Cache-then-network: emit cache immediately, refresh in background
+    fun observeArticles(): Flow<List<Article>> = dao.observeAll()
+        .map { it.map(ArticleEntity::toDomain) }
+        .onStart {
+            launchIn { runCatching { refresh() } }
+        }
+
+    private suspend fun refresh() {
+        val fresh = api.list()
+        dao.replaceAll(fresh.map(ArticleDto::toEntity))
+    }
+}
+```
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Persistence rules">
+- **DataStore** for settings, **Room** for structured data, never SharedPreferences in new code.
+- Always write **migrations** when changing the Room schema; test them.
+- Encrypt secrets at rest with **EncryptedSharedPreferences** + Android Keystore.
+- Use **scoped storage** (MediaStore, SAF) — request permissions only when necessary.
+- The Repository decides cache vs network; ViewModels never know the source.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Theme preference with DataStore', description: 'Persist a dark-mode toggle and observe it as Flow<Boolean>. Drive the Compose theme from it.' },
+  { title: 'Notes app with Room', description: 'Build a NotesEntity + NotesDao + NotesRepository. Add a search query and order by updatedAt DESC.' },
+  { title: 'Migration test', description: 'Add a new column in v2 of your schema. Write a MigrationTestHelper test asserting data preserves.' }
+]} />
+
+## Next module
+
+Continue to **[Module 06 — Networking & API Integration](/docs/networking-api/overview)** to fetch and post data with Retrofit, OkHttp, and Moshi.
