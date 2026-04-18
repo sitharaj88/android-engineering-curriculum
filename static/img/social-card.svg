@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0F172A" />
+      <stop offset="100%" stop-color="#0B1220" />
+    </linearGradient>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3DDC84" />
+      <stop offset="55%" stop-color="#0F9D58" />
+      <stop offset="100%" stop-color="#4285F4" />
+    </linearGradient>
+    <linearGradient id="bot" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3DDC84" />
+      <stop offset="100%" stop-color="#0F9D58" />
+    </linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="40" /></filter>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)" />
+  <circle cx="1050" cy="120" r="180" fill="#0F9D58" opacity="0.25" filter="url(#glow)" />
+  <circle cx="120"  cy="540" r="200" fill="#4285F4" opacity="0.22" filter="url(#glow)" />
+
+  <!-- Android-ish robot mark -->
+  <g transform="translate(80,170)">
+    <g fill="url(#bot)">
+      <!-- antennae -->
+      <line x1="40" y1="40" x2="60" y2="80" stroke="url(#bot)" stroke-width="6" stroke-linecap="round" />
+      <line x1="160" y1="40" x2="140" y2="80" stroke="url(#bot)" stroke-width="6" stroke-linecap="round" />
+      <!-- head -->
+      <path d="M 20 100 Q 100 30 180 100 L 180 170 L 20 170 Z" />
+      <!-- body -->
+      <rect x="20" y="190" width="160" height="160" rx="14" />
+      <!-- arms -->
+      <rect x="-15" y="200" width="28" height="120" rx="14" />
+      <rect x="187" y="200" width="28" height="120" rx="14" />
+      <!-- legs -->
+      <rect x="55"  y="360" width="28" height="90" rx="14" />
+      <rect x="117" y="360" width="28" height="90" rx="14" />
+    </g>
+    <!-- eyes -->
+    <circle cx="75"  cy="135" r="9" fill="#0F172A" />
+    <circle cx="125" cy="135" r="9" fill="#0F172A" />
+  </g>
+
+  <!-- Type -->
+  <g font-family="-apple-system, Inter, Segoe UI, Helvetica, Arial, sans-serif" fill="#F8FAFC">
+    <text x="320" y="220" font-size="34" font-weight="600" fill="#94A3B8" letter-spacing="6">SITHARAJ.IN · TRAINING</text>
+    <text x="320" y="320" font-size="84" font-weight="900">Android Development</text>
+    <text x="320" y="395" font-size="48" font-weight="800" fill="url(#brand)">Complete Guide</text>
+
+    <text x="320" y="475" font-size="28" font-weight="500" fill="#CBD5E1">
+      Kotlin · Compose · Architecture · Firebase · KMP
+    </text>
+
+    <g font-size="22" font-weight="700" fill="#0F172A">
+      <rect x="320" y="510" width="150" height="46" rx="23" fill="#3DDC84" />
+      <text x="395" y="540" text-anchor="middle">13 Modules</text>
+      <rect x="486" y="510" width="150" height="46" rx="23" fill="#FBBC04" />
+      <text x="561" y="540" text-anchor="middle">120 Hours</text>
+      <rect x="652" y="510" width="170" height="46" rx="23" fill="#4285F4" fill-opacity="0.95" />
+      <text x="737" y="540" text-anchor="middle" fill="#F8FAFC">5 Real Projects</text>
+    </g>
+  </g>
+</svg>

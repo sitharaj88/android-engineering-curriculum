@@ -5,7 +5,7 @@ sidebar_label: Overview
 description: The language of modern Android — variables, OOP, null safety, collections, lambdas, scope functions, and coroutines basics.
 ---
 
-import { Callout, ComparisonCard, StepList, FeatureGrid } from '@site/src/components/Doc';
+import { Callout, ComparisonCard, StepList, FeatureGrid, Diagram, CoroutineScopesDiagram } from '@site/src/components/Doc';
 
 <div className="module-info">
   <span><strong>Module:</strong> 01 of 13</span>
@@ -322,6 +322,10 @@ val saved = repository.save(user)
 ```
 
 ### Coroutines basics & exception handling
+
+<Diagram title="Coroutine scopes" caption="Pick the smallest scope that outlives the work. Avoid GlobalScope.">
+  <CoroutineScopesDiagram />
+</Diagram>
 
 Coroutines make async code look like sequential code. They run on **CoroutineScopes**
 that bind their lifetime to a UI controller (Activity/Fragment/ViewModel) and

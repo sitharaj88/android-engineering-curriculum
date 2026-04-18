@@ -5,7 +5,7 @@ sidebar_label: Overview
 description: Kotlin Multiplatform, ML Kit + TensorFlow Lite, Wear OS, Android TV, BLE/IoT, accessibility, security, adaptive layouts.
 ---
 
-import { Callout, StepList, FeatureGrid, LibraryGrid } from '@site/src/components/Doc';
+import { Callout, StepList, FeatureGrid, LibraryGrid, Diagram, KmpSharedModuleDiagram } from '@site/src/components/Doc';
 
 <div className="module-info">
   <span><strong>Module:</strong> 12 of 13</span>
@@ -24,6 +24,10 @@ your survey of what's new and what's next.
 ## Topic 1 · Cross-Platform
 
 ### Kotlin Multiplatform (KMP)
+
+<Diagram title="Shared module targets" caption="commonMain holds pure Kotlin; per-target source sets bridge to platform APIs.">
+  <KmpSharedModuleDiagram />
+</Diagram>
 
 KMP lets you share **Kotlin code** across Android, iOS, web, and desktop —
 typically the business layer (use cases, repositories, networking, models)

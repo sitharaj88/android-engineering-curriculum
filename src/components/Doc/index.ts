@@ -4,6 +4,13 @@
  */
 
 export { default as Diagram } from './Diagram';
+export { default as AndroidArchDiagram } from './Diagrams/AndroidArchDiagram';
+export { default as ActivityLifecycleDiagram } from './Diagrams/ActivityLifecycleDiagram';
+export { default as ComposeRecompositionDiagram } from './Diagrams/ComposeRecompositionDiagram';
+export { default as CoroutineScopesDiagram } from './Diagrams/CoroutineScopesDiagram';
+export { default as HiltGraphDiagram } from './Diagrams/HiltGraphDiagram';
+export { default as FlowOperatorsDiagram } from './Diagrams/FlowOperatorsDiagram';
+export { default as KmpSharedModuleDiagram } from './Diagrams/KmpSharedModuleDiagram';
 export { default as ArchDiagram } from './Diagrams/ArchDiagram';
 export { default as BridgeDiagram } from './Diagrams/BridgeDiagram';
 export { default as ThreadsDiagram } from './Diagrams/ThreadsDiagram';

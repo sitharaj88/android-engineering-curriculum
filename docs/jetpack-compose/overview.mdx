@@ -5,7 +5,7 @@ sidebar_label: Overview
 description: Declarative UI, modifiers, Material 3 theming, state hoisting, navigation, animations, and Compose-XML interop.
 ---
 
-import { Callout, ComparisonCard, StepList, FeatureGrid, LibraryGrid } from '@site/src/components/Doc';
+import { Callout, ComparisonCard, StepList, FeatureGrid, LibraryGrid, Diagram, ComposeRecompositionDiagram } from '@site/src/components/Doc';
 
 <div className="module-info">
   <span><strong>Module:</strong> 03 of 13</span>
@@ -104,6 +104,10 @@ items, like RecyclerView.
 ## Topic 2 · State & Theming
 
 ### State management — `remember`, `mutableStateOf`, hoisting
+
+<Diagram title="Recomposition propagation" caption="Only composables that read the state recompose. Siblings stay untouched.">
+  <ComposeRecompositionDiagram />
+</Diagram>
 
 State in Compose is **observable** — when you read a `State<T>` inside a
 composable, that composable will recompose whenever the value changes.

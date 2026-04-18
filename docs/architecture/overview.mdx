@@ -5,7 +5,7 @@ sidebar_label: Overview
 description: A cross-cutting view of Android app architecture — how MVVM, Clean Architecture, modularization, and reactive state work together in real apps.
 ---
 
-import { Callout, FeatureGrid } from '@site/src/components/Doc';
+import { Callout, FeatureGrid, Diagram, AndroidArchDiagram } from '@site/src/components/Doc';
 
 # Architecture Guide
 
@@ -23,33 +23,9 @@ while you build.
 
 A modern Android app is a **layered, reactive, dependency-injected** system:
 
-```text
-                ┌────────────────────────────────────────┐
-                │       Compose UI (Composables)          │
-                │                                         │
-                │   ─── observes StateFlow / SharedFlow ──┘
-                ▼                                         
-      ┌────────────────┐    sends events    ┌────────────────┐
-      │   ViewModel    │◀──────────────────│      User       │
-      │ (StateFlow,    │                    └────────────────┘
-      │  SharedFlow)   │
-      └───────┬────────┘
-              │ calls suspend / Flow
-              ▼
-      ┌────────────────┐
-      │   Use Case     │   pure Kotlin business rule
-      └───────┬────────┘
-              │
-              ▼
-      ┌────────────────┐    interface only
-      │  Repository    │◀──── Domain knows the contract
-      └───────┬────────┘
-              │ implemented in :data
-              ▼
-      ┌──────────────────────────────────────────┐
-      │  Network · Database · DataStore · Cache  │
-      └──────────────────────────────────────────┘
-```
+<Diagram title="Layered Android architecture" caption="Each layer depends only on the abstraction below it. Data flows up; intents flow down.">
+  <AndroidArchDiagram />
+</Diagram>
 
 Three principles drive every decision:
 

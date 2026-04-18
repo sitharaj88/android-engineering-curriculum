@@ -5,7 +5,7 @@ sidebar_label: Overview
 description: Platform architecture, Activities, Intents, Fragments, ViewGroups, ConstraintLayout, and resources — the runtime you target.
 ---
 
-import { Callout, StepList, FeatureGrid, ComparisonCard } from '@site/src/components/Doc';
+import { Callout, StepList, FeatureGrid, ComparisonCard, Diagram, ActivityLifecycleDiagram } from '@site/src/components/Doc';
 
 <div className="module-info">
   <span><strong>Module:</strong> 02 of 13</span>
@@ -86,6 +86,10 @@ accessors like `libs.androidx.core.ktx`. We use it throughout the projects.
 ## Topic 2 · Components
 
 ### Activities & the Activity lifecycle
+
+<Diagram title="Activity lifecycle" caption="Forward path. Save state in onSaveInstanceState; release resources in onPause/onStop.">
+  <ActivityLifecycleDiagram />
+</Diagram>
 
 An **Activity** is a single screen the user can interact with. It has a
 well-defined lifecycle — the system calls these methods as the user, the OS,

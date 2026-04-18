@@ -5,7 +5,7 @@ sidebar_label: Overview
 description: MVVM, Clean Architecture, Repository pattern, Hilt dependency injection, ViewModel + StateFlow, modular architecture.
 ---
 
-import { Callout, ComparisonCard, StepList, FeatureGrid } from '@site/src/components/Doc';
+import { Callout, ComparisonCard, StepList, FeatureGrid, Diagram, HiltGraphDiagram, FlowOperatorsDiagram } from '@site/src/components/Doc';
 
 <div className="module-info">
   <span><strong>Module:</strong> 04 of 13</span>
@@ -187,6 +187,10 @@ class UserRepositoryImpl @Inject constructor(
 
 ### Hilt — DI without the boilerplate
 
+<Diagram title="Hilt component hierarchy" caption="Each component scopes the lifetime of its bindings.">
+  <HiltGraphDiagram />
+</Diagram>
+
 Hilt is Google's recommended DI framework, built on Dagger but with
 Android-specific scopes pre-wired. You declare what you need, Hilt builds the
 graph.
@@ -256,6 +260,10 @@ fun ProfileScreen(vm: ProfileViewModel = hiltViewModel()) {
 ## Topic 3 · Advanced Patterns
 
 ### StateFlow & SharedFlow for reactive programming
+
+<Diagram title="Flow operator pipeline" caption="Cold flows stay idle until a terminal operator collects them.">
+  <FlowOperatorsDiagram />
+</Diagram>
 
 | Type           | Use when                                                            |
 |----------------|---------------------------------------------------------------------|
