@@ -3,7 +3,7 @@ import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
-  title: 'Android Development Training',
+  title: 'Android Engineering Curriculum',
   tagline: 'Enterprise-Grade Android Development — From Kotlin Fundamentals to Play Store',
   favicon: 'img/favicon.ico',
 
@@ -12,10 +12,10 @@ const config: Config = {
   },
 
   url: 'https://sitharaj88.github.io',
-  baseUrl: '/android-development-training/',
+  baseUrl: '/android-engineering-curriculum/',
 
   organizationName: 'sitharaj88',
-  projectName: 'android-development-training',
+  projectName: 'android-engineering-curriculum',
   deploymentBranch: 'gh-pages',
   trailingSlash: false,
 
@@ -38,7 +38,7 @@ const config: Config = {
       {
         docs: {
           sidebarPath: './sidebars.ts',
-          editUrl: 'https://github.com/sitharaj88/android-development-training/tree/main/',
+          editUrl: 'https://github.com/sitharaj88/android-engineering-curriculum/tree/main/',
           showLastUpdateAuthor: true,
           showLastUpdateTime: true,
           breadcrumbs: true,
@@ -84,16 +84,16 @@ const config: Config = {
     },
     announcementBar: {
       id: 'training_announcement',
-      content: '⚡ 13 Modules · 73+ Topics · 34 Weeks · Kotlin + Jetpack Compose Curriculum — <a href="/android-development-training/docs/intro">Start Learning →</a>',
+      content: '⚡ 13 Modules · 73+ Topics · 34 Weeks · Kotlin + Jetpack Compose Curriculum — <a href="/android-engineering-curriculum/docs/intro">Start Learning →</a>',
       backgroundColor: '#3DDC84',
       textColor: '#0F172A',
       isCloseable: true,
     },
     navbar: {
-      title: 'Android Training',
+      title: 'Android Curriculum',
       hideOnScroll: true,
       logo: {
-        alt: 'Android Development Training',
+        alt: 'Android Engineering Curriculum',
         src: 'img/logo.svg',
       },
       items: [

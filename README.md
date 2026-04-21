@@ -1,4 +1,4 @@
-# Android Development Training
+# Android Engineering Curriculum
 
 A comprehensive, production-focused Android development curriculum covering everything from Kotlin fundamentals to publishing on Google Play. Built with Docusaurus and deep-explanation MDX.
 
@@ -11,7 +11,7 @@ A comprehensive, production-focused Android development curriculum covering ever
 
 ```bash
 npm install
-npm start            # http://localhost:3000/android-development-training/
+npm start            # http://localhost:3000/android-engineering-curriculum/
 npm run build
 ```
 
