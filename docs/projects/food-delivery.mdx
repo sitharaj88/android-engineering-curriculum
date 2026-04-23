@@ -1,0 +1,176 @@
+---
+id: food-delivery
+title: Project 3 — Food Delivery App
+sidebar_label: Food Delivery
+description: Restaurant discovery, live order tracking with Maps + Location, courier ETA over WebSocket, and a separate courier-facing app.
+---
+
+import { Callout, StepList, FeatureGrid } from '@site/src/components/Doc';
+
+# Food Delivery App
+
+Two apps in one repo: the **customer app** (browse, order, track) and the
+**courier app** (accept, navigate, mark delivered). This project owns the
+**location + foreground services + maps + WebSocket** skill set.
+
+## User & courier journeys
+
+```text
+CUSTOMER                                            COURIER
+───────                                            ───────
+Discover ─→ Restaurant ─→ Menu ─→ Cart             Shift start ─→ Go online
+                                    │                              │
+                                    ▼                              ▼
+                              Checkout ─→ Payment ─→ Order accepted ─→ Pickup
+                                                           │              │
+                                                           ▼              ▼
+                                          Live tracking ──►  Drop-off ─→ Tip
+```
+
+## Features (by milestone)
+
+### M1 — Multi-app repo
+
+- Shared `:core:*` modules for both customer and courier apps
+- Separate `:app-customer` and `:app-courier` targets
+- Gradle convention plugin for multi-app config
+- Shared `:core:maps` wrapping Google Maps Compose SDK
+
+### M2 — Restaurant discovery
+
+- Location permission request with rationale
+- Nearby restaurants query (geo-hashed query on backend)
+- Restaurant list + filter (cuisine, rating, delivery time)
+- Menu with categories, item customization (dietary, spice level)
+- Offline cache of favorites + last-ordered restaurant
+
+### M3 — Checkout + payment
+
+- Address autocomplete via Places API
+- Delivery time slot picker
+- Payment sheet (Google Pay + card entry)
+- Tip picker with presets + custom
+- Order confirmation with estimated delivery time
+
+### M4 — Live tracking (critical path)
+
+- **Foreground Service** in courier app tracking location (runtime permission + notification)
+- Location updates published to backend via WebSocket
+- Customer app subscribes to order channel, receives courier location
+- Google Maps Compose renders courier marker + route polyline
+- ETA recomputed on each location update
+
+```kotlin
+class LocationForegroundService : LifecycleService() {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Delivering order")
+            .setSmallIcon(R.drawable.ic_delivery)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .build()
+        startForeground(NOTIF_ID, notification, FOREGROUND_SERVICE_TYPE_LOCATION)
+
+        lifecycleScope.launch {
+            locationClient.updates(intervalMillis = 5_000)
+                .collect { location -> webSocket.send(LocationUpdate(orderId, location)) }
+        }
+        return START_STICKY
+    }
+}
+```
+
+### M5 — Courier app specifics
+
+- Accept/reject within timeout (shared countdown state)
+- Turn-by-turn navigation (Google Navigation SDK or Intent to Maps)
+- Mark pickup / delivered with signature capture (Canvas)
+- Daily earnings summary with local charts
+
+### M6 — Production
+
+- **Battery impact**: Doze + App Standby handling; WorkManager fallback for position reporting if FG service killed
+- Foreground service **type declaration** (`dataSync`, `location`)
+- Android 14+ restrictions on starting FG from background — design around it
+- Macrobenchmark for map rendering jank
+- Play Data Safety: Precise location declared + user-revocable
+
+## Architecture highlights
+
+### Location client wrapped in Flow
+
+```kotlin
+class LocationClient @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val fused: FusedLocationProviderClient
+) {
+    @SuppressLint("MissingPermission")
+    fun updates(intervalMillis: Long): Flow<Location> = callbackFlow {
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, intervalMillis)
+            .setMinUpdateIntervalMillis(intervalMillis / 2)
+            .build()
+        val callback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                result.lastLocation?.let { trySend(it) }
+            }
+        }
+        fused.requestLocationUpdates(request, callback, Looper.getMainLooper())
+        awaitClose { fused.removeLocationUpdates(callback) }
+    }.flowOn(Dispatchers.Default)
+}
+```
+
+### ETA reducer
+
+```kotlin
+class EtaReducer @Inject constructor(
+    private val directions: DirectionsApi
+) {
+    suspend fun compute(courier: LatLng, destination: LatLng): Duration {
+        val route = directions.route(origin = courier, destination = destination)
+        return route.durationSeconds.seconds
+    }
+}
+
+@Composable
+fun TrackingScreen(viewModel: TrackingViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    GoogleMap(
+        cameraPositionState = rememberCameraPositionState {
+            position = CameraPosition.fromLatLngZoom(state.destination, 15f)
+        }
+    ) {
+        Marker(state = MarkerState(state.courier), icon = courierIcon())
+        Marker(state = MarkerState(state.destination), icon = homeIcon())
+        Polyline(points = state.route, color = MaterialTheme.colorScheme.primary)
+    }
+    Text("ETA: ${state.etaMinutes} min")
+}
+```
+
+## Stretch goals
+
+<FeatureGrid columns={2} features={[
+  { icon: '🏎️', title: 'Offline maps', description: 'Download map tiles for the city. Courier app works even in dead zones.' },
+  { icon: '🔋', title: 'Adaptive location', description: 'Reduce update frequency when stationary. Save 30-50% battery per shift.' },
+  { icon: '📡', title: 'BLE beacon pickup', description: 'Restaurant BLE beacon auto-marks pickup when courier enters.' },
+  { icon: '🎨', title: 'Android Auto', description: 'Courier app integration with Android Auto head unit for voice-guided delivery.' }
+]} />
+
+## Testing strategy
+
+- **MockLocation** for FusedLocationProvider in instrumentation tests
+- **MockWebServer** simulates WebSocket stream of location updates
+- **Compose tests** for map camera follow and polyline updates
+- **Battery tests** via Battery Historian — ensure < 5% drain per 30-min delivery
+
+## Privacy & permissions
+
+- **Precise location**: only while delivering (runtime permission just-in-time)
+- **Background location**: required only on courier app, with rationale screen
+- **Play Data Safety**: precise location collected, purpose "Delivery tracking",
+  user-revocable, encrypted in transit, deletable
+- **Retention**: location data purged 30 days after delivery
+
+## Next
+
+Continue to **[Project 4 — Fitness Tracker](/docs/projects/fitness-tracker)** for sensors, Wear OS, and Health Connect.

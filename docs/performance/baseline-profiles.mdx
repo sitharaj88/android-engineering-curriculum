@@ -1,0 +1,384 @@
+---
+id: baseline-profiles
+title: Baseline Profiles & Startup Optimization
+sidebar_label: Baseline Profiles
+description: Cut cold start by 30-40%. Baseline profiles, startup profiles, macrobenchmark, app startup library, and the playbook to optimize cold, warm, and hot launches.
+---
+
+import { Callout, StepList, ComparisonCard, Diagram, RenderFlowDiagram } from '@site/src/components/Doc';
+
+# Baseline Profiles & Startup Optimization
+
+Cold start is the first impression. P95 cold start above 2 seconds loses
+users, hurts engagement metrics, and costs you Play Store ranking. This
+chapter teaches you the three-part playbook: **measure with Macrobenchmark,
+precompile with Baseline Profiles, defer with App Startup**.
+
+<Callout kind="tip" title="Why this works">
+On a cold start, ART (Android Runtime) JIT-compiles methods as they execute.
+A baseline profile tells ART "these methods will run at startup — compile
+them ahead of time." The result: methods run as native code from frame 1.
+Real-world wins: Chrome 30%, Cash App 40%, Instagram 25%.
+</Callout>
+
+## The three launch modes
+
+```text
+┌──────────┬───────────────────────────────────┬─────────────────────────┐
+│ Mode     │ What happens                      │ Target (mid-tier device)│
+├──────────┼───────────────────────────────────┼─────────────────────────┤
+│ Cold     │ Process start + Application.onCreate│ < 1000 ms              │
+│          │ + first activity + first frame    │                         │
+├──────────┼───────────────────────────────────┼─────────────────────────┤
+│ Warm     │ Process alive, activity recreated │ < 500 ms                │
+├──────────┼───────────────────────────────────┼─────────────────────────┤
+│ Hot      │ Activity resumed from stopped     │ < 300 ms                │
+└──────────┴───────────────────────────────────┴─────────────────────────┘
+```
+
+Real users see **cold** far more often than you think (Android kills
+processes aggressively after 10-15 min idle). Optimize cold first.
+
+## Step 1 — Macrobenchmark (measure, don't guess)
+
+Create a `:benchmark` module:
+
+```kotlin
+// benchmark/build.gradle.kts
+plugins {
+    alias(libs.plugins.android.test)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.benchmark)
+}
+
+android {
+    namespace = "com.myapp.benchmark"
+    compileSdk = 35
+    defaultConfig {
+        minSdk = 24
+        targetSdk = 35
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+    testBuildType = "benchmark"
+    buildTypes {
+        create("benchmark") {
+            initWith(getByName("release"))
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
+    }
+    targetProjectPath = ":app"
+    experimentalProperties["android.experimental.self-instrumenting"] = true
+}
+
+dependencies {
+    implementation("androidx.benchmark:benchmark-macro-junit4:1.3.3")
+    implementation("androidx.test.ext:junit:1.2.1")
+    implementation("androidx.test.espresso:espresso-core:3.6.1")
+    implementation("androidx.test.uiautomator:uiautomator:2.3.0")
+}
+```
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class StartupBenchmark {
+
+    @get:Rule val rule = MacrobenchmarkRule()
+
+    @Test fun startupCompilationNone() = startup(CompilationMode.None())
+
+    @Test fun startupCompilationBaselineProfile() =
+        startup(CompilationMode.Partial(BaselineProfileMode.Require))
+
+    @Test fun startupCompilationFull() = startup(CompilationMode.Full())
+
+    private fun startup(mode: CompilationMode) = rule.measureRepeated(
+        packageName = "com.myapp",
+        metrics = listOf(StartupTimingMetric(), FrameTimingMetric()),
+        compilationMode = mode,
+        startupMode = StartupMode.COLD,
+        iterations = 10,
+        setupBlock = { pressHome() },
+        measureBlock = {
+            startActivityAndWait()
+            device.wait(Until.hasObject(By.res("home_root")), 5_000)
+        }
+    )
+}
+```
+
+Run on a physical device (emulators lie):
+
+```bash
+./gradlew :benchmark:connectedBenchmarkAndroidTest
+```
+
+You'll see three distributions side by side. The delta between `None` and
+`Require` is **the value your baseline profile delivers**.
+
+## Step 2 — Generate the baseline profile
+
+```kotlin
+// baseline-profile/build.gradle.kts
+plugins {
+    alias(libs.plugins.android.test)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.baselineprofile)
+}
+
+android {
+    namespace = "com.myapp.baselineprofile"
+    compileSdk = 35
+    defaultConfig { minSdk = 28 }
+    targetProjectPath = ":app"
+}
+
+dependencies {
+    implementation("androidx.benchmark:benchmark-macro-junit4:1.3.3")
+    implementation("androidx.test.uiautomator:uiautomator:2.3.0")
+}
+```
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+@OptIn(ExperimentalBaselineProfilesApi::class)
+class BaselineProfileGenerator {
+
+    @get:Rule val rule = BaselineProfileRule()
+
+    @Test fun generate() = rule.collect(
+        packageName = "com.myapp",
+        includeInStartupProfile = true,                  // also generate a startup profile
+        profileBlock = {
+            pressHome()
+            startActivityAndWait()
+
+            // Exercise the critical user journey
+            device.wait(Until.hasObject(By.res("home_root")), 5_000)
+
+            // Scroll the feed
+            val feed = device.findObject(By.res("home_feed"))
+            repeat(3) { feed.fling(Direction.DOWN); device.waitForIdle() }
+
+            // Open a detail screen
+            device.findObject(By.res("feed_item")).click()
+            device.wait(Until.hasObject(By.res("detail_root")), 5_000)
+            device.pressBack()
+
+            // Navigate bottom tabs
+            device.findObject(By.text("Search")).click()
+            device.wait(Until.hasObject(By.res("search_root")), 5_000)
+        }
+    )
+}
+```
+
+```kotlin
+// app/build.gradle.kts
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.baselineprofile)
+}
+
+baselineProfile {
+    saveInSrc = true                            // commit to repo
+    automaticGenerationDuringBuild = false      // don't regenerate on every release
+}
+
+dependencies {
+    "baselineProfile"(project(":baseline-profile"))
+    implementation("androidx.profileinstaller:profileinstaller:1.4.1")
+}
+```
+
+Generate once:
+
+```bash
+./gradlew :app:generateReleaseBaselineProfile
+```
+
+The generator runs your journey on a device, records which methods ran,
+and writes `app/src/main/generated/baselineProfiles/baseline-prof.txt`.
+Commit it to your repo. AGP bundles it into the APK automatically.
+
+## Step 3 — Defer with App Startup
+
+Every initializer runs on the main thread before the first frame. Audit
+your `Application.onCreate` and defer everything you can with the
+**App Startup** library:
+
+```kotlin
+class AnalyticsInitializer : Initializer<Analytics> {
+    override fun create(context: Context): Analytics =
+        Analytics.getInstance(context).apply { setCollectionEnabled(true) }
+    override fun dependencies(): List<Class<out Initializer<*>>> = emptyList()
+}
+
+class CrashlyticsInitializer : Initializer<FirebaseCrashlytics> {
+    override fun create(context: Context): FirebaseCrashlytics =
+        FirebaseCrashlytics.getInstance().apply {
+            setCrashlyticsCollectionEnabled(!BuildConfig.DEBUG)
+        }
+    override fun dependencies() = listOf(FirebaseInitializer::class.java)
+}
+```
+
+```xml
+<!-- AndroidManifest.xml -->
+<provider
+    android:name="androidx.startup.InitializationProvider"
+    android:authorities="${applicationId}.androidx-startup"
+    android:exported="false">
+    <meta-data
+        android:name="com.myapp.init.AnalyticsInitializer"
+        android:value="androidx.startup"/>
+    <meta-data
+        android:name="com.myapp.init.CrashlyticsInitializer"
+        android:value="androidx.startup"/>
+</provider>
+```
+
+For heavy, non-critical work, use **lazy initialization** and `WorkManager`:
+
+```kotlin
+class MyApp : Application() {
+    val deferredTelemetry by lazy { TelemetryClient.init(this) }
+
+    override fun onCreate() {
+        super.onCreate()
+        // Main thread: only the bare minimum (logger, Hilt, crash reporter)
+
+        // Defer heavy init to background
+        val workRequest = OneTimeWorkRequestBuilder<BackgroundInitWorker>()
+            .setInitialDelay(2, TimeUnit.SECONDS)
+            .build()
+        WorkManager.getInstance(this).enqueue(workRequest)
+    }
+}
+```
+
+## Other startup wins
+
+### Avoid `Application` inheritance bloat
+
+```kotlin
+// BAD — constructor runs at process creation
+class MyApp : Application() {
+    private val heavyCache = ExpensiveCache(/* 50 MB alloc */)
+}
+
+// GOOD — lazy
+class MyApp : Application() {
+    private val heavyCache by lazy { ExpensiveCache() }
+}
+```
+
+### Splash screens: no network gating
+
+```kotlin
+// DON'T await a config fetch before navigating
+splashScreen.setKeepOnScreenCondition { !config.isReady }   // ⚠️ delays everything
+
+// DO navigate immediately; show placeholders
+splashScreen.setKeepOnScreenCondition { false }            // remove immediately
+```
+
+### Preloads that actually matter
+
+- **Images**: prefetch the above-the-fold images for your main list
+- **Fonts**: use downloadable fonts with `app:fontProviderFetchStrategy="async"`
+- **DataStore**: warm the flow before the UI collects
+
+```kotlin
+class HomeViewModel @Inject constructor(
+    private val prefetcher: ImagePrefetcher,
+    private val feedRepo: FeedRepository
+) : ViewModel() {
+    init {
+        viewModelScope.launch {
+            val items = feedRepo.topItems(limit = 10)
+            prefetcher.prefetch(items.map { it.imageUrl })
+        }
+    }
+}
+```
+
+### ProfileInstaller verification
+
+Check at runtime that the baseline profile was installed:
+
+```kotlin
+class ProfileVerifier @Inject constructor(@ApplicationContext private val context: Context) {
+    fun verify() = context.packageManager.getApplicationInfo(context.packageName, 0)
+        .let { ProfileVerifier.getCompilationStatusAsync().get() }
+        .takeIf { it.isCompiledWithProfile }
+        ?.let { Log.i("Profile", "Baseline profile active, reason=${it.profileInstallResultCode}") }
+        ?: Log.w("Profile", "Baseline profile NOT active")
+}
+```
+
+## ANR and jank — the long-tail of performance
+
+Startup isn't the only frame-timing problem. Track:
+
+- **ANR rate** — target ≥ 99.8% ANR-free (via Crashlytics + `ApplicationExitInfo`)
+- **Frame timing P99** — `FrameTimingMetric` in macrobenchmark
+- **Jank percentage** — frames > 16ms (or > 11ms on 90Hz, 8ms on 120Hz)
+
+```kotlin
+// Detect StrictMode violations in debug (main thread I/O, DB access)
+if (BuildConfig.DEBUG) {
+    StrictMode.setThreadPolicy(
+        StrictMode.ThreadPolicy.Builder()
+            .detectDiskReads().detectDiskWrites().detectNetwork()
+            .penaltyLog().penaltyFlashScreen()
+            .build()
+    )
+    StrictMode.setVmPolicy(
+        StrictMode.VmPolicy.Builder()
+            .detectLeakedSqlLiteObjects().detectActivityLeaks()
+            .penaltyLog()
+            .build()
+    )
+}
+```
+
+## The startup audit checklist
+
+<StepList steps={[
+  { title: 'Macrobenchmark the three modes', description: 'Cold, warm, hot — on a P20-equivalent device. Record current P50/P95.' },
+  { title: 'Profile with Perfetto or Android Studio', description: 'Identify the 5 longest main-thread operations before first frame. Defer each one.' },
+  { title: 'App Startup library adoption', description: 'Move everything from Application.onCreate into Initializer classes with proper dependencies.' },
+  { title: 'Generate baseline + startup profiles', description: 'Run the baseline-profile module, commit the generated txt files, verify with ProfileVerifier at runtime.' },
+  { title: 'Defer network and heavy I/O', description: 'No config fetch, no analytics flush, no DB warmup on the critical path. Splash screen is not a waiting room.' },
+  { title: 'Macrobenchmark again', description: 'Compare before/after distributions. You should see P95 drop 20-40%.' }
+]} />
+
+## Device tier strategy
+
+A Pixel 9 Pro is not your user. Test on:
+
+- **Low tier**: Pixel 4a (2020), RAM 6GB — emulates Android Go entry phones
+- **Mid tier**: Pixel 7 (2022), RAM 8GB — dominant real-world device
+- **High tier**: Pixel 9 Pro (2024), RAM 16GB — validates upper bounds
+
+Startup on the low tier is your real P95. Ship when that number meets your
+SLO.
+
+## Key takeaways
+
+<Callout kind="success" title="Startup performance rules">
+- **Measure with Macrobenchmark** before changing anything — record baselines.
+- **Baseline + Startup profiles** give 20-40% cold-start wins with ~20 lines of code.
+- **App Startup library** for Initializer dependency graphs.
+- **Defer aggressively** — no network, no DB, no analytics flush on the critical path.
+- **Low-tier device is your P95**. Test there, not on the flagship.
+- **Verify at runtime** with ProfileVerifier — builds without baseline profile silently regress.
+</Callout>
+
+## Next
+
+Return to **[Module 10 Overview](./overview)** or continue to
+**[Module 11 — Google Play Store & Publishing](/docs/publishing/overview)**.

@@ -1,0 +1,380 @@
+---
+id: overview
+title: Module 15 — Modularization at Scale
+sidebar_label: Overview
+description: Split a monolith into 30+ feature modules. API/impl separation, dependency direction enforcement, dynamic feature delivery, and incremental build wins.
+---
+
+import { Callout, ComparisonCard, StepList, FeatureGrid, Diagram, ArchDiagram } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 15 of 20</span>
+  <span><strong>Duration:</strong> 2 weeks</span>
+  <span><strong>Topics:</strong> 4 · 9 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 04, 14</span>
+</div>
+
+# Modularization at Scale
+
+A single-module app is fine for 5,000 lines. At 50,000 lines with 10
+developers, you need modules — not because they're fashionable, but because
+without them **every change triggers a full recompile**, **features leak into
+each other**, and **build times balloon past 5 minutes**. This module teaches
+the patterns used at Google, Square, Airbnb, and every other serious Android
+shop.
+
+<Callout kind="tip" title="The real reason to modularize">
+Modularization is not about making your project "look organized." It is about
+**incremental build performance**, **enforced architectural boundaries**, and
+**enabling dynamic feature delivery**. Modularize when you have a reason —
+not pre-emptively.
+</Callout>
+
+## Topic 1 · Module taxonomy
+
+A well-modularized app has three module types, stacked in layers:
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│  APP MODULE            :app                                      │
+│  - Application class, DI entry points, NavHost wiring           │
+│  - Depends on all :feature:* modules                             │
+├─────────────────────────────────────────────────────────────────┤
+│  FEATURE MODULES       :feature:auth, :feature:cart, ...         │
+│  - Self-contained user-facing feature (UI + VM + feature logic) │
+│  - Depend on :core:* modules, never on each other                │
+├─────────────────────────────────────────────────────────────────┤
+│  CORE MODULES          :core:ui, :core:design, :core:data, ...   │
+│  - Cross-cutting concerns used by every feature                 │
+│  - Depend only on other :core:* modules + libraries             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### A reference enterprise layout
+
+```text
+:app                       -> Application, DI, NavHost, top-level theme
+:build-logic              -> convention plugins (Module 14)
+
+:core:
+  :core:design            -> M3 theme, colors, typography, design tokens
+  :core:ui                -> reusable Composables (AppBar, EmptyState, Loading)
+  :core:domain            -> entities, use cases, repository interfaces (PURE KOTLIN)
+  :core:data              -> repository implementations, DTOs, mappers
+  :core:database          -> Room setup, DAOs, entities
+  :core:network           -> Retrofit, OkHttp, auth interceptor
+  :core:datastore         -> DataStore wrappers, proto definitions
+  :core:common            -> Dispatchers, Result, logging utilities
+  :core:testing           -> test fakes, Hilt test rules, fixtures
+  :core:analytics         -> analytics abstraction (Firebase, Amplitude adapters)
+
+:feature:
+  :feature:auth           -> sign-in, sign-up, password reset
+  :feature:home           -> feed, navigation hub
+  :feature:catalog        -> product list + detail
+  :feature:cart           -> cart screen + checkout flow
+  :feature:profile        -> account, settings, orders
+  :feature:search         -> search screen + filters
+
+:benchmark                -> macrobenchmark suite (Module 10/17)
+:baseline-profile         -> baseline profile generator
+```
+
+**Key property**: features depend on core, never on each other. If
+`:feature:cart` needs data from `:feature:catalog`, they both go through
+`:core:domain` interfaces.
+
+---
+
+## Topic 2 · API / Impl split
+
+A module typically exposes a small surface and hides everything else. For
+features that cross boundaries (a home feed that shows products from multiple
+features), split the module in two:
+
+```text
+:feature:catalog:
+  :feature:catalog:api    -> public contracts (interfaces, data classes)
+  :feature:catalog:impl   -> implementation (screens, VMs, repositories)
+```
+
+```kotlin
+// feature/catalog/api/src/main/kotlin/CatalogApi.kt
+interface CatalogApi {
+    suspend fun featured(limit: Int): List<Product>
+    fun navigateToProduct(id: String): NavRoute
+}
+
+// feature/catalog/impl/src/main/kotlin/CatalogApiImpl.kt
+@Singleton
+class CatalogApiImpl @Inject constructor(
+    private val repo: ProductRepository
+) : CatalogApi {
+    override suspend fun featured(limit: Int): List<Product> = repo.featured(limit)
+    override fun navigateToProduct(id: String) = ProductDetailRoute(id)
+}
+
+// feature/catalog/impl/src/main/kotlin/di/CatalogModule.kt
+@Module
+@InstallIn(SingletonComponent::class)
+abstract class CatalogModule {
+    @Binds @Singleton
+    abstract fun bindCatalogApi(impl: CatalogApiImpl): CatalogApi
+}
+```
+
+Now `:feature:home` depends on `:feature:catalog:api` (tiny, rarely changes)
+rather than the full implementation. When catalog's internal code changes,
+home doesn't recompile.
+
+<Callout kind="success" title="The hidden superpower">
+A clean API/impl split lets you replace any feature's implementation without
+touching callers. Legacy catalog? Swap the impl module, keep the API. A/B
+test two implementations? Bind a different impl in each flavor.
+</Callout>
+
+---
+
+## Topic 3 · Dependency rules & enforcement
+
+Writing the rules isn't enough. Someone will break them. **Enforce them at
+build time.**
+
+### Konsist — architectural tests
+
+```kotlin
+// core/testing/src/main/kotlin/ArchitectureTest.kt
+class ArchitectureTest {
+
+    @Test
+    fun `features never depend on each other`() {
+        Konsist
+            .scopeFromProject()
+            .files
+            .filter { it.resideInModule("feature") }
+            .assertFalse { file ->
+                file.imports.any { import ->
+                    val src = file.moduleName                     // e.g. feature:cart
+                    val dst = import.name.moduleName() ?: return@any false
+                    src != dst && src.startsWith("feature") && dst.startsWith("feature")
+                }
+            }
+    }
+
+    @Test
+    fun `domain has no Android dependencies`() {
+        Konsist
+            .scopeFromProject()
+            .files
+            .filter { it.resideInModule("core.domain") }
+            .assertFalse { file ->
+                file.imports.any { import ->
+                    import.name.startsWith("android.") ||
+                    import.name.startsWith("androidx.")
+                }
+            }
+    }
+
+    @Test
+    fun `use cases end with UseCase suffix`() {
+        Konsist
+            .scopeFromProject()
+            .classes()
+            .filter { it.resideInPackage("..usecase..") }
+            .assertTrue { it.name.endsWith("UseCase") }
+    }
+}
+```
+
+Run as part of `./gradlew check`. Any PR that breaks a boundary fails CI.
+
+### Module visibility
+
+```kotlin
+// settings.gradle.kts
+include(":feature:catalog:api")
+include(":feature:catalog:impl")
+// Never include or depend on :feature:catalog:impl from feature:home
+```
+
+Combined with the `implementation()` (not `api()`) scope in Gradle,
+transitive leaks are impossible:
+
+```kotlin
+// feature/home/build.gradle.kts
+dependencies {
+    implementation(projects.feature.catalog.api)  // home uses the interface
+    // implementation(projects.feature.catalog.impl)  ❌ compile error if added
+}
+```
+
+---
+
+## Topic 4 · Dynamic feature modules
+
+**Play Feature Delivery** lets you ship features that download on demand —
+shrinking the base APK and enabling country-specific, device-specific, or
+purchase-gated modules.
+
+```kotlin
+// feature/premium-analytics/build.gradle.kts
+plugins {
+    alias(libs.plugins.android.dynamic.feature)
+    alias(libs.plugins.kotlin.android)
+}
+
+android {
+    namespace = "com.myapp.premium.analytics"
+}
+
+dependencies {
+    implementation(project(":app"))   // dynamic features depend on :app
+    implementation(projects.core.ui)
+    implementation(projects.core.domain)
+}
+```
+
+```xml
+<!-- feature/premium-analytics/src/main/AndroidManifest.xml -->
+<manifest
+    xmlns:dist="http://schemas.android.com/apk/distribution">
+    <dist:module
+        dist:instant="false"
+        dist:title="@string/premium_analytics_title">
+        <dist:delivery>
+            <dist:on-demand/>
+        </dist:delivery>
+        <dist:fusing dist:include="true"/>
+    </dist:module>
+</manifest>
+```
+
+Request the module at runtime:
+
+```kotlin
+class PremiumFeatureLoader @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    private val manager = SplitInstallManagerFactory.create(context)
+
+    suspend fun installAnalytics(): Result<Unit> = suspendCancellableCoroutine { cont ->
+        val request = SplitInstallRequest.newBuilder()
+            .addModule("premium-analytics")
+            .build()
+
+        manager.startInstall(request)
+            .addOnSuccessListener { cont.resume(Result.success(Unit)) {} }
+            .addOnFailureListener { cont.resume(Result.failure(it)) {} }
+    }
+}
+```
+
+<Callout kind="warning" title="When NOT to use dynamic features">
+Dynamic delivery adds complexity: module loading states, testing edge cases,
+Play Integrity complications. Only use it when:
+- The feature is large (>1 MB of code/resources)
+- It's used by a minority of users (premium, region-locked)
+- You ship via Play (not alternative stores)
+
+For a team with < 3 engineers, stick with regular feature modules.
+</Callout>
+
+---
+
+## Migration strategy — monolith to modular
+
+Don't "big bang" refactor. Do it in vertical slices:
+
+<StepList steps={[
+  { title: 'Extract core:design first', description: 'Move your theme, colors, typography, and a few reusable Composables. Every feature will eventually depend on this, so validating the module setup here is safe.' },
+  { title: 'Extract core:common and core:domain', description: 'Pure-Kotlin modules with zero Android dependencies. These compile fastest and act as the foundation for every feature.' },
+  { title: 'Extract ONE feature end-to-end', description: 'Pick a small, well-understood feature. Move its screen, ViewModel, repository, and use cases. Verify tests still run. This proves the pattern.' },
+  { title: 'Extract core:data and core:network', description: 'Pull out Retrofit, OkHttp, interceptors, repository implementations. Features now depend on data through domain interfaces.' },
+  { title: 'Iterate feature-by-feature', description: 'Every sprint, move one more feature module. Measure incremental build time after each extraction — that\'s your ROI dashboard.' },
+  { title: 'Add Konsist architectural tests', description: 'Lock in the boundaries you just created. Future PRs can\'t accidentally reintroduce cross-feature imports.' }
+]} />
+
+---
+
+## Measuring the ROI
+
+Before and after each module extraction, record these numbers:
+
+```bash
+# Clean build time
+./gradlew clean && time ./gradlew :app:assembleDebug
+
+# Incremental (change one line in one feature)
+./gradlew :app:assembleDebug
+# edit feature/profile/ProfileScreen.kt
+time ./gradlew :app:assembleDebug
+
+# Configuration time only
+./gradlew help --scan
+```
+
+A good modular Android app achieves:
+
+| Metric                              | Monolith          | Well-modularized      |
+|-------------------------------------|-------------------|-----------------------|
+| Clean debug build                  | 2–4 min           | 1–2 min               |
+| Incremental (one-feature change)   | 45–90 s           | 8–20 s                |
+| Configuration phase                | 15–30 s           | 2–5 s (config cache)  |
+| Test a feature in isolation        | impossible        | `./gradlew :feature:cart:test` |
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'What to avoid',
+    variant: 'old',
+    points: [
+      'Creating modules before you have pain',
+      'A :common module that everything depends on',
+      'Feature-to-feature dependencies',
+      'Exposing impls via api() scope',
+      'Giant :core:data that contains everything',
+      'Copy-pasting buildTypes into every module'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'What to do',
+    variant: 'new',
+    points: [
+      'Extract modules when build time or boundaries hurt',
+      'Split core by domain: data, domain, ui, design',
+      'Route cross-feature traffic through core:domain',
+      'Use implementation() by default; api() for public contracts only',
+      'One module = one responsibility; split when it grows past 30 files',
+      'Convention plugins from Module 14 — zero duplication'
+    ]
+  }}
+/>
+
+## Key takeaways
+
+<Callout kind="success" title="Modularization principles">
+- Modules solve **build time** and **boundary enforcement** — not organization.
+- Three layers: **app**, **feature**, **core**. Features never import features.
+- API/impl split isolates change — `api` module stays stable while `impl` churns.
+- Enforce boundaries with **Konsist** tests; lint catches what humans miss.
+- Measure clean build + incremental build time before and after every extraction.
+- Dynamic features are powerful but costly — reserve for large, optional capabilities.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Extract core:design', description: 'Create a :core:design module, move Theme.kt, Color.kt, Type.kt into it, and update :app to depend on it.' },
+  { title: 'Split a feature into api/impl', description: 'Take a feature from Module 04 (e.g., Profile) and split it into :feature:profile:api and :feature:profile:impl with a ProfileApi interface.' },
+  { title: 'Write a Konsist test', description: 'Add an architectural test that fails if any file in :core:domain imports from androidx.* or android.*.' },
+  { title: 'Benchmark your build', description: 'Record clean and incremental build times before and after extracting one feature module. Share the numbers in a README.' }
+]} />
+
+## Next module
+
+Continue to **[Module 16 — Security & Compliance](/docs/security-compliance/overview)** to harden your app against reverse engineering, enforce certificate pinning, integrate Play Integrity, and comply with GDPR/CCPA.

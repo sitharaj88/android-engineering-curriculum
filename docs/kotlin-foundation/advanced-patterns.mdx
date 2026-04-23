@@ -1,0 +1,374 @@
+---
+id: advanced-patterns
+title: Advanced Kotlin Patterns
+sidebar_label: Advanced Patterns
+description: Generics, variance, reified types, sealed hierarchies, DSL building, inline classes, context receivers — the Kotlin features that separate fluent users from experts.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Advanced Kotlin Patterns
+
+Kotlin is a simple language on the surface and a deep one underneath. These
+patterns show up in every serious Android codebase — Jetpack source, Coil,
+OkHttp, Ktor — and you'll write them yourself once you hit real-world
+design problems.
+
+## Generics and variance
+
+### The `out` (covariant) and `in` (contravariant) modifiers
+
+```kotlin
+// A producer of T is covariant — you can use a Producer<String>
+// where Producer<Any> is expected.
+interface Producer<out T> {
+    fun produce(): T
+    // fun consume(t: T)  // ERROR: T is out, can't appear in "in" positions
+}
+
+// A consumer of T is contravariant — you can use Consumer<Any>
+// where Consumer<String> is expected.
+interface Consumer<in T> {
+    fun consume(t: T)
+    // fun produce(): T   // ERROR: T is in, can't appear in "out" positions
+}
+
+val anyProducer: Producer<Any> = object : Producer<String> {
+    override fun produce() = "hello"
+}
+
+val stringConsumer: Consumer<String> = object : Consumer<Any> {
+    override fun consume(t: Any) = println(t)
+}
+```
+
+**Mnemonic**: "Producer Extends, Consumer Super" (PECS from Java). In Kotlin
+it's "Producer **out**, Consumer **in**." `List<out T>` is read-only;
+`MutableList<T>` is invariant because it produces AND consumes.
+
+### Use-site variance
+
+When you can't change a declaration, annotate at the call site:
+
+```kotlin
+fun copy(source: MutableList<out Number>, dest: MutableList<in Number>) {
+    for (item in source) dest.add(item)
+}
+
+val ints: MutableList<Int> = mutableListOf(1, 2, 3)
+val anys: MutableList<Any> = mutableListOf()
+copy(ints, anys)   // works: Int is a Number, Any is a supertype of Number
+```
+
+### Reified type parameters
+
+Normal generics are erased at runtime. `reified` keeps the type available —
+but only in `inline` functions:
+
+```kotlin
+inline fun <reified T> Gson.fromJson(json: String): T =
+    fromJson(json, T::class.java)
+
+val user: User = gson.fromJson(payload)   // T is User at runtime
+
+// Classic Android use: starting an activity
+inline fun <reified T : Activity> Context.start(init: Intent.() -> Unit = {}) {
+    val intent = Intent(this, T::class.java).apply(init)
+    startActivity(intent)
+}
+
+context.start<ProfileActivity> {
+    putExtra("userId", "u1")
+}
+```
+
+## Sealed classes and interfaces
+
+Sealed types are **closed hierarchies**: the compiler knows every subtype,
+so `when` expressions are exhaustive without an `else` branch.
+
+```kotlin
+sealed interface UiState<out T> {
+    data object Loading : UiState<Nothing>
+    data class Success<T>(val data: T) : UiState<T>
+    data class Error(val throwable: Throwable) : UiState<Nothing>
+}
+
+@Composable
+fun <T> render(state: UiState<T>, onRetry: () -> Unit, content: @Composable (T) -> Unit) {
+    when (state) {  // exhaustive — no else needed
+        is UiState.Loading -> LoadingView()
+        is UiState.Success -> content(state.data)
+        is UiState.Error -> ErrorView(state.throwable, onRetry)
+    }
+}
+```
+
+<Callout kind="tip" title="sealed interface vs sealed class">
+Use `sealed interface` when you need multiple inheritance or a type to
+extend other interfaces. Use `sealed class` when you want shared state or
+constructors. In 95% of cases, sealed interface + data classes/objects is
+enough and cleanest.
+</Callout>
+
+### The `Result` pattern
+
+```kotlin
+sealed interface Outcome<out T, out E> {
+    data class Ok<T>(val value: T) : Outcome<T, Nothing>
+    data class Err<E>(val error: E) : Outcome<Nothing, E>
+}
+
+inline fun <T, E, R> Outcome<T, E>.fold(
+    onOk: (T) -> R,
+    onErr: (E) -> R
+): R = when (this) {
+    is Outcome.Ok  -> onOk(value)
+    is Outcome.Err -> onErr(error)
+}
+
+sealed interface LoginError {
+    data object WrongPassword : LoginError
+    data object NetworkDown : LoginError
+    data class Rate(val retryAfter: Duration) : LoginError
+}
+
+suspend fun login(email: String, pw: String): Outcome<Session, LoginError> {
+    return try {
+        Outcome.Ok(api.login(email, pw))
+    } catch (e: HttpException) when (e.code()) {
+        401 -> Outcome.Err(LoginError.WrongPassword)
+        429 -> Outcome.Err(LoginError.Rate(e.retryAfter()))
+        else -> Outcome.Err(LoginError.NetworkDown)
+    }
+}
+```
+
+This beats `Result<T>` when you need **typed errors** the compiler enforces
+at call sites.
+
+## DSLs with receivers
+
+Kotlin's "function with receiver" (`A.() -> Unit`) is how Compose, Gradle,
+Ktor, and Jetpack routing all look declarative.
+
+```kotlin
+class NotificationSpec {
+    var title: String = ""
+    var body: String = ""
+    var priority: Int = 3
+    private val actions = mutableListOf<Action>()
+
+    fun action(init: Action.() -> Unit) {
+        actions += Action().apply(init)
+    }
+
+    class Action {
+        var label: String = ""
+        var intent: Intent? = null
+    }
+}
+
+fun notification(init: NotificationSpec.() -> Unit): NotificationSpec =
+    NotificationSpec().apply(init)
+
+val spec = notification {
+    title = "Order shipped"
+    body = "Your order #1234 has left the warehouse"
+    priority = 2
+    action {
+        label = "Track"
+        intent = TrackActivity.intentFor(orderId = "1234")
+    }
+}
+```
+
+### `@DslMarker` — prevent scope bleeding
+
+Without `@DslMarker`, nested DSL blocks can accidentally reach outer
+receivers:
+
+```kotlin
+@DslMarker
+annotation class NotificationDsl
+
+@NotificationDsl
+class NotificationSpec { /* ... */ }
+
+@NotificationDsl
+class ActionSpec { /* ... */ }
+
+notification {
+    action {
+        // Cannot accidentally access `title` from here — compile error
+    }
+}
+```
+
+## Inline classes (value classes)
+
+Type-safe wrappers with zero runtime cost. Perfect for IDs, units, and
+opaque handles:
+
+```kotlin
+@JvmInline value class UserId(val raw: String)
+@JvmInline value class Email(val raw: String) {
+    init { require(raw.matches(EMAIL_REGEX)) { "Invalid email: $raw" } }
+}
+@JvmInline value class Cents(val raw: Long) {
+    operator fun plus(other: Cents) = Cents(raw + other.raw)
+    val dollars: Double get() = raw / 100.0
+}
+
+// Before: fun charge(userId: String, amount: Long) { ... }
+// Easy to mix up. After:
+fun charge(userId: UserId, amount: Cents) { /* ... */ }
+
+charge(UserId("u1"), Cents(4999))
+// charge("u1", 4999L)  // ERROR — type mismatch, bug prevented
+```
+
+<Callout kind="warning" title="Inline classes and nullability">
+`UserId?` boxes into a regular object. Nullable fields of value classes
+defeat the zero-cost property. Prefer sentinel values or sealed hierarchies
+for optional IDs: `sealed class UserRef { object Anonymous : UserRef(); data class Known(val id: UserId) : UserRef() }`.
+</Callout>
+
+## Extension functions and properties
+
+Extensions are the backbone of idiomatic Kotlin. Three patterns every
+Android codebase uses:
+
+```kotlin
+// 1. View / Context extensions
+fun Context.dpToPx(dp: Int): Float = dp * resources.displayMetrics.density
+
+fun View.showKeyboard() {
+    requestFocus()
+    (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+        .showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+}
+
+// 2. Flow extensions for Android
+fun <T> Flow<T>.observeAsEvents(lifecycle: Lifecycle, block: suspend (T) -> Unit) {
+    lifecycle.coroutineScope.launch {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            collect(block)
+        }
+    }
+}
+
+// 3. Kotlin stdlib-style extensions for collections
+fun <T> List<T>.chunkedFlow(size: Int): Flow<List<T>> = chunked(size).asFlow()
+```
+
+### Member extensions — scoped behavior
+
+```kotlin
+class DateFormatter(private val zone: ZoneId) {
+
+    // This extension is ONLY visible inside DateFormatter scope
+    fun Instant.formatted(): String = DateTimeFormatter.ISO_LOCAL_DATE_TIME
+        .format(this.atZone(zone).toLocalDateTime())
+
+    fun format(moments: List<Instant>): List<String> =
+        moments.map { it.formatted() }  // extension visible here
+}
+```
+
+## Context receivers (preview)
+
+Kotlin 2.x is previewing `context(...)` receivers — a cleaner replacement
+for extension-with-receiver hacks:
+
+```kotlin
+context(LocalContextReceivers)
+fun loadImage(url: String) {
+    // Access `logger`, `dispatcher`, etc. from LocalContextReceivers
+    // without carrying them as parameters or fields
+}
+```
+
+Watch for this maturing. Today, use explicit receivers and scope functions.
+
+## Delegation — `by` keyword
+
+Kotlin delegation is two things: **interface delegation** (object
+composition) and **property delegation** (lazy, observable, map-backed).
+
+```kotlin
+// Interface delegation — no boilerplate forwarding
+interface Logger { fun log(msg: String) }
+class TimberLogger : Logger { override fun log(msg: String) = Timber.i(msg) }
+
+class UserService(logger: Logger) : Logger by logger {
+    fun login() {
+        log("login start")   // forwarded to delegate
+    }
+}
+
+// Property delegation
+class ViewModelWithFlags(remote: RemoteConfig) {
+    val newCheckout by remote.flag("new_checkout_enabled", default = false)
+}
+
+class FlagDelegate<T>(
+    private val remote: RemoteConfig,
+    private val key: String,
+    private val default: T
+) : ReadOnlyProperty<Any?, T> {
+    override fun getValue(thisRef: Any?, property: KProperty<*>): T =
+        remote.get(key) as? T ?: default
+}
+
+fun RemoteConfig.flag(key: String, default: Boolean) = FlagDelegate(this, key, default)
+```
+
+### `lazy`, `observable`, `vetoable`
+
+```kotlin
+class Screen {
+    private val expensive by lazy { buildHeavyObject() }             // constructed once, thread-safe
+
+    var counter: Int by Delegates.observable(0) { _, old, new ->
+        Log.d("Screen", "counter $old → $new")
+    }
+
+    var positive: Int by Delegates.vetoable(0) { _, _, new -> new >= 0 }
+}
+```
+
+## Kotlin K2 compiler (what senior engineers know)
+
+Kotlin 2.0 ships the K2 compiler — a complete rewrite of the frontend that:
+
+- Doubles compile speed in large projects
+- Enables new features (multi-file facades, better inference, smarter smart casts)
+- Preserves binary compatibility (use the same stdlib)
+
+Enable K2:
+
+```properties
+# gradle.properties
+kotlin.experimental.tryK2=true   # Kotlin 1.9; default in 2.0+
+```
+
+K2 is stricter about some edge cases — you might see new warnings. Treat
+them as free code-review findings.
+
+## Key takeaways
+
+<Callout kind="success" title="Patterns that differentiate">
+- **Variance** (`in`/`out`) — correctness at compile time for generic APIs.
+- **Sealed hierarchies** — exhaustive `when`, typed errors, no `else` branch.
+- **Reified types** — type-aware generic code in `inline fun`.
+- **DSLs with `@DslMarker`** — fluent, scoped APIs like Compose/Ktor.
+- **Value classes** — type safety with zero boxing cost.
+- **Delegation** — `by` keyword for composition and property delegates.
+- **K2 compiler** — faster builds, better inference; opt in and fix the warnings.
+</Callout>
+
+## Next
+
+Return to the **[Module 01 Overview](./overview)** or continue to
+**[Module 02 — Android Fundamentals](/docs/android-fundamentals/overview)**.

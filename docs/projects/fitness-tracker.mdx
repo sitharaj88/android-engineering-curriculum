@@ -1,0 +1,186 @@
+---
+id: fitness-tracker
+title: Project 4 — Fitness Tracker
+sidebar_label: Fitness Tracker
+description: Sensors, Health Connect, Wear OS companion, and offline-first syncing. Build a complete fitness app with phone + watch pair.
+---
+
+import { Callout, StepList, FeatureGrid } from '@site/src/components/Doc';
+
+# Fitness Tracker
+
+Build a workout + activity tracker with a **Wear OS companion**. This
+project owns **sensors, Health Connect, background services, KMP sharing,
+and cross-device sync**.
+
+## The user journey
+
+```text
+Phone                                    Watch
+─────                                    ─────
+Dashboard (today's stats)                Workout list
+Start workout ──────── BLE sync ────────►Live session (heart rate, splits)
+End workout ◄───────── sync result ─────End workout
+History (trends, charts)
+```
+
+## Features (by milestone)
+
+### M1 — Phone skeleton
+
+- Bottom nav: Today, Workouts, Trends, Profile
+- Permissions: Activity Recognition, Body Sensors, Health Connect
+- DataStore Proto schema for user preferences + workout settings
+- Compose charts (Vico or custom Canvas) for dashboards
+
+### M2 — Sensors & live workout
+
+- **Sensor fusion**: accelerometer + step counter + heart rate
+- Foreground service with notification showing live workout stats
+- Rolling buffer of recent samples for graph rendering
+- Pause/resume/stop with persisted state (survives process death)
+
+```kotlin
+class WorkoutService : LifecycleService(), SensorEventListener {
+    private lateinit var sensorManager: SensorManager
+    private val buffer = RingBuffer<SensorSample>(capacity = 1000)
+
+    override fun onSensorChanged(event: SensorEvent) {
+        buffer.add(SensorSample(event.sensor.type, event.values, event.timestamp))
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startForeground(NOTIF_ID, buildNotification(), FOREGROUND_SERVICE_TYPE_HEALTH)
+        registerSensors()
+        lifecycleScope.launch {
+            while (isActive) {
+                delay(1000)
+                val snapshot = buffer.snapshot()
+                statsStore.update(snapshot)
+            }
+        }
+        return START_STICKY
+    }
+}
+```
+
+### M3 — Health Connect integration
+
+- Read existing data: steps, distance, active calories, heart rate
+- Write workouts: `ExerciseSessionRecord` with start/end, type, duration, route
+- Permission rationale UI with explicit scopes
+- Sync Health Connect → your cloud backend (debounced)
+
+```kotlin
+class HealthSync @Inject constructor(private val client: HealthConnectClient) {
+    suspend fun writeWorkout(workout: Workout) {
+        val session = ExerciseSessionRecord(
+            startTime = workout.startTime, startZoneOffset = ZoneOffset.UTC,
+            endTime = workout.endTime, endZoneOffset = ZoneOffset.UTC,
+            exerciseType = ExerciseSessionRecord.EXERCISE_TYPE_RUNNING,
+            title = workout.title,
+            metadata = Metadata.manualEntry()
+        )
+        val heartRate = HeartRateRecord(
+            startTime = workout.startTime, startZoneOffset = ZoneOffset.UTC,
+            endTime = workout.endTime, endZoneOffset = ZoneOffset.UTC,
+            samples = workout.heartRateSamples.map {
+                HeartRateRecord.Sample(time = it.time, beatsPerMinute = it.bpm.toLong())
+            }
+        )
+        client.insertRecords(listOf(session, heartRate))
+    }
+}
+```
+
+### M4 — Wear OS companion
+
+- Separate `:wear` module with Wear Compose UI
+- Tile (ambient stats) + Complication (step count on the watchface)
+- Data Layer API for phone ↔ watch sync
+- Wear-specific foreground service for workouts started on the watch
+
+```kotlin
+// Wear: start workout, send to phone
+class WatchWorkoutViewModel @Inject constructor(
+    private val nodeClient: NodeClient,
+    private val messageClient: MessageClient
+) : ViewModel() {
+    fun sendWorkoutStart() = viewModelScope.launch {
+        val nodes = nodeClient.connectedNodes.await()
+        val payload = ProtoBuf.encodeToByteArray(WorkoutStart.serializer(), WorkoutStart(now()))
+        nodes.forEach { node -> messageClient.sendMessage(node.id, "/workout/start", payload) }
+    }
+}
+```
+
+### M5 — Trends, goals, gamification
+
+- Weekly/monthly rollups in a background WorkManager job
+- Goals: steps/day, workouts/week, active minutes
+- Achievements with on-device logic (no server round-trip)
+- Compose animations celebrating streak milestones
+
+### M6 — Production
+
+- Battery profiling (Battery Historian)
+- Doze + App Standby + sensor batching for efficiency
+- Baseline profile for dashboard and live workout screens
+- Play Data Safety: Health data, body sensor declarations with user controls
+- HIPAA-ish hardening: encryption at rest (SQLCipher) + transit (cert pinning)
+
+## Architecture — where the watch sits
+
+```text
+┌─────────────┐  Data Layer API   ┌─────────────┐
+│  Phone app  │ ◄────────────────► │  Watch app  │
+│  (Compose)  │                    │ (Wear UI)   │
+└──────┬──────┘                    └──────┬──────┘
+       │                                  │
+       ▼                                  ▼
+┌─────────────────────────────────────────────────┐
+│  :shared (KMP commonMain)                       │
+│    Domain models, formatters, formulas          │
+└──────────────────────────┬──────────────────────┘
+                           │
+            ┌──────────────┴──────────────┐
+            ▼                             ▼
+     ┌─────────────┐              ┌──────────────┐
+     │ Health Connect│              │  Cloud API   │
+     └─────────────┘              └──────────────┘
+```
+
+## Stretch goals
+
+<FeatureGrid columns={2} features={[
+  { icon: '🏃', title: 'GPS route tracking', description: 'Phone-only runs with route polyline, split analysis, elevation graph.' },
+  { icon: '💧', title: 'Hydration reminders', description: 'WorkManager-driven reminders with rich notifications and one-tap log.' },
+  { icon: '🧘', title: 'Guided breathing', description: 'Compose animation synced to inhale/exhale cycles. Wear tile shortcut.' },
+  { icon: '🔊', title: 'Voice coach', description: 'TTS split announcements during runs. Audio ducks music automatically.' },
+  { icon: '🎨', title: 'Ambient mode', description: 'Wear app supports always-on display with low-power updates every 60s.' }
+]} />
+
+## Testing strategy
+
+- **SensorManager fakes** for unit tests of sample processing
+- **Health Connect** test doubles for record assertions
+- **Robolectric** for WorkManager periodic jobs
+- **Espresso-Wear** for watch app UI tests on emulator
+- **MockDataLayer** for phone↔watch message routing
+
+## Battery SLOs
+
+- Live workout: < 10% battery drain per hour on Pixel 7
+- Idle background: < 1% battery drain per 24h
+- Wear companion: < 15% drain per 8h day with 1h workout
+
+## Privacy (critical for health apps)
+
+- All health data **encrypted on device** (SQLCipher wrapping Room)
+- **Zero third-party SDKs** receive health data (no Firebase Analytics on health events)
+- **Export + delete** flows for GDPR/CCPA compliance
+- **BAA required** with any cloud provider if marketing as HIPAA-compliant
+
+## Next
+
+Continue to **[Project 5 — News Aggregator](/docs/projects/news-aggregator)** for Paging 3, offline-first content, and Glance widgets.

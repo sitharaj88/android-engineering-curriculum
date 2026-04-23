@@ -1,0 +1,105 @@
+---
+id: overview
+title: Capstone Projects
+sidebar_label: Overview
+description: Five production-grade Android projects that bring together every module. Each has an architecture diagram, feature list, and graded milestones.
+slug: /projects
+---
+
+import { Callout, FeatureGrid, StepList } from '@site/src/components/Doc';
+
+# Capstone Projects
+
+Reading the curriculum gets you 40% of the way. Building these projects
+gets you the other 60%. Each project is designed to reinforce a specific
+stack — and together they cover every topic in the 20-module curriculum.
+
+<Callout kind="tip" title="How to use these projects">
+Don't try to build all five. Pick **two or three** based on your career
+direction: consumer product (E-Commerce + Social), logistics/operations
+(Food Delivery), health/wearables (Fitness), or content/platform (News).
+Ship each to a real device or Play internal track — shipping is the
+learning.
+</Callout>
+
+## Project index
+
+<FeatureGrid columns={2} features={[
+  { icon: '🛒', title: 'E-Commerce App', description: 'Catalog, cart, checkout, payments. Compose + Hilt + Room + Retrofit + MVI checkout flow. Primary modules: 01-06, 14-16.' },
+  { icon: '💬', title: 'Social Media App', description: 'Real-time chat, push, media upload. Firebase + FCM + Firestore + WebSocket + GraphQL. Primary modules: 06, 07, 16, 18.' },
+  { icon: '🍔', title: 'Food Delivery App', description: 'Live tracking, maps, courier ETA, WebSocket status. Maps + Location + Foreground Service. Primary modules: 06, 08, 10.' },
+  { icon: '💪', title: 'Fitness Tracker', description: 'Sensors, Health Connect, Wear OS companion, offline-first. Primary modules: 05, 08, 12, 19.' },
+  { icon: '📰', title: 'News Aggregator', description: 'Paging 3, offline cache, WorkManager sync, Glance widget. Primary modules: 05, 06, 08, 10.' }
+]} />
+
+## Graded milestones
+
+Every project has six milestones. Treat each milestone as a **PR** so your
+GitHub history tells the story.
+
+<StepList steps={[
+  { title: 'M1 — Skeleton', description: 'App + feature scaffolding, theme, navigation host, empty screens. Gradle convention plugins from Module 14.' },
+  { title: 'M2 — Data layer', description: 'Retrofit/GraphQL/etc, Room schema, repository interfaces, fake API for dev. Offline-first reading working.' },
+  { title: 'M3 — Primary flows', description: 'The 2-3 user journeys that define the app. Full MVVM/MVI with typed states and tests.' },
+  { title: 'M4 — Advanced features', description: 'Real-time, push, widgets, sensors — whatever the project requires. Cross-module surfaces.' },
+  { title: 'M5 — Production hardening', description: 'Crashlytics, baseline profile, R8 tuning, accessibility pass, RTL support, instrumentation tests.' },
+  { title: 'M6 — Ship', description: 'CI/CD, Play internal track upload, SBOM, privacy declaration, release notes. Update your portfolio README.' }
+]} />
+
+## Shared project scaffolding
+
+Every project should start with the same skeleton:
+
+```text
+myapp/
+├── build-logic/              -> convention plugins (Module 14)
+├── app/
+├── core/
+│   ├── design/               -> theme, tokens, reusable UI
+│   ├── ui/                   -> components: AppBar, EmptyState, ErrorView
+│   ├── domain/               -> entities, use cases, repo interfaces
+│   ├── data/                 -> repository impls, DTOs, mappers
+│   ├── network/              -> OkHttp, Retrofit/Apollo, auth interceptor
+│   ├── database/             -> Room, DAOs, migrations
+│   ├── datastore/            -> DataStore, proto schemas
+│   ├── common/               -> Result, Dispatchers, logging
+│   ├── testing/              -> fakes, Hilt test rules, fixtures
+│   └── analytics/            -> analytics abstraction + Firebase adapter
+├── feature/
+│   └── [feature]/            -> one module per screen/feature
+├── benchmark/                -> macrobenchmark suite (Module 10, 17)
+└── baseline-profile/         -> baseline profile generator
+```
+
+## Expected signals from each project
+
+| Signal                  | Target                                              |
+|-------------------------|-----------------------------------------------------|
+| Crash-free rate        | ≥ 99.5% on internal testers                         |
+| Cold start P95         | < 1.5 s on mid-tier device (Pixel 7 equivalent)     |
+| Test count             | ≥ 100 unit tests + ≥ 20 instrumentation tests      |
+| Code coverage          | Domain + use cases ≥ 80%, overall ≥ 50%             |
+| CI pipeline            | Green on main, < 12 min total runtime               |
+| Accessibility audit    | Zero serious violations from Google A11y framework  |
+| Play Data Safety       | Declared and matches actual SDK behavior            |
+
+## How to submit for review
+
+1. Push to a public GitHub repo with a README that includes:
+   - Screenshots or GIFs of primary flows
+   - Architecture diagram (hand-drawn is fine)
+   - Build + test badges
+   - "Decisions" section explaining non-obvious choices
+2. Tag a release (`v1.0.0`) with signed release notes
+3. Ship to Play internal track — paste the tester link in the README
+4. Submit the repo URL via a PR to this curriculum's `showcases/` folder (if hosting your own fork)
+
+## Next
+
+Pick your first project:
+
+- **[E-Commerce App](/docs/projects/ecommerce)** — Compose, Hilt, Room, Retrofit, checkout state machine
+- **[Social Media App](/docs/projects/social-media)** — Firebase, FCM, real-time chat, media upload
+- **[Food Delivery App](/docs/projects/food-delivery)** — Maps, live location, foreground services, WebSocket
+- **[Fitness Tracker](/docs/projects/fitness-tracker)** — Sensors, Health Connect, Wear OS companion, offline-first
+- **[News Aggregator](/docs/projects/news-aggregator)** — Paging 3, WorkManager sync, Glance widget

@@ -1,0 +1,407 @@
+---
+id: coroutines-deep-dive
+title: Coroutines Deep Dive
+sidebar_label: Coroutines Deep Dive
+description: Structured concurrency, dispatchers, supervisor jobs, exception handling, cancellation, and the coroutine internals every senior Android engineer must know.
+---
+
+import { Callout, ComparisonCard, StepList, Diagram, CoroutineScopesDiagram, ThreadsDiagram } from '@site/src/components/Doc';
+
+# Coroutines Deep Dive
+
+The overview showed you `viewModelScope.launch { }`. This chapter covers
+what happens **inside** that call — the coroutine machinery senior engineers
+must understand to debug real production code.
+
+<Callout kind="tip" title="Why go deep">
+Most coroutine bugs at scale come from four things: **leaking scopes**,
+**swallowed cancellation**, **wrong exception propagation**, and
+**dispatcher misuse**. Understanding the internals turns those from
+mysteries into obvious fixes.
+</Callout>
+
+## Structured concurrency
+
+A coroutine never exists alone. Every `launch` or `async` creates a child
+of the enclosing scope's `Job`. If the parent cancels, all children cancel.
+If a child throws, the parent cancels (and by transitivity, siblings cancel).
+
+```kotlin
+// The root scope of this work is viewModelScope.
+// Launching three children here means:
+// - If the ViewModel is cleared → all three cancel
+// - If any child throws → all three cancel (default Job)
+viewModelScope.launch {
+    val user = async { userRepo.fetch(id) }
+    val posts = async { postsRepo.listBy(id) }
+    val followers = async { followRepo.countFollowersOf(id) }
+    _state.value = ProfileUi(
+        user = user.await(),
+        posts = posts.await(),
+        followers = followers.await()
+    )
+}
+```
+
+### SupervisorJob — isolated failure
+
+Sometimes you want sibling coroutines to fail independently. Use
+`SupervisorJob` or `supervisorScope { }`:
+
+```kotlin
+// If `posts` fetch fails, `followers` still succeeds.
+viewModelScope.launch {
+    supervisorScope {
+        val user = async { userRepo.fetch(id) }
+        val posts = async { runCatching { postsRepo.listBy(id) }.getOrDefault(emptyList()) }
+        val followers = async { runCatching { followRepo.countFollowersOf(id) }.getOrNull() }
+        _state.value = ProfileUi(user.await(), posts.await(), followers.await())
+    }
+}
+```
+
+<Callout kind="warning" title="SupervisorJob is not the default">
+Using SupervisorJob everywhere defeats structured concurrency. Use it only
+where independent failure is a product requirement (parallel independent
+panels, background refresh tasks). Default to regular Job for logic where
+all-or-nothing semantics matter.
+</Callout>
+
+## Dispatchers — what runs where
+
+<Diagram title="Threads and dispatchers" caption="Dispatchers are thread pools with different behaviors. Pick the one that matches the work.">
+  <ThreadsDiagram />
+</Diagram>
+
+| Dispatcher            | Backing threads                        | Use for                                          |
+|-----------------------|----------------------------------------|--------------------------------------------------|
+| `Dispatchers.Main`    | Android main thread                    | UI updates, calling suspend fun that returns to UI |
+| `Dispatchers.Main.immediate` | Current main thread if already on it | Avoid unnecessary post to message queue          |
+| `Dispatchers.IO`      | Shared pool, 64+ threads               | Disk, network, blocking JDBC, JNI                |
+| `Dispatchers.Default` | CPU-count threads                      | CPU-bound work: JSON parsing, image encoding     |
+| `Dispatchers.Unconfined` | Whatever thread resumed the continuation | Advanced; avoid in production |
+
+```kotlin
+// WRONG — blocking on Main
+class UserViewModel : ViewModel() {
+    fun load(id: String) {
+        viewModelScope.launch {
+            val bytes = File("/sdcard/cache/$id").readBytes()  // ⚠️ BLOCKS MAIN
+            _state.value = UiState.Success(bytes)
+        }
+    }
+}
+
+// RIGHT — switch to IO for blocking work
+fun load(id: String) {
+    viewModelScope.launch {
+        val bytes = withContext(Dispatchers.IO) { File("/sdcard/cache/$id").readBytes() }
+        _state.value = UiState.Success(bytes)
+    }
+}
+```
+
+### Inject dispatchers for testability
+
+Never reference `Dispatchers.IO` directly in code you want to test:
+
+```kotlin
+// Production module
+@Qualifier @Retention(AnnotationRetention.BINARY) annotation class IoDispatcher
+@Qualifier @Retention(AnnotationRetention.BINARY) annotation class DefaultDispatcher
+
+@Module @InstallIn(SingletonComponent::class)
+object DispatcherModule {
+    @Provides @IoDispatcher      fun io(): CoroutineDispatcher = Dispatchers.IO
+    @Provides @DefaultDispatcher fun default(): CoroutineDispatcher = Dispatchers.Default
+}
+
+// Repository
+class ImageRepository @Inject constructor(
+    @IoDispatcher private val io: CoroutineDispatcher
+) {
+    suspend fun compress(bytes: ByteArray): ByteArray = withContext(io) {
+        /* heavy work */
+    }
+}
+
+// Test
+class ImageRepositoryTest {
+    private val dispatcher = StandardTestDispatcher()
+    private val repo = ImageRepository(dispatcher)
+
+    @Test fun `compress completes synchronously in test`() = runTest(dispatcher) {
+        val result = repo.compress(ByteArray(1024))
+        assertNotNull(result)
+    }
+}
+```
+
+## Cancellation — the cooperative model
+
+Cancellation in coroutines is **cooperative**. A coroutine checks for
+cancellation at suspension points; tight CPU loops ignore it.
+
+```kotlin
+// BROKEN — won't cancel until the loop finishes
+viewModelScope.launch {
+    var x = 0
+    while (true) { x++ }   // never suspends → never checks for cancellation
+}
+
+// RIGHT — ensureActive() inside tight loops
+viewModelScope.launch {
+    var x = 0
+    while (true) {
+        ensureActive()   // throws CancellationException if cancelled
+        x++
+    }
+}
+
+// Or use isActive
+viewModelScope.launch {
+    while (isActive) { /* work */ }
+}
+```
+
+### CancellationException is special
+
+```kotlin
+viewModelScope.launch {
+    try {
+        doWork()
+    } catch (e: Exception) {
+        _error.value = e.message     // ⚠️ swallows CancellationException
+    }
+}
+
+// RIGHT — re-throw cancellation
+viewModelScope.launch {
+    try {
+        doWork()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        _error.value = e.message
+    }
+}
+
+// BETTER — Kotlin 1.6+ gives us a helper
+viewModelScope.launch {
+    runCatching { doWork() }
+        .onFailure { if (it is CancellationException) throw it else _error.value = it.message }
+}
+```
+
+### NonCancellable — atomic cleanup
+
+When you MUST complete an operation (finalize a DB transaction, close a
+file) even after cancellation, wrap it in `NonCancellable`:
+
+```kotlin
+suspend fun replaceCache(data: ByteArray) {
+    try {
+        writeNewCache(data)
+    } finally {
+        withContext(NonCancellable) {
+            oldCacheFile.delete()    // runs even if parent cancels
+        }
+    }
+}
+```
+
+## Exception propagation
+
+Exceptions in `launch` are **uncaught by the caller** unless a
+`CoroutineExceptionHandler` is installed. Exceptions in `async` surface only
+when you `.await()`.
+
+```kotlin
+// `launch` — fails silently to the caller; propagates to parent job
+viewModelScope.launch { throw IOException() }   // caller does NOT see it
+
+// With a handler
+val handler = CoroutineExceptionHandler { _, e -> Firebase.crashlytics.recordException(e) }
+viewModelScope.launch(handler) { /* ... */ }
+
+// `async` — exception rethrown on await
+viewModelScope.launch {
+    val deferred = async { throw IOException() }
+    runCatching { deferred.await() }.onFailure { /* handle */ }
+}
+```
+
+### CoroutineExceptionHandler placement
+
+```kotlin
+// WRONG — handler on the child, not the launch target
+viewModelScope.launch {
+    launch(handler) { throw IOException() }  // handler doesn't help; parent still cancels
+}
+
+// RIGHT — supervisorScope isolates, handler catches
+viewModelScope.launch {
+    supervisorScope {
+        launch(handler) { throw IOException() }
+        launch { doOtherWork() }  // still runs
+    }
+}
+```
+
+## Channels and Flows
+
+### Channel — hot, coroutine-to-coroutine pipe
+
+```kotlin
+class UploadQueue {
+    private val channel = Channel<Upload>(capacity = Channel.BUFFERED)
+
+    suspend fun enqueue(upload: Upload) = channel.send(upload)
+
+    fun startWorker(scope: CoroutineScope) = scope.launch {
+        for (upload in channel) {
+            uploadService.send(upload)
+        }
+    }
+}
+```
+
+### Flow — cold, declarative stream
+
+```kotlin
+fun searchUsers(query: String): Flow<List<User>> = flow {
+    emit(emptyList())                                   // initial
+    val results = api.search(query)
+    emit(results)
+}
+    .flowOn(Dispatchers.IO)                            // upstream runs on IO
+    .catch { emit(emptyList()) }                       // convert errors
+    .distinctUntilChanged()                            // drop duplicate emissions
+```
+
+### Combining flows the right way
+
+```kotlin
+// Combine — re-emit whenever ANY source emits
+val uiState: Flow<UiState> = combine(
+    userFlow,
+    settingsFlow,
+    connectivityFlow
+) { user, settings, connected ->
+    UiState(user, settings, connected)
+}
+
+// Zip — re-emit only when ALL have new values
+val paired: Flow<Pair<A, B>> = flowA.zip(flowB) { a, b -> a to b }
+
+// flatMapLatest — cancel the old inner flow when outer emits
+val searchResults: Flow<List<User>> = queryFlow
+    .debounce(300)
+    .flatMapLatest { query -> searchUsers(query) }    // cancels in-flight on new query
+```
+
+<Callout kind="success" title="The flatMap variants">
+- `flatMapConcat` — preserve order, wait for each inner to finish. Rare.
+- `flatMapMerge` — run inner flows concurrently. Use when order doesn't matter.
+- `flatMapLatest` — **the one you'll use for user input**. Debounce + latest-wins.
+</Callout>
+
+## Testing coroutines
+
+`kotlinx-coroutines-test` is not optional. Master three tools:
+
+```kotlin
+@ExtendWith(MainDispatcherRule::class)
+class SearchViewModelTest {
+    private val dispatcher = StandardTestDispatcher()
+
+    @Test fun `debounce waits 300ms`() = runTest(dispatcher) {
+        val vm = SearchViewModel(dispatcher)
+
+        vm.onQueryChanged("p")
+        vm.onQueryChanged("pi")
+        vm.onQueryChanged("pix")
+        advanceTimeBy(299)
+        assertEquals(0, vm.searchCount)          // still debouncing
+        advanceTimeBy(1)
+        runCurrent()
+        assertEquals(1, vm.searchCount)          // fired once for "pix"
+    }
+}
+
+class MainDispatcherRule(
+    private val dispatcher: TestDispatcher = StandardTestDispatcher()
+) : BeforeEachCallback, AfterEachCallback {
+    override fun beforeEach(ctx: ExtensionContext) = Dispatchers.setMain(dispatcher)
+    override fun afterEach(ctx: ExtensionContext) = Dispatchers.resetMain()
+}
+```
+
+Three tools:
+- `runTest { }` — virtual time, auto-advances until all coroutines idle
+- `advanceTimeBy(n)` — fast-forward virtual time exactly `n` ms
+- `runCurrent()` — run coroutines that are due right now
+
+## Coroutine internals (at a glance)
+
+Compiled Kotlin suspend functions are **state machines**. Every suspension
+point becomes a state; the continuation object holds the resume point and
+captured locals.
+
+```kotlin
+suspend fun fetch(id: String): User {
+    val dto = api.get(id)          // suspend point 1
+    val entity = dao.upsert(dto)   // suspend point 2
+    return entity.toDomain()
+}
+```
+
+Becomes roughly:
+
+```kotlin
+fun fetch(id: String, continuation: Continuation<User>): Any? {
+    val sm = continuation as? FetchStateMachine ?: FetchStateMachine(continuation)
+    return when (sm.label) {
+        0 -> { sm.label = 1; api.get(id, sm) }                    // returns COROUTINE_SUSPENDED
+        1 -> { val dto = sm.result as Dto; sm.label = 2; dao.upsert(dto, sm) }
+        2 -> { val entity = sm.result as Entity; entity.toDomain() }
+        else -> error("impossible")
+    }
+}
+```
+
+**Implications**: captured locals are fields on the continuation. Large
+captured state means heap pressure. Avoid capturing large objects in long-
+running coroutines; pass IDs and re-fetch instead.
+
+## Debugging in production
+
+```kotlin
+// Name coroutines for readable stack traces
+viewModelScope.launch(CoroutineName("profile-load") + handler) { /* ... */ }
+
+// Install debug probes in debug builds
+if (BuildConfig.DEBUG) {
+    DebugProbes.install()
+    DebugProbes.dumpCoroutines()  // dumps all running coroutines to logcat
+}
+```
+
+On a device: `adb shell dumpsys activity processes` shows process state;
+Android Studio's **Coroutine Inspector** (profiler) visualizes live
+coroutines.
+
+## Key takeaways
+
+<Callout kind="success" title="Senior-level coroutine rules">
+- **Structured concurrency** is the default. Cancellation is cooperative and re-thrown.
+- **Dispatchers** are pools; inject them so tests can swap `TestDispatcher`.
+- **SupervisorJob** isolates sibling failure — only when that's a product requirement.
+- **flatMapLatest** for user input, **combine** for UI state, **flowOn** for upstream dispatcher.
+- **CancellationException** must propagate — never swallow in a generic catch.
+- Use `runTest + advanceTimeBy` for deterministic coroutine tests.
+</Callout>
+
+## Next
+
+Continue to **[Kotlin Advanced Patterns](./advanced-patterns)** for generics, DSLs, inline classes, and type-level programming.

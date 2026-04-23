@@ -1,0 +1,164 @@
+---
+id: social-media
+title: Project 2 — Social Media App
+sidebar_label: Social Media
+description: Real-time messaging and feed. Firestore + FCM + WebSocket + media upload. Offline-first messaging with outbox pattern.
+---
+
+import { Callout, StepList, FeatureGrid } from '@site/src/components/Doc';
+
+# Social Media App
+
+Build a real-time social app: posts, likes, comments, 1:1 chat, and push
+notifications. This project owns the **real-time + offline-first** skill
+set — outbox, WebSocket, Firestore listeners, and FCM.
+
+## The user journey
+
+```text
+Sign in (Google/Phone) → Feed → Post detail (comments)
+                             │
+                             ├─ New post (camera, upload)
+                             ├─ Inbox → Conversation (real-time messaging)
+                             └─ Profile (own & others)
+```
+
+## Features (by milestone)
+
+### M1 — Auth + skeleton
+
+- Firebase Auth: Google Sign-In + Phone OTP
+- `:feature:auth` with sealed auth states (SignedOut, OtpSent, Verifying, SignedIn)
+- Bottom nav: Feed, Search, New Post, Inbox, Profile
+- Network Security Config with cert pinning
+
+### M2 — Feed + posts
+
+- Firestore-backed feed with `snapshots().addSnapshotListener()`
+- Room caches posts for offline viewing
+- Post creation: capture/pick image → Cloud Storage upload → Firestore doc
+- Likes, comments (sub-collection), share intents
+- Paging 3 integration with Firestore cursor pagination
+
+### M3 — Real-time messaging (offline-first)
+
+```text
+User types → Room INSERT (status=SENDING, client-id=UUID)
+                ↓ enqueue
+OutboxWorker → WebSocket.send() → ack → Room UPDATE (status=SENT)
+                ↑ on failure
+                └── 4xx: FAILED  |  5xx/timeout: retry with backoff
+```
+
+- WebSocket-based chat (OkHttp) with reconnection + resume cursor
+- Outbox worker using WorkManager
+- Typing indicator (debounced Flow), read receipts
+- Message search across all conversations (Room FTS5)
+
+### M4 — Push + media
+
+- FCM with topic + direct-user notifications
+- Notification channels per category (messages, mentions, updates)
+- Deep links from notifications into specific conversations/posts
+- Image/video compression on upload (WorkManager job)
+- Video thumbnail generation; cached with Coil
+
+### M5 — Production hardening
+
+- Play Integrity on post creation (anti-spam)
+- Content moderation: ML Kit on-device image classification
+- Accessibility: TalkBack-complete conversations, custom actions for archive/delete
+- i18n: plurals, date formatting, RTL
+- Baseline profile for feed + chat
+
+### M6 — Ship
+
+- CI with sharded unit tests + instrumented tests on emulator matrix
+- Fastlane internal + closed beta + production
+- Data Safety declaration matching all Firebase SDKs
+- Privacy policy + CMP integration
+- Crash + ANR SLOs + automatic rollout halt (Module 17)
+
+## Architecture highlights
+
+### Offline-first messaging repository
+
+```kotlin
+class MessageRepository @Inject constructor(
+    private val dao: MessageDao,
+    private val outbox: OutboxDao,
+    private val socket: ChatSocket,
+    private val workManager: WorkManager
+) {
+    fun observe(conversationId: String): Flow<List<Message>> =
+        dao.observe(conversationId).map { it.map(MessageEntity::toDomain) }
+
+    suspend fun send(conversationId: String, body: String): Message {
+        val local = MessageEntity(
+            id = Uuid.random().toString(),
+            conversationId = conversationId,
+            authorId = currentUserId(),
+            body = body,
+            sentAt = now(),
+            status = MessageStatus.SENDING
+        )
+        dao.insert(local)
+        outbox.enqueue(OutboxItem.SendMessage(local.id))
+        workManager.enqueueUniqueWork(
+            "outbox",
+            ExistingWorkPolicy.KEEP,
+            OneTimeWorkRequestBuilder<OutboxWorker>()
+                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                .build()
+        )
+        return local.toDomain()
+    }
+}
+```
+
+### WebSocket lifecycle-aware
+
+```kotlin
+class ChatSessionManager @Inject constructor(
+    private val socket: ChatSocket,
+    private val processLifecycle: ProcessLifecycleOwner
+) {
+    fun start(token: String, conversationId: String) {
+        processLifecycle.lifecycle.coroutineScope.launch {
+            processLifecycle.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                socket.connect(token, conversationId)
+                try { awaitCancellation() } finally { socket.close() }
+            }
+        }
+    }
+}
+```
+
+## Stretch goals
+
+<FeatureGrid columns={2} features={[
+  { icon: '🎙️', title: 'Voice messages', description: 'Record audio, compress (Opus), upload to Cloud Storage, playback inline with waveform.' },
+  { icon: '🖼️', title: 'Stories', description: '24-hour ephemeral posts with Compose animation. Background WorkManager cleanup.' },
+  { icon: '🔔', title: 'Rich notifications', description: 'Direct reply from the notification shade (RemoteInput + Direct Reply).' },
+  { icon: '🎨', title: 'AR filters', description: 'ML Kit face detection + Compose overlay. Real-time at 30fps.' },
+  { icon: '🌐', title: 'Web viewer', description: 'Compose Multiplatform share target — same code renders posts in web version.' }
+]} />
+
+## Testing strategy
+
+- **Firestore emulator** in CI for integration tests
+- **MockWebServer** simulates WebSocket for unit tests
+- **Robolectric** for WorkManager outbox tests
+- **Compose tests** for conversation UI (typing, read receipts, scroll-to-bottom)
+- **Macrobenchmark** for feed scroll frame timing
+
+## Privacy considerations (you own this)
+
+- **E2E encryption opt-in** for chats (Signal Protocol via libsignal)
+- **Local-only data** for drafts — never sync to backend
+- **Explicit opt-in** for each analytics SDK
+- **Delete-account flow** that cascades (Firestore function + Cloud Storage purge)
+
+## Next
+
+Continue to **[Project 3 — Food Delivery](/docs/projects/food-delivery)** for Maps, live location, and foreground services.

@@ -4,10 +4,19 @@ const sidebars: SidebarsConfig = {
   curriculumSidebar: [
     'intro',
     {
+      type: 'html',
+      value: '<div class="sidebar-divider"><span>Foundations</span></div>',
+      defaultStyle: true,
+    },
+    {
       type: 'category',
       label: 'Module 01 — Kotlin Foundation',
       collapsed: true,
-      items: ['kotlin-foundation/overview'],
+      items: [
+        'kotlin-foundation/overview',
+        'kotlin-foundation/coroutines-deep-dive',
+        'kotlin-foundation/advanced-patterns',
+      ],
     },
     {
       type: 'category',
@@ -19,13 +28,26 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Module 03 — Jetpack Compose',
       collapsed: true,
-      items: ['jetpack-compose/overview'],
+      items: [
+        'jetpack-compose/overview',
+        'jetpack-compose/performance',
+        'jetpack-compose/custom-layouts-gestures',
+      ],
     },
     {
       type: 'category',
       label: 'Module 04 — Architecture & Patterns',
       collapsed: true,
-      items: ['architecture-patterns/overview'],
+      items: [
+        'architecture-patterns/overview',
+        'architecture-patterns/mvi-state-machines',
+        'architecture-patterns/offline-first',
+      ],
+    },
+    {
+      type: 'html',
+      value: '<div class="sidebar-divider"><span>Data & Services</span></div>',
+      defaultStyle: true,
     },
     {
       type: 'category',
@@ -37,7 +59,10 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Module 06 — Networking & API',
       collapsed: true,
-      items: ['networking-api/overview'],
+      items: [
+        'networking-api/overview',
+        'networking-api/graphql-websocket-grpc',
+      ],
     },
     {
       type: 'category',
@@ -52,6 +77,11 @@ const sidebars: SidebarsConfig = {
       items: ['advanced-components/overview'],
     },
     {
+      type: 'html',
+      value: '<div class="sidebar-divider"><span>Quality & Performance</span></div>',
+      defaultStyle: true,
+    },
+    {
       type: 'category',
       label: 'Module 09 — Testing & Quality',
       collapsed: true,
@@ -61,7 +91,10 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Module 10 — Performance',
       collapsed: true,
-      items: ['performance/overview'],
+      items: [
+        'performance/overview',
+        'performance/baseline-profiles',
+      ],
     },
     {
       type: 'category',
@@ -80,6 +113,71 @@ const sidebars: SidebarsConfig = {
       label: 'Module 13 — Version Control',
       collapsed: true,
       items: ['version-control/overview'],
+    },
+    {
+      type: 'html',
+      value: '<div class="sidebar-divider"><span>Enterprise Engineering</span></div>',
+      defaultStyle: true,
+    },
+    {
+      type: 'category',
+      label: 'Module 14 — Gradle & Build Systems',
+      collapsed: true,
+      items: ['gradle-build/overview'],
+    },
+    {
+      type: 'category',
+      label: 'Module 15 — Modularization at Scale',
+      collapsed: true,
+      items: ['modularization/overview'],
+    },
+    {
+      type: 'category',
+      label: 'Module 16 — Security & Compliance',
+      collapsed: true,
+      items: ['security-compliance/overview'],
+    },
+    {
+      type: 'category',
+      label: 'Module 17 — CI/CD & DevOps',
+      collapsed: true,
+      items: ['cicd-devops/overview'],
+    },
+    {
+      type: 'category',
+      label: 'Module 18 — Observability',
+      collapsed: true,
+      items: ['observability/overview'],
+    },
+    {
+      type: 'category',
+      label: 'Module 19 — Enterprise UX',
+      collapsed: true,
+      items: ['enterprise-ux/overview'],
+    },
+    {
+      type: 'category',
+      label: 'Module 20 — Career & Interview',
+      collapsed: true,
+      items: ['career-interview/overview'],
+    },
+    {
+      type: 'html',
+      value: '<div class="sidebar-divider"><span>Capstone Projects</span></div>',
+      defaultStyle: true,
+    },
+    {
+      type: 'category',
+      label: 'Capstone Projects',
+      collapsed: true,
+      items: [
+        'projects/overview',
+        'projects/ecommerce',
+        'projects/social-media',
+        'projects/food-delivery',
+        'projects/fitness-tracker',
+        'projects/news-aggregator',
+      ],
     },
     {
       type: 'html',

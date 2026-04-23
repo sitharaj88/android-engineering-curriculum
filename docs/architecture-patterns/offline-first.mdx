@@ -1,0 +1,284 @@
+---
+id: offline-first
+title: Offline-First Architecture
+sidebar_label: Offline-First
+description: Build apps that work without a network. Single source of truth, sync strategies, conflict resolution, outbox pattern, optimistic UI, and WorkManager.
+---
+
+import { Callout, ComparisonCard, StepList, Diagram, NetworkingDiagram } from '@site/src/components/Doc';
+
+# Offline-First Architecture
+
+Billion-user apps — Gmail, WhatsApp, Google Maps, Spotify, Instagram — are
+**offline-first**: the UI reads from a local database, writes go into an
+outbox, and sync happens in the background. This pattern makes the app feel
+instant, survives bad networks, and is the only correct design for emerging-
+market users.
+
+<Callout kind="tip" title="The core shift">
+In offline-first, the **network is a sync layer, not a data source**. Your
+UI reads from Room. Your writes go to Room first, then a worker pushes to
+the server. The mental model is "local is truth; server is a mirror."
+</Callout>
+
+## The canonical architecture
+
+```text
+┌───────────────────────────────────────────────────────────────────────┐
+│  UI (Compose)                                                         │
+│     observes → repository.observe()                                   │
+│     triggers → repository.enqueue(intent)                             │
+└──────────────────────────┬────────────────────────────────────────────┘
+                           │
+┌──────────────────────────▼────────────────────────────────────────────┐
+│  Repository                                                           │
+│     observe(): Flow<Entity>      ← always from Room                  │
+│     enqueue(intent): Unit        ← writes Room + queues Outbox       │
+└──────┬────────────────────────────┬───────────────────────────────────┘
+       │ reads/writes               │ enqueues
+       ▼                            ▼
+┌─────────────────┐       ┌────────────────────┐
+│  Room Database  │       │  Outbox (Room)     │
+│  (source of     │       │  + WorkManager     │
+│   truth)        │       │     worker         │
+└─────────────────┘       └──────────┬─────────┘
+                                     │ push
+                                     ▼
+                          ┌────────────────────┐
+                          │   Remote API       │
+                          └────────────────────┘
+                                     ▲
+                                     │ pull
+┌────────────────┐         ┌─────────┴──────────┐
+│  Periodic      │ ──────→ │  SyncWorker        │
+│  WorkManager   │         │  (cursor based)    │
+└────────────────┘         └────────────────────┘
+```
+
+## Single source of truth
+
+The UI observes Room. Always. Even during a network call.
+
+```kotlin
+class MessageRepository @Inject constructor(
+    private val dao: MessageDao,
+    private val api: MessageApi,
+    private val outbox: OutboxDao,
+    private val workManager: WorkManager,
+    @IoDispatcher private val io: CoroutineDispatcher
+) {
+    fun observe(conversationId: String): Flow<List<Message>> =
+        dao.observe(conversationId)
+            .map { it.map(MessageEntity::toDomain) }
+            .flowOn(io)
+
+    suspend fun send(conversationId: String, body: String) = withContext(io) {
+        val local = MessageEntity(
+            id = Uuid.random().toString(),        // client-generated
+            conversationId = conversationId,
+            body = body,
+            sentAt = System.currentTimeMillis(),
+            serverAt = null,
+            status = MessageStatus.SENDING
+        )
+        dao.insert(local)                         // UI updates immediately
+        outbox.enqueue(OutboxItem.SendMessage(local.id))
+        workManager.enqueueUniqueWork(
+            OUTBOX_WORK,
+            ExistingWorkPolicy.KEEP,
+            OneTimeWorkRequestBuilder<OutboxWorker>()
+                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 10, TimeUnit.SECONDS)
+                .build()
+        )
+    }
+}
+```
+
+Notice: **the UI sees the message in SENDING state instantly**. The repo
+does not `await` the network call. Optimistic UI, for free.
+
+## The outbox worker
+
+```kotlin
+@HiltWorker
+class OutboxWorker @AssistedInject constructor(
+    @Assisted context: Context,
+    @Assisted params: WorkerParameters,
+    private val outbox: OutboxDao,
+    private val dao: MessageDao,
+    private val api: MessageApi
+) : CoroutineWorker(context, params) {
+
+    override suspend fun doWork(): Result {
+        val pending = outbox.dequeueBatch(limit = 20)
+        for (item in pending) {
+            when (item) {
+                is OutboxItem.SendMessage -> {
+                    val msg = dao.getById(item.messageId) ?: continue
+                    try {
+                        val response = api.send(
+                            conversationId = msg.conversationId,
+                            idempotencyKey = msg.id,               // server dedupes on this
+                            body = msg.body
+                        )
+                        dao.markSent(msg.id, response.serverAt)
+                        outbox.delete(item)
+                    } catch (e: HttpException) when (e.code()) {
+                        in 400..499 -> {
+                            dao.markFailed(msg.id, e.code())
+                            outbox.delete(item)                    // no retry for 4xx
+                        }
+                        else -> throw e                            // 5xx retries
+                    }
+                }
+            }
+        }
+        return if (outbox.hasPending()) Result.retry() else Result.success()
+    }
+}
+```
+
+<Callout kind="warning" title="Idempotency is non-negotiable">
+Client-generated IDs double as **idempotency keys**. If the worker sends,
+the network times out, and we retry — the server sees the same ID and
+returns success without creating a duplicate. Without idempotency, unstable
+networks create phantom messages.
+</Callout>
+
+## Pulling — cursor-based sync
+
+For incoming updates, never poll `GET /messages`. Use a cursor:
+
+```kotlin
+@HiltWorker
+class SyncWorker @AssistedInject constructor(/* ... */) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
+        val cursor = syncCursorStore.get()
+        var page: MessagePage? = null
+        do {
+            page = api.sync(cursor = cursor, limit = 100)
+            dao.upsertAll(page.messages.map(MessageDto::toEntity))
+            syncCursorStore.set(page.nextCursor)
+        } while (page?.hasMore == true)
+        return Result.success()
+    }
+}
+```
+
+Cursor cursors to work well: **server-side monotonic event ID**. Every
+change (insert, update, delete) gets a new event. The client remembers the
+last seen event ID. Sync pulls "everything after X" — efficient and correct.
+
+## Conflict resolution
+
+Two devices edit the same record while offline. Who wins?
+
+### Last-write-wins (simplest)
+
+Server keeps the version with the highest `updatedAt`. Cheap, wrong for
+collaborative editing, right for many features.
+
+### Operational transform / CRDTs (collaborative)
+
+For text editing, use libraries like **Automerge** or **Yjs**. Each edit is
+an operation; operations commute regardless of order. Complex but the only
+right answer for Google-Docs-style collaboration.
+
+### Per-field merge (pragmatic)
+
+Most apps don't need full CRDTs. Merge per field:
+
+```kotlin
+fun merge(local: Profile, remote: Profile, base: Profile): Profile = Profile(
+    id = local.id,
+    name = if (local.name != base.name) local.name else remote.name,
+    bio = if (local.bio != base.bio) local.bio else remote.bio,
+    avatar = if (local.avatarUpdatedAt > remote.avatarUpdatedAt) local.avatar else remote.avatar
+)
+```
+
+This requires a **three-way merge** — local, remote, and the last-known-
+server version. Harder than LWW but handles 95% of realistic conflicts.
+
+## Connectivity UI
+
+Users need to know when they're offline. Expose a connectivity flow:
+
+```kotlin
+class ConnectivityObserver @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    val status: Flow<NetworkStatus> = callbackFlow {
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) { trySend(NetworkStatus.Online) }
+            override fun onLost(network: Network) { trySend(NetworkStatus.Offline) }
+        }
+        cm.registerDefaultNetworkCallback(callback)
+        trySend(if (cm.activeNetwork != null) NetworkStatus.Online else NetworkStatus.Offline)
+        awaitClose { cm.unregisterNetworkCallback(callback) }
+    }.distinctUntilChanged()
+}
+
+@Composable
+fun OfflineBanner(status: NetworkStatus) {
+    AnimatedVisibility(visible = status == NetworkStatus.Offline) {
+        Surface(color = MaterialTheme.colorScheme.tertiary) {
+            Text("You're offline — changes will sync when you reconnect", Modifier.padding(12.dp))
+        }
+    }
+}
+```
+
+## Testing offline flows
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class OfflineSendTest {
+    @Test fun `send while offline shows SENDING immediately`() = runTest {
+        val repo = MessageRepository(dao, fakeApi, outbox, workManager, testDispatcher)
+        fakeApi.offline = true
+
+        repo.send(conversationId = "c1", body = "hello")
+
+        repo.observe("c1").test {
+            val list = awaitItem()
+            assertEquals(1, list.size)
+            assertEquals(MessageStatus.SENDING, list[0].status)
+        }
+
+        fakeApi.offline = false
+        workManager.getWorkInfoByIdLiveData(outboxWorkId).observeForever { /* assert SENT */ }
+    }
+}
+```
+
+## Checklist for a truly offline-first app
+
+<StepList steps={[
+  { title: 'Room is the only source of truth', description: 'Every Compose screen calls repository.observe() which returns a Flow<T> backed by a DAO Flow. No raw API calls in the UI.' },
+  { title: 'Writes are optimistic', description: 'repository.write(...) returns instantly after Room insert + Outbox enqueue. The UI never awaits the network.' },
+  { title: 'Outbox has idempotency keys', description: 'Every write has a client-generated ID that the server uses for deduplication.' },
+  { title: 'Worker handles 4xx vs 5xx differently', description: '4xx: mark failed, drop from outbox, surface to user. 5xx / network: exponential backoff.' },
+  { title: 'Cursor-based sync', description: 'Server supports "give me everything after event X". Client remembers the cursor in DataStore.' },
+  { title: 'Connectivity is observable', description: 'NetworkCallback-based Flow exposed to the UI. Offline banner shown when disconnected.' },
+  { title: 'Conflict resolution defined', description: 'Per field: LWW for simple fields, 3-way merge for user-editable, CRDT for collaborative editors.' },
+  { title: 'Schema migrations tested', description: 'Room migrations + server compatibility both verified with instrumentation tests.' }
+]} />
+
+## Key takeaways
+
+<Callout kind="success" title="Offline-first principles">
+- **Local is truth**. Server is the mirror that eventually agrees.
+- **Writes return instantly** after Room + outbox. Networks are not in the critical path.
+- **Idempotency keys** on every write — retries are safe.
+- **Cursor-based sync** for pulls, not polling.
+- **Explicit conflict strategy** per field — LWW, merge, or CRDT.
+- **Connectivity UI** keeps users oriented when they lose signal.
+</Callout>
+
+## Next
+
+Return to **[Module 04 Overview](./overview)** or continue to
+**[Module 05 — Data & Persistence](/docs/data-persistence/overview)**.

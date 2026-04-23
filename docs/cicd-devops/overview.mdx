@@ -1,0 +1,431 @@
+---
+id: overview
+title: Module 17 — CI/CD & DevOps Automation
+sidebar_label: Overview
+description: Industrial-strength Android CI/CD. GitHub Actions pipelines, Fastlane, Play Console API, staged rollouts, release signing in HSM, flaky test handling.
+---
+
+import { Callout, ComparisonCard, StepList, FeatureGrid, LibraryGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 17 of 20</span>
+  <span><strong>Duration:</strong> 2 weeks</span>
+  <span><strong>Topics:</strong> 5 · 11 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 09, 11, 14</span>
+</div>
+
+# CI/CD & DevOps Automation
+
+Shipping an Android app without CI/CD is shipping with your eyes closed. This
+module shows you how serious teams automate everything: PR validation,
+release builds, staged rollouts, rollback, and post-release monitoring — the
+full pipeline from `git push` to "10% of users upgraded successfully."
+
+<Callout kind="tip" title="The DevOps North Star">
+Mean time from merge → production should be **under 2 hours**. Mean time to
+detect a bad release should be **under 15 minutes**. Mean time to rollback
+should be **under 5 minutes**. Every improvement below targets these three.
+</Callout>
+
+## Topic 1 · The PR pipeline
+
+Every PR should run the full quality gate before a reviewer touches it.
+
+```yaml
+# .github/workflows/pr.yml
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [main, release/*]
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest-8core
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+          develocity-token-expiry: 6
+      - name: Spotless
+        run: ./gradlew spotlessCheck
+      - name: Detekt
+        run: ./gradlew detekt
+      - name: Lint
+        run: ./gradlew lint
+      - name: Konsist architecture tests
+        run: ./gradlew :core:testing:test --tests '*ArchitectureTest'
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: reports-static, path: '**/build/reports/**' }
+
+  unit-tests:
+    runs-on: ubuntu-latest-8core
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Test shard ${{ matrix.shard }}/4
+        run: ./gradlew testDebugUnitTest -Pshard=${{ matrix.shard }} -PshardCount=4
+      - name: Kover coverage
+        if: matrix.shard == 1
+        run: ./gradlew koverXmlReport
+
+  android-tests:
+    runs-on: macos-14-large  # Apple Silicon, HVF acceleration
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+      - name: AVD cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-api34
+      - name: Run instrumentation tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: arm64-v8a
+          script: ./gradlew connectedDebugAndroidTest
+
+  assemble-preview-apk:
+    runs-on: ubuntu-latest
+    needs: [static-checks, unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew :app:assembleStagingRelease
+      - name: Upload to Firebase App Distribution
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_APP_ID }}
+          serviceCredentialsFileContent: ${{ secrets.FIREBASE_CREDS }}
+          groups: qa-team,designers
+          file: app/build/outputs/apk/staging/release/app-staging-release.apk
+```
+
+### What every quality gate should run
+
+<FeatureGrid columns={2} features={[
+  { icon: '🎨', title: 'Formatting', description: 'Spotless + ktlint — no opinions in PR review about tabs vs spaces.' },
+  { icon: '🔍', title: 'Static analysis', description: 'Detekt, Android Lint, Konsist for architectural rules.' },
+  { icon: '🧪', title: 'Unit tests', description: 'JUnit + Turbine + MockK — sharded 4× for speed.' },
+  { icon: '📱', title: 'UI/instrumentation tests', description: 'Compose tests on an emulator with AVD cache.' },
+  { icon: '🔐', title: 'Dependency checks', description: 'Dependabot/Renovate + SBOM + license audit.' },
+  { icon: '📊', title: 'Preview artifact', description: 'Upload signed staging APK to App Distribution for QA.' }
+]} />
+
+---
+
+## Topic 2 · Fastlane for Android
+
+Fastlane automates the tedious parts of release: metadata upload, screenshot
+publishing, Play track promotion, build signing:
+
+```ruby
+# fastlane/Fastfile
+default_platform(:android)
+
+platform :android do
+
+  desc "Run all tests on CI"
+  lane :test do
+    gradle(task: "testDebugUnitTest detekt lint")
+  end
+
+  desc "Build and upload to Play internal track"
+  lane :internal do
+    gradle(
+      task: "bundle",
+      build_type: "Release",
+      properties: {
+        "android.injected.signing.store.file"     => ENV["KEYSTORE_FILE"],
+        "android.injected.signing.store.password" => ENV["KEYSTORE_PASSWORD"],
+        "android.injected.signing.key.alias"      => ENV["KEY_ALIAS"],
+        "android.injected.signing.key.password"   => ENV["KEY_PASSWORD"]
+      }
+    )
+    upload_to_play_store(
+      track: "internal",
+      aab: "app/build/outputs/bundle/release/app-release.aab",
+      release_status: "completed",
+      skip_upload_metadata: false,
+      skip_upload_changelogs: false
+    )
+  end
+
+  desc "Promote internal -> alpha -> beta -> production at 5%"
+  lane :promote_to_production do |options|
+    upload_to_play_store(
+      track: options[:from] || "beta",
+      track_promote_to: "production",
+      rollout: options[:rollout] || "0.05"
+    )
+  end
+
+  desc "Halt production rollout (emergency)"
+  lane :halt do
+    upload_to_play_store(
+      track: "production",
+      rollout: "0.0",
+      skip_upload_aab: true
+    )
+  end
+
+  error do |lane, exception|
+    slack(
+      message: "Fastlane lane `#{lane}` failed: #{exception.message}",
+      slack_url: ENV["SLACK_WEBHOOK"],
+      success: false
+    )
+  end
+end
+```
+
+```yaml
+# .github/workflows/release.yml
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production   # requires manual approval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with: { bundler-cache: true }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Decode keystore
+        env: { KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }} }
+        run: echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
+      - name: Bundle + upload
+        env:
+          KEYSTORE_FILE: ${{ github.workspace }}/release.keystore
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          SUPPLY_JSON_KEY: ${{ secrets.PLAY_JSON_KEY }}
+        run: bundle exec fastlane internal
+```
+
+---
+
+## Topic 3 · Release signing done safely
+
+### Play App Signing (mandatory since 2021)
+
+You hold an **upload key** locally; Google holds the **app-signing key** in
+their HSM. If your upload key is compromised, Google revokes it and issues a
+new one — no rebuild disaster.
+
+<Callout kind="danger" title="Never commit keystores">
+Store `release.keystore` as a base64-encoded secret (`KEYSTORE_BASE64`) in
+GitHub Actions Secrets, GCP Secret Manager, or HashiCorp Vault. Decode in
+the runner, use it, delete it. `.gitignore` is not security.
+</Callout>
+
+### HSM-backed signing for high-security apps
+
+For banking, health, and government apps, Play supports **Cloud KMS /
+hardware-backed signing**:
+
+```ruby
+# Fastfile — no keystore on disk; HSM holds the key
+upload_to_play_store(
+  package_name: "com.example.bank",
+  aab: "app.aab",
+  track: "internal",
+  json_key_data: ENV["PLAY_JSON_KEY"]
+  # Signing happens in Play's HSM after upload; the key never leaves
+)
+```
+
+---
+
+## Topic 4 · Staged rollouts & release discipline
+
+Ship to production at **1% → 5% → 10% → 25% → 50% → 100%** with bake time at
+each step. This is **not** bureaucracy; it is how you catch a crash spike
+before it hits a million users.
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│  Internal (QA, 24 h)   →  Alpha (100 testers, 24 h)             │
+│                    ↓                                             │
+│         Closed beta (1k-10k users, 3 days)                       │
+│                    ↓                                             │
+│   Open beta (50k+ users, 1 week) — real-world signal             │
+│                    ↓                                             │
+│   Production 1% (24 h) — automated halt if crash-free < 99.5%    │
+│                    ↓                                             │
+│   Production 5% → 10% → 25% → 50% → 100%, 24 h between steps    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Automated halt on crash-rate regression
+
+```yaml
+# .github/workflows/rollout-watchdog.yml
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes during rollout
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Query Crashlytics
+        id: crashlytics
+        run: |
+          RATE=$(curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://firebase.googleapis.com/...crashFreePercentile" | jq .p50)
+          echo "rate=$RATE" >> $GITHUB_OUTPUT
+      - name: Halt if crash-free < 99.5%
+        if: ${{ fromJSON(steps.crashlytics.outputs.rate) < 99.5 }}
+        env:
+          PLAY_JSON_KEY: ${{ secrets.PLAY_JSON_KEY }}
+        run: |
+          bundle exec fastlane halt
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"🚨 Rollout halted — crash-free dropped to '"${{ steps.crashlytics.outputs.rate }}"'%"}' \
+            ${{ secrets.SLACK_WEBHOOK }}
+```
+
+### Feature flags alongside releases
+
+Every risky change ships behind a **Firebase Remote Config** or
+**LaunchDarkly / Split.io** flag. If the rollout shows trouble, you disable
+the feature without shipping a new binary:
+
+```kotlin
+@Singleton
+class FeatureFlags @Inject constructor(
+    private val remoteConfig: FirebaseRemoteConfig
+) {
+    val newCheckoutEnabled: Boolean
+        get() = remoteConfig.getBoolean("new_checkout_enabled")
+
+    suspend fun refresh() = remoteConfig.fetchAndActivate().await()
+}
+
+// Usage in composable
+@Composable
+fun CheckoutEntry(viewModel: CheckoutViewModel = hiltViewModel()) {
+    if (viewModel.flags.newCheckoutEnabled) NewCheckoutScreen() else LegacyCheckoutScreen()
+}
+```
+
+<Callout kind="tip" title="Two kinds of flags — don't mix">
+- **Release flags** — protect a risky feature during rollout. Short-lived
+  (weeks). Delete code + flag after full rollout.
+- **Ops/permission flags** — long-lived toggles for enterprise customers or
+  A/B tests. Expected to persist.
+
+Mixing them produces permanent tech debt — a codebase of dead branches.
+</Callout>
+
+---
+
+## Topic 5 · Flaky test management
+
+Flaky tests erode trust in CI. Within three weeks of unaddressed flakes,
+developers start retrying pipelines instead of fixing bugs.
+
+### Detection
+
+```kotlin
+// Use Develocity / Gradle Enterprise for flaky test detection:
+// https://docs.gradle.com/enterprise/test-distribution/
+
+// Or the JUnit 5 RetryingExtension for local/CI retry + quarantine:
+@ExtendWith(RetryingTestExtension::class)
+@Retry(maxAttempts = 3, reportFlakes = true)
+class CartViewModelTest { /* ... */ }
+```
+
+### Quarantine workflow
+
+1. CI detects a test that fails 1+ time out of N in a sliding window.
+2. Auto-tag the test `@Tag("flaky")` and open a GitHub issue.
+3. Daily scheduled job runs only quarantined tests, reports results to owners.
+4. After 7 days in quarantine, a test is deleted if no one fixes it — flakiness must not be permanent.
+
+```kotlin
+@Tag("flaky")
+@Test
+fun `cart refresh sometimes fails on slow CI`() { /* ... */ }
+```
+
+```yaml
+- name: Run stable tests only
+  run: ./gradlew test --exclude-tag=flaky
+
+- name: Flaky test report (nightly)
+  if: github.event.schedule
+  run: ./gradlew test --include-tag=flaky
+```
+
+---
+
+## Companion tools
+
+<LibraryGrid libraries={[
+  { name: 'Fastlane', tagline: 'Release automation', description: 'Industry-standard Ruby-based automation. Lanes for test, build, sign, upload, promote, halt, screenshot generation.', url: 'https://fastlane.tools' },
+  { name: 'Gradle Develocity', tagline: 'Build + test observability', description: 'Remote build cache, flaky test detection, test distribution. Paid tier but transformative for teams > 30.', url: 'https://gradle.com/develocity' },
+  { name: 'GitHub Actions', tagline: 'CI/CD as code', description: 'Free for public repos, generous for private. Matrix builds, sharding, environments for manual approval.', url: 'https://github.com/features/actions' },
+  { name: 'Firebase App Distribution', tagline: 'Internal beta', description: 'Upload APKs/AABs; testers install via email invite. Free tier covers most teams.', url: 'https://firebase.google.com/docs/app-distribution' },
+  { name: 'Play Console API', tagline: 'Programmatic publishing', description: 'Upload, promote, halt releases without touching the UI. Backbone of Fastlane supply plugin.', url: 'https://developers.google.com/android-publisher' }
+]} />
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Enterprise release discipline">
+- Every PR: **lint + detekt + spotless + unit tests + instrumentation + preview APK**.
+- Sharded tests on multiple runners — wall clock beats total CPU time.
+- **Fastlane** for release automation; **Play App Signing** for key safety.
+- **Staged rollout** with automated halt on crash-rate regression.
+- **Feature flags** decouple deployment from release; **delete flags** after rollout.
+- **Flaky test quarantine + deletion** — zero tolerance for long-term flakes.
+- Mean time to detect a bad release: **< 15 min**. Mean time to rollback: **< 5 min**.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Set up the PR workflow', description: 'Create .github/workflows/pr.yml with jobs for spotless, detekt, lint, unit tests (sharded), and upload reports as artifacts.' },
+  { title: 'Fastlane internal lane', description: 'Write a Fastlane internal lane that builds a signed AAB and uploads to the Play internal track. Use GitHub Secrets for the keystore.' },
+  { title: 'Feature flag migration', description: 'Wrap a risky feature in a Firebase Remote Config flag. Verify you can toggle it remotely without rebuilding.' },
+  { title: 'Rollout watchdog', description: 'Write a scheduled GitHub Action that queries Crashlytics and halts the rollout when crash-free rate drops below 99.5%.' }
+]} />
+
+## Next module
+
+Continue to **[Module 18 — Observability & Monitoring](/docs/observability/overview)** to see what your app is doing in the wild — crashes, performance, user journeys, business KPIs.

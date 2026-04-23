@@ -1,0 +1,155 @@
+---
+id: ecommerce
+title: Project 1 — E-Commerce App
+sidebar_label: E-Commerce
+description: Production-grade shopping app — catalog, cart, checkout, payments. Compose + Hilt + Room + Retrofit + MVI for the checkout flow.
+---
+
+import { Callout, StepList, FeatureGrid } from '@site/src/components/Doc';
+
+# E-Commerce App
+
+Build a complete shopping experience: browse products, add to cart, check
+out, pay, and track orders. This is the canonical project for reinforcing
+Compose, clean architecture, Hilt, Room, Retrofit, and MVI state machines.
+
+## The user journey
+
+```text
+Splash → Home (featured) → Category → Product detail → Add to cart
+                                                             │
+                                                             ▼
+   Orders ← Confirmation ← Payment ← Checkout ← Cart ◄──────┘
+```
+
+## Features (by milestone)
+
+### M1 — Skeleton (Week 1)
+
+- Convention plugins (`myapp.android.application`, `myapp.android.feature`, `myapp.android.compose`)
+- Material 3 theme + design tokens in `:core:design`
+- Bottom navigation: Home, Categories, Cart, Orders, Profile
+- Feature modules: `:feature:home`, `:feature:catalog`, `:feature:product`, `:feature:cart`, `:feature:checkout`, `:feature:orders`
+- Empty state + loading + error composables in `:core:ui`
+
+### M2 — Data layer (Week 2)
+
+- Retrofit with auth interceptor + token refresh
+- Room schema for `Product`, `Category`, `CartItem`, `Order`, `Address`
+- Repository interfaces in `:core:domain`, implementations in `:core:data`
+- `Dispatchers` injected; `Result<T>` wrapper in `:core:common`
+- Fake API with product fixtures for dev flavor
+
+### M3 — Primary flows (Week 3)
+
+- Home: featured carousel + categories grid
+- Catalog: paged product list with Paging 3
+- Product detail: gallery, specs, reviews, add-to-cart
+- Cart: quantity adjustments, remove, subtotal, move-to-wishlist
+
+### M4 — Checkout state machine (Week 4)
+
+```kotlin
+sealed interface CheckoutState {
+    data object Initial : CheckoutState
+    data class SelectAddress(val addresses: List<Address>, val selected: Address?) : CheckoutState
+    data class SelectPayment(val address: Address, val methods: List<PaymentMethod>, val selected: PaymentMethod?) : CheckoutState
+    data class Review(val address: Address, val payment: PaymentMethod, val cart: Cart) : CheckoutState
+    data class Submitting(val snapshot: Review) : CheckoutState
+    data class Failed(val snapshot: Review, val error: PaymentError) : CheckoutState
+    data class Confirmed(val orderId: OrderId) : CheckoutState
+}
+```
+
+Wire MVI from Module 04 — intents: `SelectAddress`, `SelectPayment`,
+`Submit`, `Retry`. Cover all transitions with reducer tests.
+
+### M5 — Production hardening (Week 5)
+
+- Crashlytics with `user.id`, `last.screen`, `checkout.state` custom keys
+- Baseline profile generator (Module 10) for home + product + checkout
+- R8 tuned; Moshi rules; Retrofit interface rules
+- Accessibility: TalkBack-complete flow from home to confirmation
+- RTL: everything uses `start/end` padding; icons auto-mirrored
+- Instrumentation tests for checkout happy path + retry
+
+### M6 — Ship (Week 6)
+
+- GitHub Actions: PR validation + release pipeline (Module 17)
+- Fastlane: internal + alpha + beta + production lanes
+- Play Console: data safety declared, screenshots uploaded
+- SBOM + license audit committed
+- README with architecture diagram, screenshots, build badge
+
+## Architecture diagram
+
+```text
+┌─────────────────────────────────────────────────────────────────────┐
+│  :app                                                               │
+│    MyApp, Hilt graph, NavHost, AppTheme                             │
+├─────────────────────────────────────────────────────────────────────┤
+│  :feature:home  :feature:catalog  :feature:product  :feature:cart   │
+│  :feature:checkout (MVI)  :feature:orders  :feature:profile         │
+├─────────────────────────────────────────────────────────────────────┤
+│  :core:ui · :core:design · :core:domain · :core:data                │
+│  :core:network · :core:database · :core:datastore · :core:common    │
+│  :core:analytics · :core:testing                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│  Retrofit + OkHttp + Auth interceptor + Certificate pinning        │
+│  Room DB (source of truth for cart, offline products)              │
+│  DataStore Proto (user prefs, auth token, recent searches)         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Stretch goals (optional)
+
+<FeatureGrid columns={2} features={[
+  { icon: '🔐', title: 'Biometric checkout', description: 'Require BiometricPrompt for orders over a threshold. Key stored in Keystore.' },
+  { icon: '🏷️', title: 'Promo codes + flags', description: 'Firebase Remote Config flag gates promo UI. A/B test two checkout layouts.' },
+  { icon: '📱', title: 'Tablet two-pane', description: 'Responsive: on Expanded window class, show catalog + detail side by side.' },
+  { icon: '🌍', title: 'RTL + i18n', description: 'Translate to Arabic, Spanish, Hindi. Use pseudo-localization to catch bugs early.' },
+  { icon: '🖼️', title: 'Shared element transitions', description: 'Product card → product detail with Compose 1.7 SharedTransitionLayout.' },
+  { icon: '📊', title: 'Funnel analytics', description: 'Log home_view → product_view → add_to_cart → checkout_start → confirmed.' }
+]} />
+
+## Testing strategy
+
+<StepList steps={[
+  { title: 'Unit', description: 'Every ViewModel, every use case, every mapper. MockK for repo interfaces. Turbine for StateFlow assertions.' },
+  { title: 'Compose UI', description: 'Screenshot tests with Paparazzi for every screen in light/dark/RTL/2x font variants. Node assertions for interactive flows.' },
+  { title: 'Integration', description: 'Room DAO tests with in-memory DB. Retrofit with MockWebServer. Hilt test rules to wire fakes.' },
+  { title: 'End-to-end', description: 'Espresso + Compose test for full checkout happy path + retry-on-payment-decline. Run on AVD in CI.' },
+  { title: 'Macrobenchmark', description: 'Cold start, home scroll frame timing, checkout completion time — all recorded as baseline.' }
+]} />
+
+## Dependencies to learn / demonstrate
+
+- Compose + Navigation Compose + Navigation type-safe routes (Module 03)
+- Hilt for DI (Module 04)
+- Room for offline-first products + cart (Module 05)
+- Retrofit + Moshi + auth interceptor + cert pinning (Module 06, 16)
+- Paging 3 for catalog (Module 06)
+- Coil for images (Module 06)
+- DataStore Proto for user prefs (Module 05)
+- Firebase Crashlytics + Performance + Remote Config (Module 07, 18)
+- Convention plugins + version catalog (Module 14)
+- Baseline profile + Macrobenchmark (Module 10)
+- Fastlane + GitHub Actions (Module 17)
+- Paparazzi for visual regression (Module 09, 19)
+
+## Review rubric
+
+When you submit this project for portfolio review, you'll be graded on:
+
+| Area                          | Excellent (5)                                       | Pass (3)                                    |
+|-------------------------------|-----------------------------------------------------|---------------------------------------------|
+| Architecture                  | Clean 3-layer with typed errors, MVI for checkout   | MVVM throughout, some logic in composables  |
+| Testing                       | ≥ 80% domain coverage, Compose UI tests             | 50% coverage, some UI tests                 |
+| Performance                   | Baseline profile + P95 cold start < 1.5s           | No baseline profile, P95 < 2.5s             |
+| Accessibility                 | TalkBack-complete, WCAG AA contrast                | Labels present, some gaps                   |
+| Production readiness          | Crashlytics, Fastlane, staged rollout, SBOM        | Crashlytics only                            |
+| Code quality                  | Detekt clean, ktlint clean, Konsist passes         | Minor lint issues                           |
+
+## Next
+
+Once M6 is live, update your **[Career portfolio](/docs/career-interview/overview)** README, then start Project 2: **[Social Media App](/docs/projects/social-media)**.

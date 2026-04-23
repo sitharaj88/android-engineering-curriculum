@@ -1,0 +1,484 @@
+---
+id: overview
+title: Module 16 — Security & Compliance
+sidebar_label: Overview
+description: Harden Android apps for production. OWASP MASVS, certificate pinning, Play Integrity API, secure storage, reverse engineering defense, GDPR/CCPA compliance.
+---
+
+import { Callout, ComparisonCard, StepList, FeatureGrid, Diagram, AuthFlowDiagram } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 16 of 20</span>
+  <span><strong>Duration:</strong> 2 weeks</span>
+  <span><strong>Topics:</strong> 5 · 12 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 05–07</span>
+</div>
+
+# Security & Compliance
+
+Your app is a binary. Attackers have the binary. They will decompile it, read
+your strings, intercept your network traffic, and try to modify your
+`isPremium` flag. This module teaches you to build apps that **fail safely**,
+survive **active attack**, and meet the **legal bar** regulators now enforce.
+
+<Callout kind="danger" title="The threat model">
+Assume: (1) every string in your APK is public, (2) every network request can
+be intercepted, (3) the device may be rooted and instrumented with Frida, (4)
+your user has not read your privacy policy. Design accordingly.
+</Callout>
+
+## Topic 1 · The OWASP MASVS framework
+
+The **Mobile Application Security Verification Standard** is the global
+baseline for mobile security. Every enterprise Android app should hit **MASVS
+L1** at minimum, with financial and health apps hitting **L2 + R** (resilience).
+
+| Control family              | What it covers                                               |
+|-----------------------------|--------------------------------------------------------------|
+| **MASVS-STORAGE**           | Sensitive data in local storage                              |
+| **MASVS-CRYPTO**            | Cryptographic primitives and key management                  |
+| **MASVS-AUTH**              | Authentication and session handling                          |
+| **MASVS-NETWORK**           | Transport security, TLS, certificate pinning                 |
+| **MASVS-PLATFORM**          | Use of platform APIs (IPC, WebView, deep links)              |
+| **MASVS-CODE**              | Build, dependency, and supply-chain security                 |
+| **MASVS-RESILIENCE**        | Anti-tampering, anti-debug, anti-reverse-engineering         |
+| **MASVS-PRIVACY**           | Data minimization, transparency, user control                |
+
+Map every security feature you ship to a MASVS control. When an auditor asks
+"how do you prevent X?", you point at the control and your implementation.
+
+---
+
+## Topic 2 · Secure storage & cryptography
+
+### Never hardcode secrets
+
+```kotlin
+// ❌ WRONG — strings in your APK are publicly readable
+private const val API_KEY = "sk_live_abc123xyz"
+
+// ✅ RIGHT — fetch from backend after user authenticates,
+//   or use Firebase App Check + backend-issued tokens
+class ApiKeyProvider @Inject constructor(private val backend: ConfigApi) {
+    suspend fun get(): String = backend.issueApiToken().value
+}
+```
+
+### EncryptedSharedPreferences & DataStore with Tink
+
+For small sensitive blobs (tokens, PINs, biometric hash references), use
+**EncryptedSharedPreferences** (or encrypted DataStore via Google Tink):
+
+```kotlin
+val masterKey = MasterKey.Builder(context)
+    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+    .setUserAuthenticationRequired(false)  // true to require biometric before read
+    .build()
+
+val prefs = EncryptedSharedPreferences.create(
+    context,
+    "secure_prefs",
+    masterKey,
+    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+)
+
+prefs.edit().putString("refresh_token", token).apply()
+```
+
+The key lives in the **Android Keystore** — backed by the TEE (Trusted
+Execution Environment) or a dedicated StrongBox secure element on supported
+devices. An attacker who dumps the encrypted file cannot decrypt it without
+the device.
+
+### The Android Keystore directly
+
+For high-value operations (payment authorization, encryption of a local
+database), use Keystore directly with hardware backing:
+
+```kotlin
+class KeystoreCrypto {
+
+    companion object {
+        private const val KEY_ALIAS = "payment_auth_key"
+        private const val TRANSFORMATION = "AES/GCM/NoPadding"
+    }
+
+    private val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+
+    fun createKey() {
+        val spec = KeyGenParameterSpec.Builder(
+            KEY_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        )
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setUserAuthenticationRequired(true)                // require biometric
+            .setUserAuthenticationParameters(30, KeyProperties.AUTH_BIOMETRIC_STRONG)
+            .setInvalidatedByBiometricEnrollment(true)          // invalidate on new fingerprint enrolled
+            .setIsStrongBoxBacked(true)                         // TEE/StrongBox if available
+            .build()
+
+        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        generator.init(spec)
+        generator.generateKey()
+    }
+
+    fun encrypt(data: ByteArray): EncryptedPayload {
+        val key = keyStore.getKey(KEY_ALIAS, null) as SecretKey
+        val cipher = Cipher.getInstance(TRANSFORMATION).apply { init(Cipher.ENCRYPT_MODE, key) }
+        val ciphertext = cipher.doFinal(data)
+        return EncryptedPayload(ciphertext = ciphertext, iv = cipher.iv)
+    }
+}
+```
+
+<Callout kind="warning" title="What Keystore doesn't protect">
+Keystore protects the **key material**, not the **plaintext after you decrypt
+it**. Minimize the time plaintext sits in RAM. Never log decrypted PII. Clear
+`CharArray` passwords by zero-filling after use; `String` is immutable and
+leaves copies in the heap.
+</Callout>
+
+---
+
+## Topic 3 · Network security
+
+### HTTPS only + Network Security Config
+
+`android:usesCleartextTraffic="false"` is non-negotiable for production. Use
+**Network Security Config** to codify the policy and lock down debug builds:
+
+```xml
+<!-- res/xml/network_security_config.xml -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system"/>
+        </trust-anchors>
+    </base-config>
+
+    <domain-config>
+        <domain includeSubdomains="true">api.example.com</domain>
+        <pin-set expiration="2026-12-31">
+            <pin digest="SHA-256">AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</pin>
+            <pin digest="SHA-256">BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=</pin>  <!-- backup pin -->
+        </pin-set>
+    </domain-config>
+
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="user"/>  <!-- Charles/Proxyman only in debug -->
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>
+```
+
+### Certificate pinning with OkHttp
+
+```kotlin
+val certificatePinner = CertificatePinner.Builder()
+    .add("api.example.com", "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+    .add("api.example.com", "sha256/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")  // backup
+    .build()
+
+val client = OkHttpClient.Builder()
+    .certificatePinner(certificatePinner)
+    .addInterceptor(AuthInterceptor())
+    .connectTimeout(10.seconds.toJavaDuration())
+    .readTimeout(30.seconds.toJavaDuration())
+    .build()
+```
+
+<Callout kind="warning" title="Pinning operations">
+Always pin at least TWO certificates: the current one and a backup. If the
+active cert is compromised or expires early, the backup keeps users on a
+working binary while you ship an update. **Rotate pins 90 days before expiry**
+and test against real devices — a bad pin bricks your app.
+</Callout>
+
+### mTLS and token-bound sessions
+
+For enterprise APIs, upgrade to mutual TLS. Client certificate ⇒ Android
+Keystore key ⇒ Retrofit:
+
+```kotlin
+val keyManagerFactory = KeyManagerFactory.getInstance("X509").apply {
+    init(keyStore, charArrayOf())
+}
+val sslContext = SSLContext.getInstance("TLSv1.3").apply {
+    init(keyManagerFactory.keyManagers, trustManager, SecureRandom())
+}
+
+OkHttpClient.Builder()
+    .sslSocketFactory(sslContext.socketFactory, trustManager)
+    .build()
+```
+
+---
+
+## Topic 4 · Play Integrity API
+
+Play Integrity replaced SafetyNet in 2024. It verifies:
+
+- **Device integrity** — is this a real Android device (not emulator, not rooted)?
+- **App integrity** — was the APK served by Google Play and not tampered?
+- **Account integrity** — is the calling Google account licensed to this app?
+
+<Diagram title="Play Integrity flow" caption="The token is verified by your backend, not the client — never trust the client.">
+  <AuthFlowDiagram />
+</Diagram>
+
+```kotlin
+class IntegrityChecker @Inject constructor(
+    @ApplicationContext context: Context,
+    private val backend: IntegrityApi
+) {
+
+    private val standardIntegrityManager = IntegrityManagerFactory.createStandard(context)
+    private var tokenProvider: StandardIntegrityTokenProvider? = null
+
+    suspend fun warm() {
+        val req = PrepareIntegrityTokenRequest.builder()
+            .setCloudProjectNumber(CLOUD_PROJECT_NUMBER)
+            .build()
+        tokenProvider = standardIntegrityManager.prepareIntegrityToken(req).await()
+    }
+
+    suspend fun protectedCall(nonce: String): Result<Receipt> = runCatching {
+        val provider = requireNotNull(tokenProvider) { "call warm() first" }
+        val tokenReq = StandardIntegrityTokenRequest.builder()
+            .setRequestHash(nonce)
+            .build()
+        val token: String = provider.request(tokenReq).await().token()
+
+        // Token is validated on your BACKEND via Google's verification API.
+        // Never call decodeIntegrityToken() on the client.
+        backend.completePurchase(nonce = nonce, integrityToken = token)
+    }
+}
+```
+
+**Cost-aware pattern**: Play Integrity charges per request. Use the classic
+API only for high-value actions (payment, account creation, account takeover
+response). For routine API calls, rely on authenticated sessions + rate
+limiting on the backend.
+
+---
+
+## Topic 5 · Anti-tampering & obfuscation
+
+### R8 + ProGuard rules
+
+R8 is the official shrinker and obfuscator (replaces ProGuard). Enable in
+release builds:
+
+```kotlin
+android {
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+}
+```
+
+Typical rules that keep the build working without leaking structure:
+
+```proguard
+# Keep model classes used with Moshi/Gson reflection
+-keep @com.squareup.moshi.JsonClass class * { *; }
+-keep class * implements com.squareup.moshi.JsonAdapter { *; }
+
+# Hilt / Dagger
+-keep,includedescriptorclasses class * extends dagger.hilt.android.internal.managers.ApplicationComponentManager { *; }
+
+# Retrofit
+-keepattributes Signature, InnerClasses, EnclosingMethod
+-keepclassmembers,allowshrinking,allowobfuscation interface * {
+    @retrofit2.http.* <methods>;
+}
+
+# Coroutines
+-keepclassmembers class kotlinx.coroutines.** { volatile <fields>; }
+
+# Keep crash reporting class/method names readable
+-keepattributes SourceFile, LineNumberTable
+-renamesourcefileattribute SourceFile
+```
+
+### Detect tampering at runtime
+
+```kotlin
+class TamperDetector @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+
+    fun isTampered(): Boolean = listOfNotNull(
+        signatureMismatch(),
+        installerNotPlay(),
+        debuggerAttached(),
+        emulatorSignals()
+    ).isNotEmpty()
+
+    private fun signatureMismatch(): String? {
+        val sig = context.packageManager
+            .getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+            .signingInfo
+            ?.apkContentsSigners
+            ?.firstOrNull()
+            ?.toByteArray()
+            ?.let { MessageDigest.getInstance("SHA-256").digest(it).toHex() }
+        return if (sig != EXPECTED_SIGNATURE_SHA256) "signature" else null
+    }
+
+    private fun installerNotPlay(): String? {
+        val installer = context.packageManager.getInstallSourceInfo(context.packageName).installingPackageName
+        return if (installer != "com.android.vending") "installer:$installer" else null
+    }
+
+    private fun debuggerAttached(): String? =
+        if (Debug.isDebuggerConnected() || (ApplicationInfo.FLAG_DEBUGGABLE and context.applicationInfo.flags) != 0) "debug" else null
+}
+```
+
+Don't crash on detection. Log the signal, degrade the feature (block payments
+for example), and notify your backend. Crashing makes life easy for researchers
+probing your defenses.
+
+---
+
+## Topic 6 · Privacy & compliance
+
+### Play Data Safety declaration
+
+Every app published to Google Play must declare, for each data type:
+
+- Collected / shared / neither
+- Purpose (functionality, analytics, personalization, advertising)
+- Encrypted in transit (yes/no)
+- User can request deletion (yes/no)
+
+Keep a **data inventory** alongside your code. Every new SDK you integrate
+must go through a review: what does it send, where, for what purpose?
+
+```kotlin
+// Example: data inventory file checked into the repo
+// privacy/data-inventory.yml
+collected:
+  - type: email
+    purpose: authentication
+    shared_with: []
+    encrypted_in_transit: true
+    user_deletable: true
+  - type: device_id
+    purpose: crash_diagnostics
+    shared_with: [firebase_crashlytics]
+    encrypted_in_transit: true
+    user_deletable: false
+  - type: precise_location
+    purpose: delivery_tracking
+    shared_with: [google_maps]
+    encrypted_in_transit: true
+    user_deletable: true
+    user_revocable: true
+```
+
+### GDPR & CCPA essentials
+
+| Regulation | Key requirements for Android apps                                          |
+|------------|----------------------------------------------------------------------------|
+| **GDPR**   | Lawful basis, consent for non-essential cookies/SDKs, right to access/delete, data portability, DPA with processors |
+| **CCPA**   | "Do Not Sell My Personal Information" link, opt-out for 3rd-party sharing, deletion requests honored in 45 days |
+| **COPPA**  | If targeting < 13: no behavioral ads, parental consent, minimal data |
+| **HIPAA**  | Health data encryption at rest + in transit, BAA with every vendor, audit logs |
+
+### Consent Management Platform (CMP)
+
+For ads and analytics, integrate a **Google-certified CMP** (IAB TCF 2.2):
+
+```kotlin
+class ConsentManager @Inject constructor(
+    private val consentInformation: ConsentInformation
+) {
+    fun requestConsent(activity: Activity, onReady: () -> Unit) {
+        val params = ConsentRequestParameters.Builder()
+            .setConsentDebugSettings(
+                if (BuildConfig.DEBUG) ConsentDebugSettings.Builder(activity)
+                    .setDebugGeography(DebugGeography.DEBUG_GEOGRAPHY_EEA)
+                    .addTestDeviceHashedId("TEST-DEVICE")
+                    .build()
+                else null
+            )
+            .build()
+
+        consentInformation.requestConsentInfoUpdate(activity, params,
+            { UserMessagingPlatform.loadAndShowConsentFormIfRequired(activity) { onReady() } },
+            { error -> Log.e("Consent", error.message); onReady() }
+        )
+    }
+}
+```
+
+---
+
+## Supply chain security
+
+Every dependency is a trust decision. Apply:
+
+- **Dependabot/Renovate** — automated patch updates
+- **OSS Review Toolkit or Gradle Verify Dependencies** — hash verification
+- **Vendored build-logic** — don't pull Gradle plugins from unaudited repos
+- **Signed releases** — upload-key in Play App Signing, not a local `.keystore` in git
+- **Software Bill of Materials (SBOM)** — `./gradlew :app:cycloneDxBom` for audit trails
+
+```kotlin
+// gradle/verification-metadata.xml — hashes of every dependency
+<dependency-verification>
+  <verify-metadata>true</verify-metadata>
+  <verify-signatures>false</verify-signatures>
+  <components>
+    <component group="com.squareup.retrofit2" name="retrofit" version="2.11.0">
+      <artifact name="retrofit-2.11.0.jar">
+        <sha256 value="abc..." origin="verified"/>
+      </artifact>
+    </component>
+  </components>
+</dependency-verification>
+```
+
+If a transitive dependency changes hash, the build fails — preventing supply
+chain attacks like the `event-stream` npm incident.
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Security engineering mindset">
+- Map every control to **OWASP MASVS** — it's the auditor's checklist.
+- Store secrets in **Keystore**, not in `strings.xml` or `BuildConfig`.
+- **Certificate pinning** with a backup pin + expiration reminder.
+- **Play Integrity** on high-value flows, verified server-side.
+- **R8 minification + runtime tamper checks** — detect, degrade, don't crash.
+- **Data inventory + CMP** — compliance is a product feature, not a legal afterthought.
+- **SBOM + dependency verification** — supply chain is a threat vector.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Network security config', description: 'Add res/xml/network_security_config.xml that disables cleartext, pins your API domain, and allows user certs only in debug.' },
+  { title: 'EncryptedSharedPreferences', description: 'Replace SharedPreferences for refresh_token storage with EncryptedSharedPreferences. Verify the file on disk is unreadable.' },
+  { title: 'R8 rules audit', description: 'Build a release APK with -Pandroid.enableR8.fullMode=true and fix any crashes. Keep SourceFile/LineNumberTable for crash reports.' },
+  { title: 'Play Integrity integration', description: 'Add a /purchase endpoint that requires a Play Integrity token and a nonce. Verify the token server-side using Google\'s public API.' },
+  { title: 'Data inventory', description: 'Document every data type your app collects in a YAML file in the repo. Map each to a Play Data Safety category.' }
+]} />
+
+## Next module
+
+Continue to **[Module 17 — CI/CD & DevOps Automation](/docs/cicd-devops/overview)** to automate your builds, tests, release signing, and staged Play rollouts.

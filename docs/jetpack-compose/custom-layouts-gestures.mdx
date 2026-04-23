@@ -1,0 +1,330 @@
+---
+id: custom-layouts-gestures
+title: Custom Layouts & Gestures
+sidebar_label: Custom Layouts & Gestures
+description: Build bespoke layouts with the Layout composable, draw custom graphics with Canvas, handle multi-touch gestures, and master pointer input.
+---
+
+import { Callout, StepList, Diagram, ComponentLifecycleDiagram } from '@site/src/components/Doc';
+
+# Custom Layouts & Gestures
+
+Most screens are `Row`, `Column`, and `LazyColumn`. But the best-feeling apps
+have one or two moments of bespoke craft: a stacked card deck, a circular
+progress ring, a pinch-to-zoom image viewer. This chapter teaches you to
+build them.
+
+## The Layout composable
+
+Compose ships a low-level `Layout { }` composable that gives you the
+measuring and positioning hooks. Every higher-level layout (`Row`, `Column`,
+`Box`) is built on it.
+
+```kotlin
+@Composable
+fun VerticalGrid(
+    columns: Int,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit
+) {
+    Layout(
+        content = content,
+        modifier = modifier
+    ) { measurables, constraints ->
+        // Measure phase — decide the size of each child
+        val columnWidth = constraints.maxWidth / columns
+        val childConstraints = constraints.copy(
+            minWidth = 0,
+            maxWidth = columnWidth
+        )
+        val placeables = measurables.map { it.measure(childConstraints) }
+
+        // Decide our own size
+        val rows = (placeables.size + columns - 1) / columns
+        val rowHeight = placeables.maxOf { it.height }
+        val totalHeight = rowHeight * rows
+
+        layout(constraints.maxWidth, totalHeight) {
+            // Placement phase — put children at final positions
+            placeables.forEachIndexed { index, placeable ->
+                val col = index % columns
+                val row = index / columns
+                placeable.placeRelative(
+                    x = col * columnWidth,
+                    y = row * rowHeight
+                )
+            }
+        }
+    }
+}
+```
+
+### Intrinsic measurements
+
+Sometimes you need to know a child's min/max width before laying out. Compose
+supports that with intrinsic measurements:
+
+```kotlin
+@Composable
+fun TwoEqualColumns(left: @Composable () -> Unit, right: @Composable () -> Unit) {
+    Layout(
+        content = { left(); right() },
+        modifier = Modifier.height(IntrinsicSize.Min)   // height = max intrinsic height of children
+    ) { measurables, constraints ->
+        val half = constraints.maxWidth / 2
+        val leftP = measurables[0].measure(constraints.copy(minWidth = half, maxWidth = half))
+        val rightP = measurables[1].measure(constraints.copy(minWidth = half, maxWidth = half))
+        val height = maxOf(leftP.height, rightP.height)
+
+        layout(constraints.maxWidth, height) {
+            leftP.placeRelative(0, 0)
+            rightP.placeRelative(half, 0)
+        }
+    }
+}
+```
+
+<Callout kind="warning" title="Intrinsics are not free">
+Intrinsic queries double-measure children. For long lists, prefer explicit
+height or other fixed sizing. Use intrinsics only when the layout logic
+genuinely needs them.
+</Callout>
+
+## Canvas — custom drawing
+
+`Canvas` gives you the full Skia drawing API via a DrawScope receiver:
+
+```kotlin
+@Composable
+fun ProgressRing(progress: Float, modifier: Modifier = Modifier) {
+    val animated by animateFloatAsState(progress, label = "ring")
+    val strokePx = with(LocalDensity.current) { 6.dp.toPx() }
+
+    Canvas(modifier = modifier.size(96.dp)) {
+        // Background ring
+        drawCircle(
+            color = Color.LightGray,
+            radius = size.minDimension / 2 - strokePx / 2,
+            style = Stroke(width = strokePx)
+        )
+        // Progress arc
+        drawArc(
+            color = Color(0xFF3DDC84),
+            startAngle = -90f,
+            sweepAngle = 360f * animated.coerceIn(0f, 1f),
+            useCenter = false,
+            style = Stroke(width = strokePx, cap = StrokeCap.Round),
+            topLeft = Offset(strokePx / 2, strokePx / 2),
+            size = Size(size.width - strokePx, size.height - strokePx)
+        )
+    }
+}
+```
+
+### Modifier.drawWithCache — cache heavy calculations
+
+```kotlin
+@Composable
+fun Waveform(samples: FloatArray, modifier: Modifier = Modifier) {
+    Box(
+        modifier
+            .fillMaxWidth()
+            .height(48.dp)
+            .drawWithCache {
+                // Path is computed ONCE per size change, not per frame
+                val path = Path().apply {
+                    val step = size.width / samples.size
+                    samples.forEachIndexed { i, sample ->
+                        val x = i * step
+                        val y = size.height / 2 - sample * size.height / 2
+                        if (i == 0) moveTo(x, y) else lineTo(x, y)
+                    }
+                }
+                onDrawBehind {
+                    drawPath(path, color = Color(0xFF3DDC84), style = Stroke(2.dp.toPx()))
+                }
+            }
+    )
+}
+```
+
+## Pointer input — gestures the right way
+
+Compose's `Modifier.pointerInput { }` gives you the primitive. Use the
+gesture helpers when they fit; drop to primitives when they don't.
+
+### High-level: `detectDragGestures`, `detectTapGestures`
+
+```kotlin
+@Composable
+fun DraggableCard() {
+    var offset by remember { mutableStateOf(Offset.Zero) }
+
+    Box(
+        modifier = Modifier
+            .offset { IntOffset(offset.x.toInt(), offset.y.toInt()) }
+            .size(120.dp)
+            .background(Color.Blue)
+            .pointerInput(Unit) {
+                detectDragGestures { _, dragAmount ->
+                    offset += dragAmount
+                }
+            }
+    )
+}
+```
+
+### Low-level: multi-touch, pinch-to-zoom
+
+```kotlin
+@Composable
+fun ZoomableImage(painter: Painter) {
+    var scale by remember { mutableStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+
+    Image(
+        painter = painter,
+        contentDescription = null,
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                translationX = offset.x
+                translationY = offset.y
+            }
+            .pointerInput(Unit) {
+                detectTransformGestures { _, pan, zoom, _ ->
+                    scale = (scale * zoom).coerceIn(1f, 5f)
+                    offset += pan
+                }
+            }
+    )
+}
+```
+
+### Nested scroll with Compose
+
+Handle the case where an inner `LazyColumn` should defer scrolling to an
+outer container (e.g., collapsing header):
+
+```kotlin
+val nestedScrollConnection = remember {
+    object : NestedScrollConnection {
+        override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+            val delta = available.y
+            if (delta < 0 && headerOffset > -maxHeader) {
+                // Collapsing header consumes the drag
+                headerOffset = (headerOffset + delta).coerceAtLeast(-maxHeader)
+                return Offset(0f, delta)
+            }
+            return Offset.Zero
+        }
+    }
+}
+
+Box(modifier = Modifier.nestedScroll(nestedScrollConnection)) {
+    Header(offsetY = headerOffset)
+    LazyColumn(contentPadding = PaddingValues(top = headerHeight + headerOffset.dp)) { /* ... */ }
+}
+```
+
+### Gesture disambiguation
+
+When you have tap AND drag on the same element, use `awaitPointerEventScope`
+to disambiguate based on movement threshold:
+
+```kotlin
+Modifier.pointerInput(Unit) {
+    awaitPointerEventScope {
+        while (true) {
+            val down = awaitFirstDown()
+            val dragPastTouchSlop = awaitTouchSlopOrCancellation(down.id) { _, _ -> }
+            if (dragPastTouchSlop == null) {
+                // No drag — it's a tap
+                onTap(down.position)
+            } else {
+                drag(dragPastTouchSlop.id) { change -> onDrag(change.positionChange()) }
+            }
+        }
+    }
+}
+```
+
+## Graphics layer — GPU-accelerated transforms
+
+`graphicsLayer { }` applies transforms on the GPU without reinvoking the
+layout phase. Use it for animations on offset, rotation, alpha, scale:
+
+```kotlin
+val rotation by animateFloatAsState(targetValue = if (expanded) 180f else 0f, label = "chev")
+
+Icon(
+    imageVector = Icons.Default.KeyboardArrowDown,
+    contentDescription = null,
+    modifier = Modifier.graphicsLayer { rotationZ = rotation }
+)
+```
+
+`graphicsLayer { alpha = 0.5f }` is roughly 10× cheaper than composing with
+a semi-transparent color, because it avoids a full recomposition.
+
+## Compose Multiplatform — one UI, all platforms
+
+Compose is no longer Android-only. **Compose Multiplatform** runs on:
+
+- Android (JVM + Android runtime)
+- iOS (Kotlin/Native + UIKit bridge)
+- Desktop (JVM + Skia)
+- Web (Kotlin/Wasm)
+
+A shared module structure:
+
+```text
+shared/
+  commonMain/kotlin/
+    App.kt                  <-- @Composable fun App() { ... }
+    ui/DesignSystem.kt
+  androidMain/kotlin/
+    MainActivity.kt         <-- setContent { App() }
+  iosMain/kotlin/
+    MainViewController.kt   <-- ComposeUIViewController { App() }
+  desktopMain/kotlin/
+    Main.kt                 <-- application { Window { App() } }
+```
+
+```kotlin
+// shared/src/commonMain/kotlin/App.kt
+@Composable
+fun App() {
+    MaterialTheme {
+        Surface {
+            Column {
+                Text("Hello from Compose Multiplatform")
+                Button(onClick = { /* ... */ }) { Text("Tap") }
+            }
+        }
+    }
+}
+```
+
+<Callout kind="tip" title="When to consider CMP">
+Compose Multiplatform is production-ready for **Android + Desktop** and
+stable for **Android + iOS**. It's the shortest path to one Kotlin codebase
+across mobile — especially for design-system-heavy apps. See Module 12 for
+the full KMP + CMP architecture.
+</Callout>
+
+## Key takeaways
+
+<Callout kind="success" title="Custom UI rules">
+- Use `Layout { }` for bespoke arrangements; measure then place.
+- `drawWithCache` caches expensive paths per size change.
+- Low-level `pointerInput` for multi-touch; high-level `detectDrag/Tap` for common cases.
+- `graphicsLayer { }` for transforms — GPU-accelerated, skips composition.
+- Compose Multiplatform brings the same composable to iOS and Desktop.
+</Callout>
+
+## Next
+
+Return to **[Module 03 Overview](./overview)** or read **[Compose Performance](./performance)**.

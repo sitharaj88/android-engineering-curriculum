@@ -1,0 +1,196 @@
+---
+id: news-aggregator
+title: Project 5 — News Aggregator
+sidebar_label: News Aggregator
+description: Offline-first news reader. Paging 3 + Room + WorkManager sync + Glance home-screen widget + Compose-based article viewer.
+---
+
+import { Callout, StepList, FeatureGrid } from '@site/src/components/Doc';
+
+# News Aggregator
+
+Build an offline-first news reader with a home-screen widget. This project
+owns the **Paging 3 + Room + WorkManager + Glance** skill set — the
+foundation of every content-heavy app from Twitter to Pocket.
+
+## The user journey
+
+```text
+Home screen widget (latest 3 headlines)
+         │
+         ▼
+Main feed (paged, offline) ─→ Article reader ─→ Share / Save
+         │
+         ├─ Topic filter
+         └─ Search (FTS)
+```
+
+## Features (by milestone)
+
+### M1 — Skeleton + feed
+
+- `:core:design` with reading-optimized typography (Literata or similar)
+- Navigation: Home, Topics, Saved, Settings
+- Room schema: `Article`, `Topic`, `SavedArticle`, `RemoteKey`
+- Convention plugins from Module 14
+
+### M2 — Paging 3 with Room + RemoteMediator
+
+```kotlin
+@OptIn(ExperimentalPagingApi::class)
+class ArticleRemoteMediator @Inject constructor(
+    private val api: NewsApi,
+    private val db: AppDatabase
+) : RemoteMediator<Int, ArticleEntity>() {
+
+    override suspend fun load(loadType: LoadType, state: PagingState<Int, ArticleEntity>): MediatorResult {
+        val page = when (loadType) {
+            LoadType.REFRESH -> 1
+            LoadType.PREPEND -> return MediatorResult.Success(endOfPaginationReached = true)
+            LoadType.APPEND -> {
+                val lastKey = db.remoteKeyDao().getLast() ?: return MediatorResult.Success(true)
+                lastKey.nextPage ?: return MediatorResult.Success(true)
+            }
+        }
+        return try {
+            val response = api.topHeadlines(page = page, pageSize = state.config.pageSize)
+            db.withTransaction {
+                if (loadType == LoadType.REFRESH) {
+                    db.remoteKeyDao().clear()
+                    db.articleDao().clear()
+                }
+                db.articleDao().insertAll(response.articles.map(ArticleDto::toEntity))
+                db.remoteKeyDao().insert(RemoteKey(nextPage = if (response.hasMore) page + 1 else null))
+            }
+            MediatorResult.Success(endOfPaginationReached = !response.hasMore)
+        } catch (e: Exception) {
+            MediatorResult.Error(e)
+        }
+    }
+}
+
+@Singleton
+class ArticleRepository @Inject constructor(
+    private val db: AppDatabase,
+    private val mediator: ArticleRemoteMediator
+) {
+    @OptIn(ExperimentalPagingApi::class)
+    fun pager(): Flow<PagingData<Article>> = Pager(
+        config = PagingConfig(pageSize = 20, prefetchDistance = 5),
+        remoteMediator = mediator,
+        pagingSourceFactory = { db.articleDao().pagingSource() }
+    ).flow.map { paging -> paging.map(ArticleEntity::toDomain) }
+}
+```
+
+### M3 — Background sync
+
+- Periodic `WorkManager` job refreshing top headlines every 4 hours
+- Expedited job on boot to catch up missed news
+- Constraints: network connected, not low battery
+- Per-topic subscribe/unsubscribe with separate workers
+
+### M4 — Article reader + save-for-later
+
+- Reader mode with Compose Material 3 typography
+- Customizable font size + theme (light/sepia/dark)
+- Save-for-later with local cache of full HTML
+- Export to PDF using Android Print API
+
+### M5 — Glance home widget
+
+```kotlin
+class HeadlinesWidget : GlanceAppWidget() {
+    override suspend fun provideGlance(context: Context, id: GlanceId) {
+        provideContent {
+            val articles = currentState(key = headlinesKey) ?: emptyList<Article>()
+            GlanceTheme {
+                Column(modifier = GlanceModifier.padding(8.dp)) {
+                    articles.take(3).forEach { article ->
+                        Row(modifier = GlanceModifier
+                            .fillMaxWidth()
+                            .clickable(actionStartActivity(ReaderActivity.intentFor(article.id)))
+                        ) {
+                            Text(article.title, style = TextStyle(fontWeight = FontWeight.Bold))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+class HeadlinesWidgetReceiver : GlanceAppWidgetReceiver() {
+    override val glanceAppWidget = HeadlinesWidget()
+}
+```
+
+Update widget from a `WorkManager` job — Glance re-renders when state changes.
+
+### M6 — Production
+
+- Search: Room FTS5 over article body
+- Baseline profile for feed + reader
+- Macrobenchmark: scroll feed, open article cold
+- Play Data Safety: Reading history, optional analytics
+- Accessibility: heading levels in reader, landmarks for TalkBack
+
+## Architecture diagram
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  Home Screen Widget (Glance)                                 │
+│    reads: Top 3 headlines from Room                          │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+┌──────────────────────▼───────────────────────────────────────┐
+│  App UI (Compose)                                            │
+│    FeedScreen (Paging 3) · ReaderScreen · SearchScreen       │
+├──────────────────────────────────────────────────────────────┤
+│  ViewModels + Paging + Room Flow                             │
+├──────────────────────────────────────────────────────────────┤
+│  ArticleRepository + RemoteMediator                          │
+├──────────────────────────────────────────────────────────────┤
+│  Room DB (source of truth)  ◄──── WorkManager sync jobs ────│
+│                                         │                    │
+│                                         ▼                    │
+│                                  NewsApi (Retrofit)         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+## Stretch goals
+
+<FeatureGrid columns={2} features={[
+  { icon: '🔊', title: 'Audio articles', description: 'TTS narration with ExoPlayer for background playback, MediaSession for lockscreen controls.' },
+  { icon: '🤖', title: 'On-device summarization', description: 'Gemini Nano via ML Kit for 2-sentence summaries — no network, no cost.' },
+  { icon: '📌', title: 'Smart notifications', description: 'Breaking news alerts with user-level filter ("only politics and tech"). Rich notification with expanded text.' },
+  { icon: '📊', title: 'Reading stats', description: 'Time spent per topic, streak tracker, most-read sources.' },
+  { icon: '🌐', title: 'Share extension', description: 'Accept shared URLs from browser, save to reader, extract content via backend.' }
+]} />
+
+## Testing strategy
+
+- **Paging source tests** — assert that Room-backed PagingSource emits expected pages
+- **MockWebServer** for Retrofit + RemoteMediator integration tests
+- **WorkManager tests** with `SynchronousExecutor` for deterministic job runs
+- **Glance tests** with `GlanceAppWidgetUnitTestManager`
+
+## Offline UX polish
+
+- **Stale indicator**: subtle banner if last sync > 6 hours
+- **Offline mode**: disable pull-to-refresh animation, show "No connection" snackbar
+- **Image placeholders**: Coil with blurhash or dominant color fallback
+- **Preload images**: prefetch thumbnails for next page before the user scrolls
+
+## Privacy
+
+- **No third-party tracking** pixels in reader (load article text from API, not iframe the source)
+- **Reading history** local only, with user toggle for cross-device sync via your backend
+- **Analytics opt-out** respected; even first-party event collection gated
+
+## Next
+
+You've completed all five projects! Return to:
+
+- **[Capstone Projects overview](/docs/projects)** for a recap
+- **[Career & Interview Prep](/docs/career-interview/overview)** to prepare your portfolio and go interview

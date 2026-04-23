@@ -1,0 +1,457 @@
+---
+id: overview
+title: Module 14 — Gradle & Build Systems
+sidebar_label: Overview
+description: Master Gradle — the build system that powers every Android app. Version catalogs, convention plugins, composite builds, configuration cache, and build performance.
+---
+
+import { Callout, ComparisonCard, StepList, FeatureGrid, LibraryGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 14 of 20</span>
+  <span><strong>Duration:</strong> 2 weeks</span>
+  <span><strong>Topics:</strong> 4 · 10 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 01–04</span>
+</div>
+
+# Gradle & Build Systems
+
+Every Android engineer writes Kotlin. Few truly understand the build. On an
+enterprise team of 20+ developers with 50+ modules, a **10 second slowdown in
+the build loop costs thousands of engineering hours per year**. This module
+teaches Gradle the way principal engineers think about it — as a programmable
+build graph, not a mystery file you copy-paste into.
+
+<Callout kind="tip" title="Why this matters">
+When your CI pipeline takes 40 minutes, when a junior bumps a library version
+and three features break, when "clean build" is a daily ritual — that's a
+Gradle problem. This module is your shield.
+</Callout>
+
+## Topic 1 · Gradle Foundations
+
+### The build lifecycle
+
+Gradle runs in three distinct phases. Mixing them up is the #1 source of
+mysterious "works on my machine" bugs.
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│  1. Initialization — settings.gradle.kts evaluated               │
+│     Gradle decides WHICH projects to build                       │
+├──────────────────────────────────────────────────────────────────┤
+│  2. Configuration — every build.gradle.kts is evaluated          │
+│     Task graph is built (tasks are DEFINED here, not RUN)        │
+├──────────────────────────────────────────────────────────────────┤
+│  3. Execution — tasks in the graph run in dependency order       │
+│     This is where compileKotlin, packageDebug, etc. actually run │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+```kotlin
+// WRONG — runs during configuration on every build, even ./gradlew help
+android {
+    defaultConfig {
+        versionCode = computeVersionCode()  // ⚠️ SLOW during configuration
+    }
+}
+
+// RIGHT — deferred to execution, only runs when the task runs
+android {
+    defaultConfig {
+        versionCode.set(project.provider { computeVersionCode() })
+    }
+}
+```
+
+### Kotlin DSL vs Groovy DSL
+
+Modern Android projects use the **Kotlin DSL** (`.gradle.kts`). It's type-safe,
+autocompletes in the IDE, and refactor-safe. Groovy is legacy.
+
+<ComparisonCard
+  left={{
+    label: 'Groovy DSL',
+    title: 'Why we migrated away',
+    variant: 'old',
+    points: [
+      'Dynamic typing — typos are runtime errors',
+      'Poor IDE support in older versions',
+      'Inconsistent string syntax (single vs double quotes)',
+      'No compile-time checks on property names',
+      'Slower configuration parsing'
+    ]
+  }}
+  right={{
+    label: 'Kotlin DSL',
+    title: 'What we use today',
+    variant: 'new',
+    points: [
+      'Statically typed — typos caught before build',
+      'Full IDE navigation, rename, find-usages',
+      'Shares mental model with app code',
+      'Compile-time validation via kotlin-dsl plugin',
+      'Reusable logic as Kotlin code, not Groovy strings'
+    ]
+  }}
+/>
+
+---
+
+## Topic 2 · Version Catalogs — the single source of truth
+
+A **version catalog** (`libs.versions.toml`) centralizes every dependency,
+version, and plugin reference. This is non-negotiable on any team with more
+than one module.
+
+```toml
+# gradle/libs.versions.toml
+[versions]
+agp            = "8.7.2"
+kotlin         = "2.1.0"
+ksp            = "2.1.0-1.0.29"
+compose-bom    = "2024.12.01"
+coroutines     = "1.9.0"
+hilt           = "2.52"
+room           = "2.6.1"
+retrofit       = "2.11.0"
+okhttp         = "4.12.0"
+
+[libraries]
+androidx-core-ktx       = { module = "androidx.core:core-ktx",        version = "1.15.0" }
+androidx-lifecycle      = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version = "2.8.7" }
+compose-bom             = { module = "androidx.compose:compose-bom",  version.ref = "compose-bom" }
+compose-material3       = { module = "androidx.compose.material3:material3" }
+compose-ui-tooling      = { module = "androidx.compose.ui:ui-tooling" }
+kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+hilt-android            = { module = "com.google.dagger:hilt-android", version.ref = "hilt" }
+hilt-compiler           = { module = "com.google.dagger:hilt-android-compiler", version.ref = "hilt" }
+room-runtime            = { module = "androidx.room:room-runtime",    version.ref = "room" }
+room-compiler           = { module = "androidx.room:room-compiler",   version.ref = "room" }
+room-ktx                = { module = "androidx.room:room-ktx",        version.ref = "room" }
+retrofit                = { module = "com.squareup.retrofit2:retrofit", version.ref = "retrofit" }
+retrofit-moshi          = { module = "com.squareup.retrofit2:converter-moshi", version.ref = "retrofit" }
+okhttp-logging          = { module = "com.squareup.okhttp3:logging-interceptor", version.ref = "okhttp" }
+
+[bundles]
+compose    = ["compose-material3", "compose-ui-tooling"]
+networking = ["retrofit", "retrofit-moshi", "okhttp-logging"]
+room       = ["room-runtime", "room-ktx"]
+
+[plugins]
+android-application = { id = "com.android.application",    version.ref = "agp" }
+android-library     = { id = "com.android.library",        version.ref = "agp" }
+kotlin-android      = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+ksp                 = { id = "com.google.devtools.ksp",    version.ref = "ksp" }
+hilt                = { id = "com.google.dagger.hilt.android", version.ref = "hilt" }
+```
+
+Modules consume the catalog via `libs`:
+
+```kotlin
+// feature/profile/build.gradle.kts
+plugins {
+    alias(libs.plugins.android.library)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.ksp)
+    alias(libs.plugins.hilt)
+}
+
+dependencies {
+    implementation(platform(libs.compose.bom))
+    implementation(libs.bundles.compose)
+    implementation(libs.bundles.networking)
+    implementation(libs.hilt.android)
+    ksp(libs.hilt.compiler)
+}
+```
+
+<Callout kind="success" title="Catalog wins">
+- Renovate/Dependabot can update a single file instead of 50.
+- IDE autocompletes every dependency — no more `implementation "???"` guessing.
+- Refactor a version once, propagates everywhere.
+- Type-safe accessors — typos fail at configuration time, not at runtime.
+</Callout>
+
+---
+
+## Topic 3 · Convention plugins — reusable build logic
+
+Copy-pasting 40 lines of `android { ... }` config into every module is the
+path to madness. **Convention plugins** let you write that config once as a
+Kotlin plugin and apply it by ID.
+
+Set up a `build-logic` composite build:
+
+```text
+build-logic/
+├── settings.gradle.kts
+└── convention/
+    ├── build.gradle.kts
+    └── src/main/kotlin/
+        ├── AndroidLibraryConventionPlugin.kt
+        ├── AndroidApplicationConventionPlugin.kt
+        ├── AndroidComposeConventionPlugin.kt
+        └── AndroidFeatureConventionPlugin.kt
+```
+
+```kotlin
+// build-logic/convention/build.gradle.kts
+plugins {
+    `kotlin-dsl`
+}
+
+dependencies {
+    compileOnly(libs.android.gradle.plugin)
+    compileOnly(libs.kotlin.gradle.plugin)
+    compileOnly(libs.ksp.gradle.plugin)
+}
+
+gradlePlugin {
+    plugins {
+        register("androidLibrary") {
+            id = "myapp.android.library"
+            implementationClass = "AndroidLibraryConventionPlugin"
+        }
+        register("androidCompose") {
+            id = "myapp.android.compose"
+            implementationClass = "AndroidComposeConventionPlugin"
+        }
+        register("androidFeature") {
+            id = "myapp.android.feature"
+            implementationClass = "AndroidFeatureConventionPlugin"
+        }
+    }
+}
+```
+
+```kotlin
+// AndroidLibraryConventionPlugin.kt
+class AndroidLibraryConventionPlugin : Plugin<Project> {
+    override fun apply(target: Project) = with(target) {
+        with(pluginManager) {
+            apply("com.android.library")
+            apply("org.jetbrains.kotlin.android")
+        }
+
+        extensions.configure<LibraryExtension> {
+            compileSdk = 35
+            defaultConfig {
+                minSdk = 24
+                testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+                consumerProguardFiles("consumer-rules.pro")
+            }
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_17
+                targetCompatibility = JavaVersion.VERSION_17
+            }
+        }
+
+        extensions.configure<KotlinAndroidProjectExtension> {
+            jvmToolchain(17)
+            compilerOptions {
+                freeCompilerArgs.addAll(
+                    "-opt-in=kotlin.RequiresOptIn",
+                    "-Xjvm-default=all"
+                )
+            }
+        }
+    }
+}
+```
+
+Now every feature module is just:
+
+```kotlin
+// feature/profile/build.gradle.kts
+plugins {
+    id("myapp.android.feature")   // brings library + compose + hilt in one line
+}
+```
+
+**Why this matters at scale**: adding a new feature module goes from 80 lines
+of build config to **3 lines**. A SDK version bump touches one file. Kotlin
+compiler flag changes roll out consistently.
+
+---
+
+## Topic 4 · Build performance
+
+### Configuration cache
+
+Gradle's **configuration cache** serializes the task graph after the first
+build, so subsequent builds skip the entire configuration phase. On a large
+project this saves **10–20 seconds per incremental build**.
+
+```properties
+# gradle.properties
+org.gradle.configuration-cache=true
+org.gradle.configuration-cache.problems=warn
+org.gradle.caching=true
+org.gradle.parallel=true
+
+# Give Gradle enough heap — AGP 8+ is memory-hungry
+org.gradle.jvmargs=-Xmx6g -XX:+UseG1GC -XX:MaxMetaspaceSize=1g \
+  -Dfile.encoding=UTF-8 -Dkotlin.daemon.jvm.options="-Xmx4g"
+
+# Kotlin
+kotlin.code.style=official
+kotlin.incremental=true
+kotlin.incremental.useClasspathSnapshot=true
+
+# AGP
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+android.nonFinalResIds=true
+android.defaults.buildfeatures.buildconfig=false
+```
+
+<Callout kind="warning" title="Configuration cache compatibility">
+Some tasks and plugins are not configuration-cache-compatible. Start with
+`warn`, fix the reported issues, then flip to `fail` to prevent regressions.
+The Android Gradle Plugin, Kotlin, Hilt, and KSP are all compatible as of
+2024.
+</Callout>
+
+### Build scans
+
+Every serious team should publish **build scans** (https://scans.gradle.com).
+A scan tells you:
+
+- Which task took longest
+- Which module forced configuration
+- Which dependency triggered a classpath reshuffle
+- Which test ran slowest
+
+```kotlin
+// settings.gradle.kts
+plugins {
+    id("com.gradle.develocity") version "3.18"
+}
+
+develocity {
+    buildScan {
+        termsOfUseUrl.set("https://gradle.com/terms-of-service")
+        termsOfUseAgree.set("yes")
+        publishing.onlyIf { it.buildResult.failures.isNotEmpty() || isCi }
+    }
+}
+```
+
+### Remote build cache
+
+On CI, set up a remote build cache (Gradle Enterprise, self-hosted, or
+`gradle/gradle-build-action`). A second developer doesn't recompile what the
+first already compiled.
+
+```kotlin
+buildCache {
+    local { isEnabled = true }
+    remote<HttpBuildCache> {
+        url = uri("https://cache.mycompany.com/cache/")
+        isPush = isCi
+        credentials {
+            username = providers.gradleProperty("cacheUser").orNull
+            password = providers.gradleProperty("cachePassword").orNull
+        }
+    }
+}
+```
+
+### Isolate slow tasks
+
+Profile with `./gradlew <task> --profile --scan`. Common offenders:
+
+| Symptom                          | Fix                                                   |
+|----------------------------------|-------------------------------------------------------|
+| KSP re-runs every build          | Use Gradle's incremental APIs; check Hilt/Room versions |
+| `packageDebug` slow              | Shrink resources, remove unused locales/densities     |
+| Large Compose compilation        | Enable K2, use `kotlin.experimental.tryK2=true`       |
+| Configuration takes 15 s        | Adopt convention plugins, enable config cache         |
+| `lint` runs on every module      | Use `lintOptions { abortOnError = false; disable("IconMissingDensityFolder") }` or `lintRelease` only in CI |
+
+---
+
+## Build variants done right
+
+Don't create dimensions just because. Start minimal: `debug`, `release`,
+`staging` (if you have a staging backend).
+
+```kotlin
+android {
+    signingConfigs {
+        create("release") {
+            storeFile = file(System.getenv("KEYSTORE_PATH") ?: "release.keystore")
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("KEY_ALIAS")
+            keyPassword = System.getenv("KEY_PASSWORD")
+        }
+    }
+    buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-DEBUG"
+            isMinifyEnabled = false
+        }
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("release")
+        }
+        create("staging") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".staging"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
+    }
+    flavorDimensions += "environment"
+    productFlavors {
+        create("prod") {
+            dimension = "environment"
+            buildConfigField("String", "BASE_URL", "\"https://api.example.com/\"")
+        }
+        create("dev") {
+            dimension = "environment"
+            buildConfigField("String", "BASE_URL", "\"https://dev-api.example.com/\"")
+        }
+    }
+}
+```
+
+---
+
+## Companion tools every enterprise uses
+
+<LibraryGrid libraries={[
+  { name: 'Gradle Develocity', tagline: 'Build observability', description: 'Scans, distributed cache, test distribution, flaky test detection. The industry standard for teams > 20.', url: 'https://gradle.com/develocity/' },
+  { name: 'Dependabot / Renovate', tagline: 'Automated dependency updates', description: 'Opens PRs when new versions of Gradle, AGP, Kotlin, or library deps ship. Pair with version catalog for one-file updates.', url: 'https://docs.renovatebot.com/' },
+  { name: 'Android Gradle Plugin', tagline: 'The Android build system', description: 'AGP 8+ ships with configuration cache support, K2 compiler, and massive incremental build improvements.', url: 'https://developer.android.com/build' },
+  { name: 'KSP', tagline: 'Kotlin Symbol Processing', description: 'Replacement for kapt — 2× faster annotation processing. Hilt, Room, Moshi all support it.', url: 'https://kotlinlang.org/docs/ksp-overview.html' }
+]} />
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Enterprise Gradle mindset">
+- **Version catalog** for every dependency — no exceptions.
+- **Convention plugins** for every shared configuration — modules should be 3 lines.
+- **Configuration cache + build cache + parallel + KSP** enabled in `gradle.properties`.
+- **Build scans** on CI and on developer failures — measure, don't guess.
+- **Deferred providers** (`.set { }`) over eager evaluation.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Migrate to the version catalog', description: 'Move every implementation("foo:bar:1.2.3") in your app to libs.versions.toml. Use Android Studio\'s refactor action if available.' },
+  { title: 'Write a convention plugin', description: 'Create build-logic/convention with AndroidLibraryConventionPlugin and apply it to one of your library modules. Compare the diff.' },
+  { title: 'Enable configuration cache', description: 'Add org.gradle.configuration-cache=true, run ./gradlew assembleDebug twice, record the second run\'s wall-clock time.' },
+  { title: 'Publish a build scan', description: 'Run ./gradlew assembleDebug --scan on a clean checkout. Identify the three slowest tasks.' }
+]} />
+
+## Next module
+
+Continue to **[Module 15 — Modularization at Scale](/docs/modularization/overview)** to split a monolith into 30+ feature modules with clear boundaries, API/impl separation, and dynamic delivery.

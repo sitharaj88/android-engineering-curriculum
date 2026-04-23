@@ -1,0 +1,506 @@
+---
+id: overview
+title: Module 19 — Enterprise UX
+sidebar_label: Overview
+description: Build apps that work for everyone. Design systems at scale, accessibility (WCAG 2.2, TalkBack), internationalization, RTL, large screens, foldables, and motion.
+---
+
+import { Callout, ComparisonCard, StepList, FeatureGrid, LibraryGrid, Diagram, ComponentLifecycleDiagram } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 19 of 20</span>
+  <span><strong>Duration:</strong> 2 weeks</span>
+  <span><strong>Topics:</strong> 5 · 11 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 03, 15</span>
+</div>
+
+# Enterprise UX
+
+Consumer apps win on polish; enterprise apps win on **coverage**. A
+world-class Android app works for the blind user on a Pixel 9, the RTL user
+in Cairo, the foldable user with their device half-open, the executive on a
+tablet with a keyboard, and the 8-year-old Android Go device in Lagos. This
+module shows you how to build once and serve them all.
+
+<Callout kind="tip" title="The business case">
+Accessibility isn't charity — it's **market expansion**. 1B+ people have
+disabilities globally. RTL locales are **25% of internet users**. Tablets and
+foldables are the fastest-growing Android form factor. Every gap in UX is
+lost revenue.
+</Callout>
+
+## Topic 1 · Design systems at scale
+
+A design system is a **shared language** between design and engineering. At
+small teams it's a Figma file; at scale it's a versioned library of tokens,
+components, and guidelines — with CI checks and generated documentation.
+
+### The token pyramid
+
+```text
+               ┌─────────────────────────┐
+               │  Component tokens        │   Button.Primary.Background
+               │  (theme-binding)         │   TextField.Error.BorderColor
+               └────────────┬─────────────┘
+                            │ references
+                            ▼
+               ┌─────────────────────────┐
+               │  Semantic tokens         │   color.surface
+               │  (meaning)               │   color.onSurface
+               └────────────┬─────────────┘   spacing.inline.sm
+                            │ references
+                            ▼
+               ┌─────────────────────────┐
+               │  Primitive tokens        │   green.500 = #3DDC84
+               │  (raw values)            │   space.04 = 8.dp
+               └─────────────────────────┘
+```
+
+Primitive tokens never appear in screen code. Screen code only uses semantic
+or component tokens. This is how you can re-skin the app for a white-label
+customer without touching a single screen.
+
+### Generated token files
+
+Design tools (Figma Tokens, Tokens Studio) export to JSON. A codegen step
+turns that JSON into Kotlin:
+
+```kotlin
+// Generated: core/design/build/generated/tokens/Palette.kt
+object Palette {
+    val green500 = Color(0xFF3DDC84)
+    val gray900  = Color(0xFF0F172A)
+    /* ... */
+}
+
+// Handwritten: core/design/src/main/kotlin/theme/SemanticColors.kt
+@Immutable
+data class SemanticColors(
+    val surface: Color,
+    val onSurface: Color,
+    val surfaceVariant: Color,
+    val accent: Color,
+    val danger: Color
+)
+
+val LightSemantic = SemanticColors(
+    surface        = Palette.white,
+    onSurface      = Palette.gray900,
+    surfaceVariant = Palette.gray100,
+    accent         = Palette.green500,
+    danger         = Palette.red500
+)
+
+val LocalSemantic = staticCompositionLocalOf<SemanticColors> { error("No SemanticColors") }
+
+@Composable
+fun AppTheme(content: @Composable () -> Unit) {
+    val scheme = if (isSystemInDarkTheme()) DarkSemantic else LightSemantic
+    CompositionLocalProvider(LocalSemantic provides scheme) {
+        MaterialTheme(colorScheme = scheme.toMaterial3()) { content() }
+    }
+}
+
+@Composable
+fun PrimaryButton(text: String, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = LocalSemantic.current.accent,
+            contentColor = Color.White
+        )
+    ) { Text(text) }
+}
+```
+
+### Component gallery
+
+Every component in the design system has a **Compose Preview** that doubles
+as visual documentation:
+
+```kotlin
+@Preview(name = "Light", showBackground = true)
+@Preview(name = "Dark", showBackground = true, uiMode = Configuration.UI_MODE_NIGHT_YES)
+@Preview(name = "Large font", fontScale = 2.0f)
+@Preview(name = "RTL", locale = "ar")
+@Composable
+private fun PrimaryButtonPreviews() {
+    AppTheme {
+        Column { PrimaryButton(text = "Checkout · ₹3,499", onClick = {}) }
+    }
+}
+```
+
+Use **Paparazzi** or **Showkase** for automated screenshot galleries — any
+PR that changes a component produces a visual diff in the pull request.
+
+---
+
+## Topic 2 · Accessibility (A11y)
+
+Android accessibility is built on **semantics nodes** — an abstract tree
+that screen readers, switch access, and voice control all consume.
+
+### The four non-negotiables
+
+<StepList steps={[
+  { title: 'Every interactive element is labelled', description: 'Buttons, icons, images with meaning must have a content description. TextFields must have a label associated.' },
+  { title: 'Touch targets are ≥ 48×48 dp', description: 'WCAG 2.1 AA minimum. Use Modifier.minimumInteractiveComponentSize() — not manual padding.' },
+  { title: 'Color contrast ≥ 4.5:1 (text), 3:1 (graphics)', description: 'WCAG AA. Material 3 M3 "onSurface" tokens are compliant; custom colors must be audited.' },
+  { title: 'Works with TalkBack end-to-end', description: 'A blind user must be able to sign in, complete the primary journey, and sign out using TalkBack alone.' }
+]} />
+
+### Compose semantics in practice
+
+```kotlin
+@Composable
+fun AccessibleIconButton(
+    onClick: () -> Unit,
+    icon: ImageVector,
+    label: String,
+    modifier: Modifier = Modifier
+) {
+    IconButton(
+        onClick = onClick,
+        modifier = modifier.semantics { contentDescription = label }
+    ) {
+        Icon(icon, contentDescription = null)  // parent describes it
+    }
+}
+
+// Group decorative text with its action for better TalkBack navigation
+@Composable
+fun ProductCard(product: Product, onClick: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .semantics(mergeDescendants = true) {
+                // TalkBack reads ONE announcement for the card, not 4 separate items
+                contentDescription = "${product.name}, ${product.priceLabel}, in stock"
+                role = Role.Button
+            }
+    ) {
+        AsyncImage(product.imageUrl, contentDescription = null)
+        Text(product.name)
+        Text(product.priceLabel)
+    }
+}
+
+// Live regions for dynamic content
+@Composable
+fun CartBadge(count: Int) {
+    Text(
+        text = "$count",
+        modifier = Modifier.semantics {
+            liveRegion = LiveRegionMode.Polite   // TalkBack announces changes
+        }
+    )
+}
+
+// Custom actions
+@Composable
+fun MessageRow(message: Message, onArchive: () -> Unit, onDelete: () -> Unit) {
+    Row(
+        modifier = Modifier.semantics {
+            customActions = listOf(
+                CustomAccessibilityAction("Archive") { onArchive(); true },
+                CustomAccessibilityAction("Delete")  { onDelete(); true }
+            )
+        }
+    ) { /* visual: swipe gestures */ }
+}
+```
+
+### Automated a11y testing
+
+```kotlin
+@HiltAndroidTest
+class ProfileAccessibilityTest {
+
+    @get:Rule val compose = createAndroidComposeRule<HiltTestActivity>()
+
+    @Test fun `profile screen passes accessibility checks`() {
+        compose.setContent { ProfileScreen() }
+
+        // Built-in Compose a11y checks
+        compose.onRoot().assertHasClickAction()
+        compose.onAllNodesWithRole(Role.Button)
+            .assertAll(hasContentDescription() or hasText())
+
+        // Google Accessibility Test Framework
+        val config = AccessibilityValidator()
+            .setRunChecksFromRootView(true)
+            .setThrowExceptionFor(AccessibilityCheckResult.AccessibilityCheckResultType.ERROR)
+        compose.onRoot().performAccessibilityAudit(config)
+    }
+}
+```
+
+### Font scaling
+
+Android lets users scale fonts up to 2.0× (sometimes 2.5× on recent
+versions). **Test every screen at 2.0×** — that's where layouts break.
+
+```kotlin
+// DON'T: fixed dp for text containers
+Text("Long message", modifier = Modifier.height(24.dp))   // clips at large font
+
+// DO: let the text breathe, use Min/Max constraints with sp
+Text(
+    "Long message",
+    style = MaterialTheme.typography.bodyLarge,
+    modifier = Modifier.heightIn(min = 24.dp)  // grows with font
+)
+```
+
+---
+
+## Topic 3 · Internationalization & localization
+
+### Beyond translated strings
+
+i18n is more than calling `getString()`. A robust implementation handles:
+
+| Concern            | Tool / approach                                              |
+|--------------------|--------------------------------------------------------------|
+| Plurals            | `plurals.xml` with zero/one/two/few/many/other               |
+| Gender             | ICU MessageFormat + language-specific templates              |
+| Dates              | `java.time.format.DateTimeFormatter.ofLocalizedDate(...)` with `Locale.getDefault()` |
+| Numbers/currency   | `NumberFormat.getCurrencyInstance(Locale.getDefault())`       |
+| RTL (Arabic, Hebrew, Urdu, Persian) | `android:supportsRtl="true"` + start/end padding throughout |
+| Non-Latin scripts  | Test rendering on Devanagari, CJK, Thai, Myanmar              |
+
+```xml
+<!-- res/values/strings.xml -->
+<string name="greeting">Hello, %1$s!</string>
+
+<plurals name="item_count">
+    <item quantity="one">%d item</item>
+    <item quantity="other">%d items</item>
+</plurals>
+
+<!-- res/values/strings.xml — ICU for gender and advanced plurals -->
+<string name="message_preview">
+    {gender, select, female {She sent you a message.} male {He sent you a message.} other {They sent you a message.}}
+</string>
+```
+
+```kotlin
+fun format(count: Int): String = context.resources.getQuantityString(R.plurals.item_count, count, count)
+```
+
+### Pseudo-localization in debug builds
+
+Before ever translating, wrap all strings with **pseudo-localization** to
+surface RTL/length issues:
+
+```kotlin
+// debugImplementation
+Pseudolocalize.wrap(context, Pseudolocalize.Mode.EN_XA)   // [!!! ŘéšôûŕćéŚ !!!]
+Pseudolocalize.wrap(context, Pseudolocalize.Mode.AR_XB)   // RTL pseudo
+```
+
+Strings that are hardcoded (not in `strings.xml`) won't expand. Any layout
+that clips at 30% longer text fails in German before it ever ships.
+
+### Right-to-left (RTL)
+
+```xml
+<!-- AndroidManifest -->
+<application android:supportsRtl="true" ... />
+```
+
+```kotlin
+// Use start/end, NEVER left/right in padding, alignment, or drawables
+Row(modifier = Modifier.padding(start = 16.dp, end = 8.dp)) { /* correct */ }
+
+// Icons that have directional meaning — mirror them in RTL
+Icon(
+    imageVector = Icons.AutoMirrored.Filled.ArrowForward,  // auto-mirrors in RTL
+    contentDescription = null
+)
+
+// Custom drawables: set android:autoMirrored="true" in the vector XML
+```
+
+---
+
+## Topic 4 · Large screens, tablets, and foldables
+
+2020s Android is no longer "phone-first." Tablets, Chromebooks, foldables,
+and automotive screens run the same APK. **Window Size Classes** are how
+you adapt.
+
+<Diagram title="Window size classes and layout strategy" caption="Respond to window size, not device model — the same device changes size when the user folds, splits, or rotates.">
+  <ComponentLifecycleDiagram />
+</Diagram>
+
+```kotlin
+@Composable
+fun InboxApp(windowSizeClass: WindowSizeClass) {
+    when (windowSizeClass.widthSizeClass) {
+        WindowWidthSizeClass.Compact -> InboxSinglePane()          // phones
+        WindowWidthSizeClass.Medium  -> InboxTwoPaneSlideOver()    // foldables, small tablets
+        WindowWidthSizeClass.Expanded -> InboxTwoPaneFixed()       // tablets, desktop, Chromebook
+    }
+}
+
+@Composable
+fun InboxTwoPaneFixed() {
+    Row {
+        MessageList(modifier = Modifier.weight(0.4f))
+        VerticalDivider()
+        MessageDetail(modifier = Modifier.weight(0.6f))
+    }
+}
+```
+
+### Material 3 `NavigationSuiteScaffold`
+
+Auto-switches between bottom bar (compact), rail (medium), and drawer
+(expanded) based on window size:
+
+```kotlin
+NavigationSuiteScaffold(
+    navigationSuiteItems = {
+        NavigationItem.entries.forEach { item ->
+            item(
+                selected = item == currentItem,
+                onClick = { navigate(item) },
+                icon = { Icon(item.icon, null) },
+                label = { Text(item.label) }
+            )
+        }
+    }
+) {
+    NavHost(/* ... */)
+}
+```
+
+### Foldable support with Jetpack WindowManager
+
+```kotlin
+class FoldingAwareViewModel @Inject constructor(
+    windowInfoTracker: WindowInfoTracker,
+    @ApplicationContext context: Context
+) : ViewModel() {
+    val foldingFeature: StateFlow<FoldingFeature?> =
+        windowInfoTracker.windowLayoutInfo(context)
+            .map { info -> info.displayFeatures.filterIsInstance<FoldingFeature>().firstOrNull() }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+}
+
+@Composable
+fun VideoCallScreen(foldingFeature: FoldingFeature?) {
+    if (foldingFeature?.state == FoldingFeature.State.HALF_OPENED &&
+        foldingFeature.orientation == FoldingFeature.Orientation.HORIZONTAL) {
+        // Table-top mode — video on top, controls below the hinge
+        Column {
+            VideoArea(Modifier.weight(1f))
+            ControlsArea(Modifier.fillMaxWidth())
+        }
+    } else {
+        Box { VideoArea(Modifier.fillMaxSize()); ControlsOverlay() }
+    }
+}
+```
+
+### Drag, drop, keyboard, and mouse on Chromebook
+
+```kotlin
+Modifier
+    .onKeyEvent { event ->
+        if (event.key == Key.Escape) { onDismiss(); true } else false
+    }
+    .pointerHoverIcon(PointerIcon.Hand)
+    .onExternalDrag(
+        onDragStart = { /* highlight drop target */ },
+        onDrop = { data -> handleDrop(data) }
+    )
+```
+
+---
+
+## Topic 5 · Motion design
+
+Motion guides attention, communicates hierarchy, and makes a fast app *feel*
+fast. Material 3 ships a full motion system:
+
+| Token              | Duration  | Use for                                    |
+|--------------------|-----------|--------------------------------------------|
+| `durations.short1` | 50 ms     | Selection state changes, toggles          |
+| `durations.medium1`| 200 ms    | Standard transitions                      |
+| `durations.long1`  | 400 ms    | Large-element transitions                 |
+| `easing.standard`  | cubic     | Default in/out                             |
+| `easing.emphasized`| cubic     | Expressive, attention-drawing transitions |
+
+```kotlin
+val state by animateFloatAsState(
+    targetValue = if (expanded) 1f else 0f,
+    animationSpec = tween(
+        durationMillis = MotionTokens.DurationMedium1.toInt(),
+        easing = MotionTokens.EasingStandard
+    ),
+    label = "expansion"
+)
+
+// Shared element transitions (Compose 1.7+)
+SharedTransitionLayout {
+    AnimatedContent(targetState = currentRoute) { route ->
+        when (route) {
+            is ProductList -> ProductListScreen(sharedTransitionScope = this@SharedTransitionLayout)
+            is ProductDetail -> ProductDetailScreen(/* ... */)
+        }
+    }
+}
+```
+
+### Respect `prefers-reduced-motion`
+
+```kotlin
+val reduceMotion = LocalAccessibilityManager.current?.let {
+    (context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager).isReduceMotionEnabled
+} ?: false
+
+val duration = if (reduceMotion) 0 else 300
+```
+
+---
+
+## Companion tools
+
+<LibraryGrid libraries={[
+  { name: 'Paparazzi', tagline: 'Snapshot testing', description: 'Render Composables to PNG deterministically without an emulator. Perfect for design-system visual regression.', url: 'https://github.com/cashapp/paparazzi' },
+  { name: 'Showkase', tagline: 'Component browser', description: 'Generates a runtime gallery of every @Preview in your codebase. Ships alongside internal builds.', url: 'https://github.com/airbnb/Showkase' },
+  { name: 'Accompanist AdaptiveLayout', tagline: 'Window size helpers', description: 'Calculate window size classes and respond in Compose. Now folded into androidx.compose.material3.adaptive.', url: 'https://google.github.io/accompanist/adaptive/' },
+  { name: 'Jetpack WindowManager', tagline: 'Foldable state', description: 'FoldingFeature, window metrics, hinge orientation — the only correct API for foldables.', url: 'https://developer.android.com/jetpack/androidx/releases/window' },
+  { name: 'Lokalise / Phrase', tagline: 'TMS', description: 'Translation Management Systems with Android XML/ICU support. Automate string sync with CI.', url: 'https://lokalise.com' },
+  { name: 'Google Accessibility Test Framework', tagline: 'Automated a11y audit', description: 'Runs heuristics for touch target size, contrast, labels. Integrates with Espresso and Compose.', url: 'https://github.com/google/Accessibility-Test-Framework-for-Android' }
+]} />
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Enterprise UX principles">
+- **Design tokens** — primitive → semantic → component. Screens touch only the top two layers.
+- **Accessibility** is WCAG 2.2 AA: labels, ≥48dp targets, ≥4.5:1 contrast, TalkBack end-to-end.
+- **i18n** covers plurals, dates, RTL, non-Latin scripts — pseudo-localize to catch bugs early.
+- **Window size classes + Jetpack WindowManager** for tablets, foldables, Chromebooks.
+- **Motion tokens** for consistent animation; honor reduce-motion settings.
+- Build **Paparazzi snapshot tests** — every component change produces a visual diff in code review.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Token refactor', description: 'Pick one screen and replace every hardcoded color/padding with a design token. Note how many occurrences you found.' },
+  { title: 'TalkBack audit', description: 'Enable TalkBack and complete your app\'s primary user flow without looking at the screen. Fix every announcement that confused you.' },
+  { title: 'Pseudo-localize', description: 'Wire up Pseudolocalize in debug. Take a screenshot of a long-string screen in en-XA and identify three layout bugs.' },
+  { title: 'Two-pane layout', description: 'Convert your Inbox or Search screen to a two-pane layout that activates at WindowWidthSizeClass.Expanded.' },
+  { title: 'Paparazzi snapshot', description: 'Add a Paparazzi test for your PrimaryButton in light + dark + 2x font + RTL variants. Commit the baseline PNGs.' }
+]} />
+
+## Next module
+
+Continue to **[Module 20 — Career & Interview Preparation](/docs/career-interview/overview)** to translate these skills into offers, promotions, and a portfolio hiring managers remember.

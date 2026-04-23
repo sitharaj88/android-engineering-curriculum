@@ -73,7 +73,7 @@ const config: Config = {
   themeConfig: {
     image: 'img/social-card.png',
     metadata: [
-      {name: 'keywords', content: 'android, kotlin, jetpack compose, training, mobile development, MVVM, clean architecture, firebase, hilt, room, retrofit'},
+      {name: 'keywords', content: 'android, kotlin, jetpack compose, training, enterprise android, mobile development, MVVM, MVI, clean architecture, firebase, hilt, room, retrofit, gradle, modularization, baseline profiles, OWASP MASVS, kotlin multiplatform, compose multiplatform, wear os'},
       {name: 'twitter:card', content: 'summary_large_image'},
       {name: 'og:type', content: 'website'},
     ],
@@ -83,8 +83,8 @@ const config: Config = {
       respectPrefersColorScheme: true,
     },
     announcementBar: {
-      id: 'training_announcement',
-      content: '⚡ 13 Modules · 73+ Topics · 34 Weeks · Kotlin + Jetpack Compose Curriculum — <a href="/android-engineering-curriculum/docs/intro">Start Learning →</a>',
+      id: 'training_announcement_v2',
+      content: '⚡ 20 Modules · 100+ Topics · 44 Weeks · Enterprise-Grade Android Curriculum — <a href="/android-engineering-curriculum/docs/intro">Start Learning →</a>',
       backgroundColor: '#3DDC84',
       textColor: '#0F172A',
       isCloseable: true,
@@ -134,21 +134,32 @@ const config: Config = {
       style: 'dark',
       links: [
         {
-          title: 'Training Modules',
+          title: 'Foundations',
           items: [
             {label: 'Kotlin Foundation', to: '/docs/kotlin-foundation/overview'},
             {label: 'Jetpack Compose', to: '/docs/jetpack-compose/overview'},
-            {label: 'Architecture', to: '/docs/architecture-patterns/overview'},
-            {label: 'Testing', to: '/docs/testing-quality/overview'},
+            {label: 'Architecture & Patterns', to: '/docs/architecture-patterns/overview'},
+            {label: 'Testing & Quality', to: '/docs/testing-quality/overview'},
           ],
         },
         {
-          title: 'Advanced Topics',
+          title: 'Enterprise Engineering',
           items: [
+            {label: 'Gradle & Build Systems', to: '/docs/gradle-build/overview'},
+            {label: 'Modularization at Scale', to: '/docs/modularization/overview'},
+            {label: 'Security & Compliance', to: '/docs/security-compliance/overview'},
+            {label: 'CI/CD & DevOps', to: '/docs/cicd-devops/overview'},
+            {label: 'Observability', to: '/docs/observability/overview'},
+          ],
+        },
+        {
+          title: 'Projects & Career',
+          items: [
+            {label: 'Capstone Projects', to: '/docs/projects'},
+            {label: 'Enterprise UX', to: '/docs/enterprise-ux/overview'},
+            {label: 'Career & Interview', to: '/docs/career-interview/overview'},
             {label: 'Architecture Guide', to: '/docs/architecture/overview'},
             {label: 'Design Patterns', to: '/docs/patterns/design-patterns'},
-            {label: 'Performance', to: '/docs/performance/overview'},
-            {label: 'Trending Topics', to: '/docs/advanced-trending/overview'},
           ],
         },
         {

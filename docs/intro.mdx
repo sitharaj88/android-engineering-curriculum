@@ -1,76 +1,105 @@
 ---
 id: intro
-title: Welcome to the Android Development Guide
+title: Welcome to the Android Engineering Curriculum
 sidebar_position: 1
 slug: /intro
-description: Your complete roadmap from Kotlin fundamentals to publishing production Android apps on Google Play.
+description: The world-class enterprise-grade Android curriculum. 20 modules, 100+ topics, 5 capstone projects — from Kotlin fundamentals to principal engineer.
 ---
 
 import { Callout, FeatureGrid, StepList, LibraryGrid, ComparisonCard } from '@site/src/components/Doc';
 
 <div className="module-info">
-  <span><strong>Duration:</strong> 34 weeks</span>
-  <span><strong>Modules:</strong> 13</span>
-  <span><strong>Topics:</strong> 73+</span>
-  <span><strong>Content:</strong> 120 hours</span>
-  <span><strong>Difficulty:</strong> Beginner → Production-Ready</span>
+  <span><strong>Duration:</strong> 44 weeks</span>
+  <span><strong>Modules:</strong> 20</span>
+  <span><strong>Topics:</strong> 100+</span>
+  <span><strong>Content:</strong> 180+ hours</span>
+  <span><strong>Difficulty:</strong> Beginner → Principal Engineer</span>
 </div>
 
-# Android Development — Complete Guide
+# Android Engineering — The World-Class Curriculum
 
-This program is the **most comprehensive Android curriculum** you can follow as
-a self-learner, student, or working professional. It covers every layer of a
-production app — from the Kotlin language itself to publishing on Google Play —
-using the patterns, libraries, and tools that real engineering teams use today.
+This is the **most comprehensive, production-focused Android curriculum** on
+the internet. It covers every layer of a modern enterprise app — from the
+Kotlin language, through Compose and architecture, to the parts most
+curricula ignore: **Gradle at scale, modularization, security hardening,
+CI/CD pipelines, observability, enterprise UX, and career progression**.
 
-<Callout kind="tip" title="What makes this guide different">
-We don't stop at "how" — every concept is explained with the **why** behind it.
-You'll understand *why* `viewModelScope` is preferred over `GlobalScope`, *why*
-`StateFlow` replaced `LiveData`, *why* Compose recomposes the way it does, and
-*why* baseline profiles cut startup time by 40%. The reasoning is what makes
-you senior.
+<Callout kind="tip" title="Why this is different">
+Other courses stop at "how to build an app." This curriculum teaches you to
+**ship, scale, and operate** apps that serve millions of users. Every module
+is written with the patterns used at Google, Square, Airbnb, Meta, Cash
+App, and every serious Android engineering shop — not toy demos.
 </Callout>
 
 ## Why learn Android in 2026?
 
-Android runs on **3+ billion active devices** worldwide and remains the
-dominant mobile OS in every market except the US. With the rise of **Kotlin
-Multiplatform**, **Wear OS**, **Android TV**, **foldables**, and **AI-powered
-on-device experiences via ML Kit**, Android engineering is more relevant — and
-more rewarding — than ever.
+Android runs on **3+ billion active devices** worldwide. With the rise of
+**Kotlin Multiplatform**, **Compose Multiplatform**, **Wear OS**, **foldables**,
+**AI-powered on-device experiences**, and **Android XR**, Android engineering
+is more relevant — and more rewarding — than ever.
 
-Modern Android development is also **far more pleasant** than it used to be.
-Java is gone. XML layouts are giving way to declarative Compose. Coroutines
-make async code readable. Hilt removes DI boilerplate. The platform finally
-feels modern — and this guide teaches you that modern stack from the ground
-up.
+Modern Android is also **far more pleasant** than it used to be. Java is
+gone. XML layouts are giving way to declarative Compose. Coroutines make
+async code readable. Hilt removes DI boilerplate. Baseline profiles slash
+cold start by 40%. This curriculum teaches you that modern stack from the
+ground up — and the enterprise engineering around it.
 
 <FeatureGrid columns={3} features={[
-  { icon: '🎯', title: 'Production-Focused', description: 'Every example mirrors patterns used in shipping apps — not toy demos.' },
-  { icon: '🧠', title: 'Concept-First', description: 'You learn the model behind each tool so you can adapt when libraries change.' },
-  { icon: '🛠️', title: 'Hands-On Projects', description: '5 end-to-end apps reinforce architecture, networking, persistence, and publishing.' }
+  { icon: '🎯', title: 'Production-focused', description: 'Every example mirrors patterns used in shipping enterprise apps — not toy demos.' },
+  { icon: '🧠', title: 'Concept-first', description: 'You learn the model behind each tool so you can adapt when libraries change.' },
+  { icon: '🏢', title: 'Enterprise-ready', description: 'Gradle at scale, modularization, security, CI/CD, observability — the whole operations stack.' },
+  { icon: '🛠️', title: 'Hands-on projects', description: '5 end-to-end apps reinforce architecture, networking, persistence, and publishing.' },
+  { icon: '📈', title: 'Career-minded', description: 'Leveling, interview prep, system design, portfolio strategy, negotiation.' },
+  { icon: '🌍', title: 'World-class UX', description: 'Accessibility, i18n, large-screen, foldables, motion — build for everyone.' }
 ]} />
 
-## How this guide is organized
+## How the curriculum is organized
 
-The 13 modules are designed to be followed in order. Each builds on concepts
-introduced in the previous one:
+The 20 modules are grouped into five phases. Each builds on the previous.
 
 <StepList steps={[
-  { title: 'Module 01 — Kotlin Foundation', description: 'The language. Variables, OOP, null safety, collections, lambdas, scope functions, and coroutines basics.' },
-  { title: 'Module 02 — Android Fundamentals', description: 'Platform architecture, Activities, Intents, Fragments, ViewGroups — the runtime you target.' },
-  { title: 'Module 03 — Jetpack Compose', description: 'Declarative UI, state hoisting, Material 3, navigation, animations.' },
-  { title: 'Module 04 — Architecture & Patterns', description: 'MVVM, Clean Architecture, Repository pattern, Hilt DI, StateFlow.' },
-  { title: 'Module 05 — Data & Persistence', description: 'DataStore, Room, migrations, encrypted storage, caching.' },
-  { title: 'Module 06 — Networking & API', description: 'Retrofit, Moshi, OkHttp, coroutines on the network layer, Paging 3, image loading.' },
-  { title: 'Module 07 — Firebase & Cloud', description: 'Auth, Firestore, Cloud Storage, FCM, Analytics, Crashlytics, Remote Config.' },
-  { title: 'Module 08 — Advanced Components', description: 'Services, WorkManager, notifications, permissions, CameraX, sensors, biometrics, Glance.' },
-  { title: 'Module 09 — Testing & Quality', description: 'JUnit 5, MockK, Turbine, Espresso, Compose Testing, TDD, CI/CD.' },
-  { title: 'Module 10 — Performance', description: 'Memory profiling, LeakCanary, R8, baseline profiles, startup tracing.' },
-  { title: 'Module 11 — Publishing', description: 'Play Console, App Bundles, signing, in-app purchases, AdMob, ASO.' },
-  { title: 'Module 12 — Advanced & Trending', description: 'Kotlin Multiplatform, ML Kit, Wear OS, Android TV, BLE/IoT, accessibility, security.' },
-  { title: 'Module 13 — Version Control', description: 'Git fundamentals, branching, pull requests, code reviews, conventional commits.' }
+  { title: 'Phase 1 — Foundations (Modules 01-04)', description: 'Kotlin mastery, Android platform, Jetpack Compose, architecture & design patterns. The mental models underneath everything else.' },
+  { title: 'Phase 2 — Data & Services (Modules 05-08)', description: 'Room, DataStore, Retrofit, GraphQL, WebSocket, gRPC, Firebase, advanced components (services, WorkManager, CameraX, Glance).' },
+  { title: 'Phase 3 — Quality & Performance (Modules 09-13)', description: 'Testing pyramid, profiling, baseline profiles, R8, publishing, KMP, Wear OS, accessibility, Git workflows.' },
+  { title: 'Phase 4 — Enterprise Engineering (Modules 14-19)', description: 'Gradle at scale, modularization with 30+ modules, OWASP security, CI/CD pipelines, observability with SLOs, design systems at scale, i18n, foldables.' },
+  { title: 'Phase 5 — Career (Module 20)', description: 'Leveling expectations, system design interviews, Android question bank, portfolio strategy, negotiation.' }
 ]} />
+
+## The complete module map
+
+<div className="module-info" style={{flexDirection: 'column', alignItems: 'flex-start'}}>
+<table style={{width: '100%', borderCollapse: 'collapse', marginTop: '1rem'}}>
+<thead>
+<tr style={{borderBottom: '2px solid var(--ifm-color-emphasis-300)'}}>
+<th align="left" style={{padding: '0.5rem'}}>Phase</th>
+<th align="left" style={{padding: '0.5rem'}}>Module</th>
+<th align="left" style={{padding: '0.5rem'}}>Focus</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Foundations</td><td>01</td><td>Kotlin Foundation — language, coroutines, advanced patterns</td></tr>
+<tr><td>Foundations</td><td>02</td><td>Android Fundamentals — platform, Activities, Fragments, Views</td></tr>
+<tr><td>Foundations</td><td>03</td><td>Jetpack Compose — UI, performance, custom layouts & gestures</td></tr>
+<tr><td>Foundations</td><td>04</td><td>Architecture & Patterns — MVVM, MVI, offline-first, DI</td></tr>
+<tr><td>Data & Services</td><td>05</td><td>Data & Persistence — Room, DataStore, migrations, encryption</td></tr>
+<tr><td>Data & Services</td><td>06</td><td>Networking & API — REST, GraphQL, WebSocket, gRPC, SSE</td></tr>
+<tr><td>Data & Services</td><td>07</td><td>Firebase & Cloud — Auth, Firestore, FCM, Analytics, Remote Config</td></tr>
+<tr><td>Data & Services</td><td>08</td><td>Advanced Components — Services, WorkManager, CameraX, Glance</td></tr>
+<tr><td>Quality & Perf</td><td>09</td><td>Testing & Quality — JUnit, MockK, Turbine, Compose tests, CI</td></tr>
+<tr><td>Quality & Perf</td><td>10</td><td>Performance — LeakCanary, R8, baseline profiles, macrobenchmark</td></tr>
+<tr><td>Quality & Perf</td><td>11</td><td>Publishing — Play Console, App Bundles, IAP, AdMob, ASO</td></tr>
+<tr><td>Quality & Perf</td><td>12</td><td>Advanced & Trending — KMP, ML Kit, Wear OS, TV, BLE, IoT</td></tr>
+<tr><td>Quality & Perf</td><td>13</td><td>Version Control — Git, branching, PRs, conventional commits</td></tr>
+<tr><td>Enterprise</td><td>14</td><td>Gradle & Build Systems — convention plugins, version catalog, perf</td></tr>
+<tr><td>Enterprise</td><td>15</td><td>Modularization at Scale — 30+ modules, API/impl, dynamic delivery</td></tr>
+<tr><td>Enterprise</td><td>16</td><td>Security & Compliance — OWASP MASVS, cert pinning, Play Integrity</td></tr>
+<tr><td>Enterprise</td><td>17</td><td>CI/CD & DevOps — GitHub Actions, Fastlane, staged rollouts</td></tr>
+<tr><td>Enterprise</td><td>18</td><td>Observability — Crashlytics, Performance, distributed tracing, SLOs</td></tr>
+<tr><td>Enterprise</td><td>19</td><td>Enterprise UX — design systems, a11y, i18n, foldables, motion</td></tr>
+<tr><td>Career</td><td>20</td><td>Career & Interview — leveling, system design, portfolio, negotiation</td></tr>
+</tbody>
+</table>
+</div>
 
 ## The modern Android stack at a glance
 
@@ -84,21 +113,23 @@ introduced in the previous one:
       'XML layouts + findViewById / view binding',
       'AsyncTask, callbacks, RxJava chains',
       'Manual Dagger 2 with subcomponents',
-      'LiveData + DataBinding',
-      'AsyncTask + Loaders for background work'
+      'Copy-pasted Groovy build scripts',
+      'Monolithic single-module app',
+      'Ship-and-pray releases'
     ]
   }}
   right={{
-    label: 'Modern Android',
+    label: 'Modern enterprise Android',
     title: 'What we teach',
     variant: 'new',
     points: [
-      'Kotlin with first-class null safety',
+      'Kotlin 2.x with K2 compiler, first-class null safety',
       'Jetpack Compose (declarative, reactive)',
       'Coroutines + Flow for async',
       'Hilt for zero-boilerplate DI',
-      'StateFlow / SharedFlow for UI state',
-      'WorkManager + coroutines for background'
+      'Version catalogs + convention plugins (Kotlin DSL)',
+      'Modular architecture with enforced boundaries',
+      'Staged rollouts with automated halt on regression'
     ]
   }}
 />
@@ -108,51 +139,59 @@ introduced in the previous one:
 You don't need any Android experience. You **do** need:
 
 - **Basic programming knowledge** in any language (variables, loops, functions, conditionals)
-- A computer with **8 GB+ RAM** running Windows, macOS, or Linux
+- A computer with **16 GB+ RAM** running Windows, macOS, or Linux (Android Studio + emulator is heavy)
 - **Curiosity** and willingness to build real projects
 
-We install Android Studio together in Module 02. Bring your own machine and a
-willingness to break things — that's how you learn.
+We install Android Studio together in Module 02. Bring your own machine and
+a willingness to break things — that's how you learn.
 
 ## Projects you'll build
 
 By the end of this program you'll have shipped **five complete apps**, each
-designed to reinforce a different layer of the stack:
+designed to reinforce a different layer of the enterprise stack:
 
 <FeatureGrid columns={2} features={[
-  { icon: '🛒', title: 'E-Commerce App', description: 'Catalog, cart, payments, and order tracking — Compose, Hilt, Room, Retrofit.' },
-  { icon: '💬', title: 'Social Media App', description: 'Real-time chat with Firestore, push via FCM, media in Cloud Storage.' },
-  { icon: '🍔', title: 'Food Delivery App', description: 'Live tracking with Maps, Location services, WebSocket status updates.' },
-  { icon: '💪', title: 'Fitness Tracker', description: 'Sensors, Wear OS companion, Health Connect, DataStore persistence.' },
-  { icon: '📰', title: 'News Aggregator', description: 'Offline-first reading with Room, Paging 3, WorkManager, and Coil.' }
+  { icon: '🛒', title: 'E-Commerce App', description: 'Catalog, cart, payments, orders — Compose, Hilt, Room, Retrofit, MVI checkout.' },
+  { icon: '💬', title: 'Social Media App', description: 'Real-time chat with WebSocket + Firestore, push via FCM, media in Cloud Storage.' },
+  { icon: '🍔', title: 'Food Delivery App', description: 'Live tracking with Maps, foreground services, WebSocket status, separate courier app.' },
+  { icon: '💪', title: 'Fitness Tracker', description: 'Sensors, Wear OS companion, Health Connect, offline-first, KMP shared module.' },
+  { icon: '📰', title: 'News Aggregator', description: 'Offline-first reading with Room, Paging 3, WorkManager sync, Glance home widget.' }
 ]} />
 
-## How to use this guide
+## How to use this curriculum
 
 <Callout kind="info" title="Recommended pace">
-- **Self-learner**: 8–12 hours per week → finish in ~6 months.
-- **Student**: 4–6 hours per week → finish in ~9 months alongside coursework.
-- **Working professional**: 6–10 hours per week → finish in ~5 months.
+- **Self-learner**: 10–14 hours per week → finish in **~8 months**.
+- **Student**: 5–8 hours per week → finish in **~12 months** alongside coursework.
+- **Working professional**: 8–12 hours per week → finish in **~7 months**.
+- **Team bootcamp**: 40 hours per week → finish in **~12 weeks** with daily stand-ups.
 
-Don't rush. **Build the projects.** Reading the code is not the same as writing
-it.
+Don't rush. **Build the projects.** Reading the code is not the same as
+writing it. Ship at least three of the five projects to a real Play internal
+track.
 </Callout>
 
 ## What you'll be able to do at the end
 
-- Build production-ready Android apps with Kotlin and Jetpack Compose
-- Implement MVVM and Clean Architecture with Hilt and StateFlow
-- Integrate Firebase for auth, real-time data, push, and analytics
-- Write unit, integration, and UI tests with confidence
-- Profile and optimize app performance for low-end devices
-- Publish, sign, and monetize apps on Google Play
+- Build **production-ready Android apps** with Kotlin 2.x and Jetpack Compose
+- Design **modular, testable, maintainable architectures** with MVVM, MVI, and Clean Architecture
+- Integrate **Firebase, GraphQL, WebSocket, gRPC** for any backend shape
+- Write **unit, integration, UI, and macrobenchmark tests** with confidence
+- Profile and optimize apps to **< 1.5s cold start** on mid-tier devices
+- Harden apps for **OWASP MASVS L2** including Play Integrity and cert pinning
+- Ship with **staged rollouts, automated halt, and feature flags**
+- Operate apps with **SLOs, distributed tracing, and structured logs**
+- Build **accessible, internationalized, foldable-ready** UIs
+- **Interview and negotiate** at senior, staff, or principal levels
 
 ## Ready to start?
 
-Head over to **[Module 01 — Kotlin Foundation](/docs/kotlin-foundation/overview)**
-and let's begin.
-
-<Callout kind="success" title="Tip">
-Bookmark the **Architecture Guide** and **Design Patterns** sections in the
-sidebar — you'll come back to them often as you build the projects.
+<Callout kind="success" title="Your path">
+1. Start with **[Module 01 — Kotlin Foundation](/docs/kotlin-foundation/overview)** — the language is the bedrock.
+2. Pace yourself — depth beats speed.
+3. Build **at least two capstone projects** while working through the curriculum.
+4. Bookmark the **[Architecture Guide](/docs/architecture/overview)** and **[Design Patterns](/docs/patterns/design-patterns)** — you'll return to them constantly.
+5. When ready to interview, jump to **[Module 20 — Career & Interview Prep](/docs/career-interview/overview)**.
 </Callout>
+
+Head over to **[Module 01 — Kotlin Foundation](/docs/kotlin-foundation/overview)** and let's begin.

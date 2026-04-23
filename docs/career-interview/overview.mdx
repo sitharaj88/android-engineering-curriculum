@@ -1,0 +1,370 @@
+---
+id: overview
+title: Module 20 — Career & Interview Preparation
+sidebar_label: Overview
+description: Translate your skills into offers. Android system design, leveling expectations, interview question bank, portfolio strategy, resume review, and negotiation.
+---
+
+import { Callout, ComparisonCard, StepList, FeatureGrid, LibraryGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 20 of 20</span>
+  <span><strong>Duration:</strong> 1 week</span>
+  <span><strong>Topics:</strong> 5 · 10 subtopics</span>
+  <span><strong>Prerequisites:</strong> Substantive project experience</span>
+</div>
+
+# Career & Interview Preparation
+
+You've learned the craft. Now let's convert it into a job offer, a promotion,
+or a contract. This module distills what FAANG, unicorn, and enterprise
+Android hiring managers look for at each level — and the practice material
+you need to get there.
+
+<Callout kind="tip" title="Interviewing is a skill">
+Engineers reach senior levels by being good at the craft; they reach staff
+level by being good at **communicating** the craft. Most failed interviews
+aren't failures of knowledge — they're failures of structure, signal, and
+storytelling. This module fixes that.
+</Callout>
+
+## Topic 1 · Leveling — what each title means
+
+These are the industry expectations. Titles vary; signals don't.
+
+| Level            | Years | Scope                                           | What you should be able to do                                                                                 |
+|------------------|-------|-------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
+| **Junior (L3)**  | 0–2   | Task-level                                      | Ship features with guidance, write unit tests, read the codebase, understand the framework docs              |
+| **Mid (L4)**     | 2–4   | Feature-level                                   | Own a feature end-to-end, pick the right architecture, review PRs, debug production issues                   |
+| **Senior (L5)**  | 4–7   | System-level                                    | Design cross-cutting systems, mentor 1–3 juniors, lead tech discussions, own reliability of a large surface  |
+| **Staff (L6)**   | 7–12  | Org-level                                       | Set direction across multiple teams, resolve ambiguous tradeoffs, influence hiring and architecture         |
+| **Principal**    | 12+   | Company-level                                   | Define platform strategy, write influential RFCs, represent the company externally                           |
+
+### What separates senior from staff
+
+<ComparisonCard
+  left={{
+    label: 'Senior engineer',
+    title: 'Scope: team',
+    variant: 'old',
+    points: [
+      'Owns a feature or subsystem',
+      'Writes RFCs for their team',
+      'Mentors juniors on their team',
+      'Resolves technical disagreements within the team',
+      'Can be told what to build and builds it well'
+    ]
+  }}
+  right={{
+    label: 'Staff engineer',
+    title: 'Scope: org',
+    variant: 'new',
+    points: [
+      'Owns a cross-team platform or vertical',
+      'Writes RFCs that shape org-level direction',
+      'Mentors seniors across teams',
+      'Resolves ambiguous trade-offs between teams',
+      'Identifies what should be built and builds consensus'
+    ]
+  }}
+/>
+
+---
+
+## Topic 2 · The Android interview loop
+
+A typical senior Android loop has **four to six rounds**:
+
+<StepList steps={[
+  { title: 'Recruiter screen (30 min)', description: 'Motivation, current role, compensation expectations. Be specific: "I am exploring senior Android roles in fintech with emphasis on Compose and offline-first architecture."' },
+  { title: 'Technical phone screen (60 min)', description: 'Coding (DSA with Android flavor) + Android fundamentals trivia. Lean on Kotlin idioms, coroutines, and Compose mental model.' },
+  { title: 'Coding deep-dive (60 min)', description: 'Implement a non-trivial feature (rate-limited search with caching, custom LazyList, form validation state machine). Verbalize tradeoffs as you type.' },
+  { title: 'System design (60 min)', description: 'Design an Android system: offline chat, photo upload service, real-time dashboard. Cover UI, data, networking, concurrency, failure modes, observability.' },
+  { title: 'Behavioral (45 min)', description: 'STAR stories. Conflict, ambiguity, failure, leadership, cross-team influence. Prepare 8-10 stories mapped to common prompts.' },
+  { title: 'Bar raiser / cross-functional (45 min)', description: 'At AWS / Google / Meta a neutral senior interviewer evaluates signal across all rounds and probes weakness.' }
+]} />
+
+---
+
+## Topic 3 · Android system design — a framework
+
+System design is the highest-variance round. Use this **five-step framework**
+on every prompt:
+
+### 1. Scope (5 min)
+
+> "Design an offline-first chat app."
+
+Don't jump in. Scope first:
+
+- **Users**: 1-on-1? Group? Scale (thousands vs millions)?
+- **Devices**: Phone only? Tablet? Wear OS?
+- **Offline**: Send when offline? Read when offline? Conflict resolution?
+- **Privacy**: E2E encryption? Message retention?
+- **Platform constraints**: Battery budget, data cost in target markets
+- **Success metrics**: Send P99 < 1s, delivered P95 < 3s, crash-free ≥ 99.5%
+
+### 2. High-level architecture
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│  UI Layer (Compose)                                              │
+│    ChatScreen · MessageComposer · TypingIndicator · PresenceBadge│
+├──────────────────────────────────────────────────────────────────┤
+│  Presentation (MVVM + State holders)                             │
+│    ChatViewModel · MessageListState · ComposerState              │
+├──────────────────────────────────────────────────────────────────┤
+│  Domain (pure Kotlin)                                            │
+│    SendMessageUseCase · ObserveConversationUseCase · Mapper      │
+├──────────────────────────────────────────────────────────────────┤
+│  Data                                                             │
+│    MessageRepository (single source of truth: Room)              │
+│       ↓                ↓                          ↓               │
+│    Room DB        OutboxQueue                 WebSocketClient    │
+│                   (WorkManager)               (ktor/OkHttp)       │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 3. Data model & sync strategy
+
+```kotlin
+@Entity(tableName = "messages", indices = [Index("conversationId", "sentAt")])
+data class MessageEntity(
+    @PrimaryKey val id: String,                    // client-generated UUID
+    val conversationId: String,
+    val authorId: String,
+    val body: String,
+    val sentAt: Long,                              // client timestamp
+    val serverAt: Long?,                           // null until acked
+    val status: MessageStatus,                     // DRAFT, SENDING, SENT, DELIVERED, READ, FAILED
+    val attempts: Int = 0
+)
+
+enum class MessageStatus { DRAFT, SENDING, SENT, DELIVERED, READ, FAILED }
+```
+
+**Offline send flow**:
+
+```text
+User types → Room INSERT (status=SENDING, id=uuid)
+     ↓
+OutboxWorker picks up SENDING messages
+     ↓
+WebSocket.send(msg) → server replies { id, serverAt }
+     ↓
+Room UPDATE status=SENT, serverAt=?
+     ↓
+Server fans out → other device receives via WebSocket
+     ↓
+Ack back → status=DELIVERED / READ
+```
+
+### 4. Non-happy paths (this is where you earn the hire)
+
+- Process dies mid-send → OutboxWorker retries on next start (WorkManager constraints)
+- WebSocket disconnects → exponential backoff + resume cursor (last event id)
+- Conflicting message IDs → server ignores duplicates via idempotency key
+- Deleted message while offline → tombstone event, apply on sync
+- Schema migration → Room migration + server-side versioning
+- Battery-constrained devices → debounce typing indicator, coalesce read receipts
+
+### 5. Observability & rollout
+
+- SLIs: send success rate, send P95 latency, ack P95 latency
+- Crashlytics with custom keys: conversation_id, message_status
+- Feature flag: `chat_v2_enabled` for gradual rollout
+- Backend contract in protobuf + BC tests
+
+<Callout kind="tip" title="The staff signal">
+Juniors design the happy path. Seniors design the data model. Staff engineers
+spend half the interview on **failure modes, rollouts, and observability**.
+Show that mindset from minute 15 onward.
+</Callout>
+
+---
+
+## Topic 4 · Interview question bank
+
+### Kotlin & coroutines (expect 4–6 questions)
+
+1. Explain the difference between `launch`, `async`, and `withContext`.
+2. What is structured concurrency and why does it matter?
+3. What happens if a parent coroutine is cancelled but the child is mid-`await()`?
+4. Difference between `Flow` and `Channel`? When would you pick each?
+5. Cold vs hot flow; give concrete examples of each.
+6. `StateFlow.value = x` vs `MutableStateFlow.update { }` — when does it matter?
+7. What does `SharingStarted.WhileSubscribed(5_000)` guarantee?
+8. How does `viewModelScope` know when to cancel?
+9. Why prefer `suspend fun` returning `T` over `Flow<T>` for one-shot calls?
+10. How does `runBlocking` interact with a `TestDispatcher`?
+
+### Compose (expect 4–6 questions)
+
+1. What triggers recomposition? What skips it? (stability, `@Stable`, `@Immutable`)
+2. Why must a `@Composable` not have side effects in its body?
+3. `remember` vs `rememberSaveable` vs `SavedStateHandle` — pick one per scenario.
+4. How does `LazyColumn` decide which items to keep vs recycle?
+5. Modifier order: what happens if `.background()` comes before `.padding()`?
+6. `LaunchedEffect` vs `DisposableEffect` vs `SideEffect`. When each?
+7. How would you diagnose a composable that recomposes 60 times per frame?
+8. Explain the difference between `derivedStateOf` and `remember { ... }`.
+9. How does Compose handle configuration changes without losing state?
+10. What's the role of the Compose compiler vs the runtime?
+
+### Architecture (expect 3–5 questions)
+
+1. When would you use Clean Architecture vs simple MVVM?
+2. How do you handle one-shot events (navigation, toast) without replaying on rotation?
+3. Walk me through how a request flows from UI → API → back to UI in your architecture.
+4. How do you test a ViewModel that calls three suspend functions in sequence?
+5. Offline-first data: where is the source of truth? How do you reconcile conflicts?
+6. When would you modularize? What's the cost?
+7. Hilt vs Dagger vs Koin — pick one and defend it.
+8. How do you handle error propagation across layers without leaking `Throwable` to the UI?
+
+### System & platform (expect 3–5 questions)
+
+1. Cold start vs warm start vs hot start — what happens in each?
+2. How does WorkManager pick when to run a job?
+3. Explain the Android process model and the OOM killer's priorities.
+4. How does the main thread differ from a Dispatchers.Main thread?
+5. Deep linking vs App Links — what's the verification step?
+6. How does ProGuard/R8 decide what to strip?
+7. What is a baseline profile and how much does it help?
+
+### DSA with Android flavor (expect 1–2 questions)
+
+Don't practice Leetcode in isolation. Practice **Leetcode with an Android lens**:
+
+- Rate-limited search as debounce in a Flow
+- LRU cache (backing a Glide/Coil disk cache)
+- BFS on a view tree (custom layout measurement)
+- Topological sort (WorkManager dependency graph)
+- Merge-intervals (calendar event overlap detection)
+- Producer/consumer (ANR analysis: what's blocking the main thread?)
+
+---
+
+## Topic 5 · Portfolio, resume, and negotiation
+
+### Portfolio
+
+For Android roles, a **GitHub profile with 2-3 polished apps beats any
+side-project list**.
+
+Polished means:
+
+- **README with screenshots, GIFs, architecture diagram**
+- CI badge showing tests passing
+- A short "decisions" section: why Compose, why Hilt, why this pattern
+- Commits that tell a story — not one "initial commit"
+- Releases tagged, with Play Store link if applicable
+
+Pick ideas where you can show breadth: an **offline-first note app**, a
+**live dashboard**, or a **platform feature** (custom keyboard, Tile, Glance
+widget).
+
+### Resume
+
+- Two columns, one page (two if 10+ yr experience)
+- Above the fold: name, title, tagline, one killer bullet
+- Each role: **impact-first bullets** with numbers
+- Not "worked on app" — "Reduced cold start from 2.4s to 1.1s (P95) by
+  introducing baseline profiles and deferring init to App Startup."
+- **Skills section** with two tiers: "Strong" and "Familiar" — honesty wins
+- Keywords matter (ATS screens on keywords), but don't stuff
+
+### Negotiation
+
+Rough heuristics for fresh offers (2025+, India-adjusted for city, US-adjusted for tier):
+
+| Level        | India (LPA, cash+RSU/4) | US / FAANG (USD total comp)  |
+|--------------|------------------------|------------------------------|
+| Junior (L3)  | ₹18–30 LPA             | $180k–$240k                  |
+| Mid (L4)     | ₹30–55 LPA             | $250k–$380k                  |
+| Senior (L5)  | ₹55–95 LPA             | $380k–$600k                  |
+| Staff (L6)   | ₹95 LPA – ₹1.8 Cr      | $600k–$1M+                   |
+
+The four negotiation moves:
+
+1. **Never give a number first.** Ask for their range. If forced, say "I'm
+   targeting competitive L5 in this geo — happy to align once I see the
+   components."
+2. **Compete offers, don't bluff.** If you have another offer, share it
+   (redacted). If you don't, don't claim to.
+3. **Ask for each component separately**: base, sign-on, RSUs, refreshers,
+   target bonus. Leveling is separate from money.
+4. **Take a pause.** "I'd like to discuss with my family/partner and come
+   back tomorrow." Every 24 hours buys you leverage.
+
+---
+
+## STAR story kit
+
+Build 8-10 stories in advance. Each story answers one of these prompts:
+
+- Tell me about a technical disagreement and how you resolved it
+- Tell me about a time you missed a deadline
+- Tell me about a bug that affected production and how you handled it
+- Tell me about a time you mentored someone
+- Tell me about a system you designed that scaled/failed
+- Tell me about a time you pushed back on a PM/designer/leader
+- Tell me about the most complex thing you built
+- Tell me about a time you changed your mind
+
+**STAR format**:
+
+> **Situation**: I was leading the Android team at X. We were 3 weeks from a
+> major release, crash-free was 99.1% but we needed 99.5% for the launch
+> criteria.
+>
+> **Task**: I owned crash-free and had to make the call on whether to delay
+> the release or ship with risk.
+>
+> **Action**: I triaged the top crashes in Crashlytics, clustered them by
+> root cause, and discovered 62% came from one place: Fragment reattachment
+> on config change. Built the fix + regression test in 4 days, deployed to
+> staging, verified with Firebase App Distribution and our QA pool.
+>
+> **Result**: Shipped on schedule. Crash-free rate went to 99.72% in week 1.
+> More importantly, I added ApplicationExitInfo tracking so we'd catch the
+> next family of issues before users noticed.
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Interview mindset">
+- **Understand the level** you're targeting — signals, not years.
+- System design: scope → architecture → data → non-happy paths → observability.
+- **Coroutines + Compose + architecture + failure modes** are the four pillars.
+- Portfolio beats resume. 2-3 polished apps with READMEs beat 20 half-built repos.
+- Negotiate by components, not totals. Take 24 hours before signing.
+- **8-10 STAR stories** prepared in advance — 80% of behavioral is preparation.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Mock system design', description: 'Spend 60 minutes designing an offline-first photo-sharing app end-to-end. Write it up as a one-pager with architecture diagram, data model, failure modes, and observability.' },
+  { title: 'Answer 30 questions', description: 'Pick 30 questions from the bank above. Record 2-minute video answers. Rewatch — you\'ll spot filler words, imprecise language, and missing signal.' },
+  { title: 'Portfolio README', description: 'Pick one of your projects and write a world-class README: screenshots, GIFs, architecture diagram, decisions section, test badge, Play Store link.' },
+  { title: 'STAR story kit', description: 'Write out 8 STAR stories in a private doc. Practice each twice, aloud, with a timer. Cut anything over 3 minutes.' },
+  { title: 'Negotiation rehearsal', description: 'Role-play a compensation conversation with a friend. Practice the four moves: never first, compete only with real offers, ask per component, pause 24 hours.' }
+]} />
+
+## Graduation
+
+You've completed 20 modules spanning Kotlin fundamentals, Compose, architecture,
+enterprise-grade tooling, security, CI/CD, observability, UX, and career. You
+are ready to ship, lead, and interview at any Android shop.
+
+<Callout kind="tip" title="What comes next">
+- **Ship one public app**. Nothing crystallizes learning like production users.
+- **Contribute to an open-source Android project**. Jetpack, Coil, Okhttp, and Firebase all accept PRs.
+- **Write**. A blog post per quarter compounds into authority faster than any certification.
+- **Speak**. Meetups, conferences, internal talks — interviewing skills and career mobility both grow.
+
+The Android platform moves fast. Your mental model is now the one that
+adapts. Good luck, and go ship.
+</Callout>

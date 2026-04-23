@@ -1,0 +1,357 @@
+---
+id: overview
+title: Module 18 — Observability & Monitoring
+sidebar_label: Overview
+description: See what your app does in production. Crashlytics, Firebase Performance, custom tracing, structured logging, distributed tracing, SLOs, and alerting.
+---
+
+import { Callout, ComparisonCard, StepList, FeatureGrid, LibraryGrid, Diagram, NetworkingDiagram } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 18 of 20</span>
+  <span><strong>Duration:</strong> 2 weeks</span>
+  <span><strong>Topics:</strong> 5 · 10 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 07, 10, 17</span>
+</div>
+
+# Observability & Monitoring
+
+You don't know how your app behaves until you watch it run on devices that
+aren't yours. This module teaches you the three pillars of observability —
+**logs, metrics, traces** — and shows you how to translate them into
+actionable signal: crash-free rate, ANR rate, P95 screen load, cold start
+distribution, and business KPIs that leadership cares about.
+
+<Callout kind="tip" title="The difference between monitoring and observability">
+**Monitoring** tells you *what* is broken (crashes spiked). **Observability**
+tells you *why* (crash fingerprint X started after release Y on Android 14
+Pixels with Bengali locale). Invest in the "why" layer — it's what turns a
+2-hour incident into a 10-minute one.
+</Callout>
+
+## Topic 1 · Crash & ANR reporting
+
+Firebase Crashlytics is the de-facto standard. Rules for making crash reports
+actionable:
+
+```kotlin
+class CrashlyticsTree @Inject constructor() : Timber.Tree() {
+    override fun log(priority: Int, tag: String?, message: String, t: Throwable?) {
+        if (priority < Log.WARN) return
+        Firebase.crashlytics.log("[$tag] $message")
+        t?.let { Firebase.crashlytics.recordException(it) }
+    }
+}
+
+class CrashlyticsBootstrap @Inject constructor(
+    private val authRepo: AuthRepository,
+    private val deviceInfo: DeviceInfo
+) {
+    fun install() {
+        Firebase.crashlytics.apply {
+            setCrashlyticsCollectionEnabled(!BuildConfig.DEBUG)
+            setCustomKey("app.flavor", BuildConfig.FLAVOR)
+            setCustomKey("device.abi", deviceInfo.abi)
+            setCustomKey("device.model", Build.MODEL)
+            setCustomKey("device.api", Build.VERSION.SDK_INT)
+            setCustomKey("locale", Locale.getDefault().toLanguageTag())
+        }
+
+        // Update user ID when the user signs in/out
+        authRepo.userFlow.onEach { user ->
+            Firebase.crashlytics.setUserId(user?.id ?: "")
+        }.launchIn(GlobalScope)
+    }
+}
+```
+
+### The three non-negotiable custom keys
+
+| Key                | Why it matters                                                    |
+|--------------------|-------------------------------------------------------------------|
+| `user.id`          | Lets you reach out to affected users or reproduce on their data  |
+| `app.flavor/build` | Separate staging noise from production signal                    |
+| `last.screen`      | Added in a navigation observer — turns a stack trace into a story|
+
+```kotlin
+// Track the last screen every time the user navigates
+navController.addOnDestinationChangedListener { _, destination, _ ->
+    Firebase.crashlytics.setCustomKey("last.screen", destination.route ?: "unknown")
+}
+```
+
+### ANR tracking
+
+Crashlytics catches ANRs automatically on modern versions. Pair with
+**ApplicationExitInfo** for richer diagnostics on Android 11+:
+
+```kotlin
+class AnrReporter @Inject constructor(
+    @ApplicationContext context: Context,
+    private val crashlytics: FirebaseCrashlytics
+) {
+    fun reportPreviousAnrs() {
+        val am = context.getSystemService(ActivityManager::class.java)
+        val reasons = am.getHistoricalProcessExitReasons(null, 0, 20)
+        reasons.filter { it.reason == ApplicationExitInfo.REASON_ANR }
+            .forEach { info ->
+                crashlytics.log("ANR ${info.timestamp} status=${info.status} desc=${info.description}")
+                info.traceInputStream?.let { crashlytics.recordException(AnrException(it.readBytes().toString(Charsets.UTF_8))) }
+            }
+    }
+}
+```
+
+---
+
+## Topic 2 · Performance monitoring
+
+### Firebase Performance automatic traces
+
+Firebase Performance auto-traces app start (cold/warm/hot), screen rendering,
+and HTTP requests. You get the P50/P75/P90/P95/P99 distribution for free.
+
+### Custom traces for business flows
+
+Auto traces tell you "HTTP to /checkout took 800 ms P95." Custom traces tell
+you "end-to-end cart → payment → confirmation took 4.2 s P95," which is what
+the PM actually cares about.
+
+```kotlin
+class CheckoutTracer @Inject constructor() {
+    suspend fun <T> traceCheckout(block: suspend () -> T): T {
+        val trace = Firebase.performance.newTrace("checkout_flow")
+        trace.start()
+        return try {
+            block().also { trace.putMetric("items_sold", /* ... */) }
+        } finally {
+            trace.stop()
+        }
+    }
+}
+
+viewModelScope.launch {
+    tracer.traceCheckout {
+        val cart = repo.currentCart()
+        val payment = payments.charge(cart.total)
+        orders.create(cart, payment)
+    }
+}
+```
+
+---
+
+## Topic 3 · Structured logging
+
+Logs are only useful if you can search them. Use **structured logs** (JSON)
+with a stable schema — this turns a firehose into a queryable table:
+
+```kotlin
+data class LogEvent(
+    val timestamp: Long = System.currentTimeMillis(),
+    val level: String,
+    val tag: String,
+    val message: String,
+    val userId: String? = null,
+    val sessionId: String,
+    val screen: String? = null,
+    val requestId: String? = null,
+    val extra: Map<String, Any?> = emptyMap()
+)
+
+class StructuredLoggingTree @Inject constructor(
+    private val shipper: LogShipper,         // ships to backend / Datadog / Elastic
+    private val session: SessionProvider
+) : Timber.Tree() {
+
+    override fun log(priority: Int, tag: String?, message: String, t: Throwable?) {
+        if (priority < Log.INFO) return
+        val event = LogEvent(
+            level = when (priority) {
+                Log.ERROR -> "ERROR"
+                Log.WARN  -> "WARN"
+                Log.INFO  -> "INFO"
+                else      -> "DEBUG"
+            },
+            tag = tag ?: "app",
+            message = message,
+            userId = session.userId(),
+            sessionId = session.sessionId(),
+            screen = session.currentScreen(),
+            extra = t?.let { mapOf("stacktrace" to it.stackTraceToString()) } ?: emptyMap()
+        )
+        shipper.enqueue(event)
+    }
+}
+```
+
+### Redacting PII
+
+Logging is the single biggest source of PII leaks into logs-retention
+systems. Redact at the source, not at the backend:
+
+```kotlin
+private val EMAIL_REGEX = Regex("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}")
+private val PHONE_REGEX = Regex("\\+?\\d[\\d ()-]{7,}")
+
+fun String.redactPii(): String = this
+    .replace(EMAIL_REGEX, "[email]")
+    .replace(PHONE_REGEX, "[phone]")
+```
+
+---
+
+## Topic 4 · Distributed tracing
+
+Modern Android apps make 10–40 HTTP calls per screen. A slow checkout could
+be the client, the API gateway, the payments service, or the database. You
+don't know without **distributed tracing**.
+
+<Diagram title="Distributed trace propagation" caption="The trace-id follows the request from client through every backend service.">
+  <NetworkingDiagram />
+</Diagram>
+
+### W3C Trace Context propagation with OkHttp
+
+```kotlin
+class TracingInterceptor @Inject constructor(
+    private val tracer: Tracer   // io.opentelemetry.api.trace.Tracer
+) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val req = chain.request()
+        val span = tracer.spanBuilder("http ${req.method} ${req.url.encodedPath}")
+            .setSpanKind(SpanKind.CLIENT)
+            .setAttribute("http.method", req.method)
+            .setAttribute("http.url", req.url.toString())
+            .startSpan()
+
+        return try {
+            span.makeCurrent().use {
+                val traced = req.newBuilder()
+                    .header("traceparent", span.spanContext.toTraceParent())
+                    .build()
+                val response = chain.proceed(traced)
+                span.setAttribute("http.status_code", response.code.toLong())
+                if (response.code >= 400) span.setStatus(StatusCode.ERROR)
+                response
+            }
+        } catch (t: Throwable) {
+            span.recordException(t); span.setStatus(StatusCode.ERROR); throw t
+        } finally {
+            span.end()
+        }
+    }
+}
+
+fun SpanContext.toTraceParent(): String =
+    "00-${traceId}-${spanId}-${if (traceFlags.isSampled) "01" else "00"}"
+```
+
+Ship spans to **Grafana Tempo**, **Honeycomb**, **Datadog APM**, or **AWS
+X-Ray**. When checkout is slow, you can drill from client span → API gateway
+span → payments service span → DB query span in one click.
+
+---
+
+## Topic 5 · SLOs, SLIs, and alerting
+
+Set **Service Level Objectives** for the user experience and alert when
+you're burning the error budget:
+
+| SLI (signal)                        | SLO target    | Budget per 30 d (1 M sessions)  |
+|-------------------------------------|---------------|---------------------------------|
+| Crash-free sessions                | ≥ 99.5%       | 5,000 crashes                   |
+| ANR-free sessions                  | ≥ 99.8%       | 2,000 ANRs                      |
+| Cold start P95                      | < 2,000 ms    | 50,000 slow starts              |
+| Checkout success rate               | ≥ 99.0%       | 10,000 failed checkouts         |
+| Screen load P75 (critical screens)  | < 1,200 ms    | 250,000 slow loads              |
+
+### Alerting in production
+
+```yaml
+# Grafana / Cloud Monitoring alerting policy (pseudo-YAML)
+- name: crash_free_regression
+  condition: |
+    avg_over_time(crash_free_sessions{app="prod"}[1h]) < 0.995
+    for: 15m
+  action:
+    - pager: oncall-android
+    - slack: '#android-incidents'
+    - auto_halt_rollout: true
+
+- name: anr_spike
+  condition: |
+    rate(anr_events{app="prod"}[15m]) > 3 * baseline_1w
+    for: 10m
+  action:
+    - slack: '#android-incidents'
+
+- name: checkout_success_drop
+  condition: |
+    sum(rate(checkout_success[5m])) / sum(rate(checkout_attempt[5m])) < 0.98
+    for: 10m
+  action:
+    - pager: oncall-payments
+    - slack: '#checkout-team'
+```
+
+**Alert fatigue kills teams.** Every alert should be:
+
+- Actionable (there's a runbook)
+- Ownable (a named team, not "mobile")
+- Breaking something real (tied to an SLO, not a metric anomaly)
+
+---
+
+## The observability stack
+
+<LibraryGrid libraries={[
+  { name: 'Firebase Crashlytics', tagline: 'Crash + ANR reporting', description: 'Default choice. Free for unlimited events. Issue grouping, Slack integration, velocity alerts.', url: 'https://firebase.google.com/docs/crashlytics' },
+  { name: 'Firebase Performance', tagline: 'Auto traces', description: 'App start, screen render, HTTP traces out of the box. Free for most teams.', url: 'https://firebase.google.com/docs/perf-mon' },
+  { name: 'Sentry', tagline: 'Crash + APM + replays', description: 'Commercial alternative with source-maps, session replay, and distributed tracing in one tool.', url: 'https://sentry.io/for/android/' },
+  { name: 'Datadog RUM + APM', tagline: 'End-to-end observability', description: 'Real user monitoring + backend APM + logs in one pane. Expensive but powerful for enterprise.', url: 'https://docs.datadoghq.com/real_user_monitoring/android/' },
+  { name: 'OpenTelemetry Android', tagline: 'Vendor-neutral tracing', description: 'SDK for traces and metrics that shipouts to any OTLP backend. Avoid vendor lock-in.', url: 'https://opentelemetry.io/docs/instrumentation/java/automatic/android/' },
+  { name: 'Timber', tagline: 'Logging abstraction', description: 'Swap log backends without touching call sites. Pair with custom Trees for Crashlytics + shipping.', url: 'https://github.com/JakeWharton/timber' }
+]} />
+
+---
+
+## Privacy-preserving telemetry
+
+Observability cannot become surveillance. Apply:
+
+- **Purpose limitation** — collect only what you act on. No "just in case" data.
+- **Sampling** — send 10% of spans, not 100%. You get signal without cost.
+- **Aggregation, not identification** — for UX metrics, user IDs are
+  unnecessary. Use randomized install IDs that reset on uninstall.
+- **Retention windows** — logs 30 days, traces 7 days, crashes 90 days.
+  Automate deletion; don't rely on policy.
+- **Opt-out controls** — every analytics SDK needs a user-visible toggle.
+  GDPR requires it; users notice it.
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="The observable app">
+- **Crashlytics** with user ID, flavor, last screen, locale — minimum viable crash context.
+- **Custom traces** around business flows, not just HTTP calls.
+- **Structured logs** with PII redaction at the source, shipped to a searchable backend.
+- **Distributed tracing** with W3C Trace Context — one trace across all services.
+- **SLOs + error budgets** drive alerting; never alert on raw metrics.
+- Observability is a product feature — design it in, don't bolt it on.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Crashlytics bootstrap', description: 'Add a CrashlyticsBootstrap class that sets user ID, flavor, and updates last.screen on every navigation event.' },
+  { title: 'Custom Performance trace', description: 'Wrap your checkout flow in a Firebase Performance custom trace with item-count and order-total metrics.' },
+  { title: 'Structured logging tree', description: 'Implement a StructuredLoggingTree that ships JSON logs to a backend endpoint, with PII redaction.' },
+  { title: 'OpenTelemetry integration', description: 'Add an OkHttp TracingInterceptor that propagates traceparent headers. Verify the trace appears in Honeycomb or Tempo.' },
+  { title: 'SLO definition', description: 'Write down three SLOs for your app (crash-free, cold start, business flow). Compute the monthly error budget for each.' }
+]} />
+
+## Next module
+
+Continue to **[Module 19 — Enterprise UX](/docs/enterprise-ux/overview)** — design systems, accessibility, internationalization, and large-screen / foldable support at scale.

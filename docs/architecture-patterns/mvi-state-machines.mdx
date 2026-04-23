@@ -1,0 +1,301 @@
+---
+id: mvi-state-machines
+title: MVI & State Machines
+sidebar_label: MVI & State Machines
+description: Unidirectional data flow, intent → reducer → state, modeling screens as state machines, side effects, and when to prefer MVI over MVVM.
+---
+
+import { Callout, ComparisonCard, StepList, Diagram, ReduxFlowDiagram } from '@site/src/components/Doc';
+
+# MVI & State Machines
+
+MVVM works. But MVVM with a single `StateFlow<UiState>` *is* MVI once you
+squint. This chapter formalizes the pattern: every screen is a
+**state machine** whose transitions are triggered by **intents** and whose
+output is a **single immutable state**. This framing catches bugs MVVM hides.
+
+<Callout kind="tip" title="Why MVI">
+Three things MVI buys you: (1) **replay** — every screen state is reproducible
+from a log of intents; (2) **testability** — reducers are pure functions;
+(3) **time-travel** debugging — inspect past states during QA. The cost is
+boilerplate. Use MVI where the state space is complex (checkout, chat,
+editors); keep MVVM simple for CRUD screens.
+</Callout>
+
+## The core loop
+
+<Diagram title="MVI flow" caption="User intents flow up; state flows down. Side effects are isolated.">
+  <ReduxFlowDiagram />
+</Diagram>
+
+```text
+ ┌──────────┐  intent  ┌────────┐  state  ┌──────────┐
+ │   View   │ ───────→ │ Reducer│ ──────→ │   View   │
+ └──────────┘          │ (pure) │          └──────────┘
+       ▲               └────┬───┘
+       │ side effect        │
+       │ (navigation, toast)│
+       └────────────────────┘
+```
+
+## Modeling a screen
+
+Start by drawing the state diagram. A checkout screen:
+
+```text
+┌─────────┐  LoadCart   ┌──────────┐ Submit  ┌───────────┐ OK ┌───────────┐
+│ Initial │ ──────────→ │   Ready  │ ──────→ │ Submitting│ ──→│ Confirmed │
+└─────────┘             └────┬─────┘          └────┬──────┘    └───────────┘
+                             │                     │ Error
+                             │                     ▼
+                             │              ┌───────────┐ Retry ─▶ Submitting
+                             │              │  Failed   │
+                             │              └───────────┘
+                             ▼
+                        ┌──────────┐
+                        │  Empty   │
+                        └──────────┘
+```
+
+Every arrow is an intent. Every box is a state. A user can never reach a
+state you didn't draw — which means they can never reach a bug you didn't
+anticipate.
+
+## Encoding in Kotlin
+
+```kotlin
+// State — an immutable, exhaustive sealed hierarchy
+sealed interface CheckoutState {
+    data object Initial : CheckoutState
+    data class Ready(val cart: Cart, val total: Cents) : CheckoutState
+    data object Empty : CheckoutState
+    data class Submitting(val cart: Cart) : CheckoutState
+    data class Failed(val cart: Cart, val error: PaymentError) : CheckoutState
+    data class Confirmed(val orderId: OrderId) : CheckoutState
+}
+
+// Intents — what the view can ask for
+sealed interface CheckoutIntent {
+    data object LoadCart : CheckoutIntent
+    data object Submit : CheckoutIntent
+    data object Retry : CheckoutIntent
+    data class UpdateQuantity(val itemId: String, val qty: Int) : CheckoutIntent
+}
+
+// Side effects — one-shot, not state
+sealed interface CheckoutEffect {
+    data class NavigateToConfirmation(val orderId: OrderId) : CheckoutEffect
+    data class ShowToast(val message: String) : CheckoutEffect
+}
+```
+
+## The reducer — pure function
+
+```kotlin
+class CheckoutReducer @Inject constructor(
+    private val cartRepo: CartRepository,
+    private val paymentsRepo: PaymentsRepository
+) {
+    suspend fun reduce(state: CheckoutState, intent: CheckoutIntent): Pair<CheckoutState, List<CheckoutEffect>> =
+        when (state) {
+            is CheckoutState.Initial -> handleInitial(intent)
+            is CheckoutState.Ready -> handleReady(state, intent)
+            is CheckoutState.Empty -> handleEmpty(intent)
+            is CheckoutState.Submitting -> handleSubmitting(state, intent)
+            is CheckoutState.Failed -> handleFailed(state, intent)
+            is CheckoutState.Confirmed -> state to emptyList()  // terminal
+        }
+
+    private suspend fun handleInitial(intent: CheckoutIntent): Pair<CheckoutState, List<CheckoutEffect>> =
+        when (intent) {
+            CheckoutIntent.LoadCart -> {
+                val cart = cartRepo.current()
+                if (cart.items.isEmpty()) CheckoutState.Empty to emptyList()
+                else CheckoutState.Ready(cart, cart.total()) to emptyList()
+            }
+            else -> CheckoutState.Initial to emptyList()   // ignore invalid intents
+        }
+
+    private suspend fun handleReady(s: CheckoutState.Ready, i: CheckoutIntent) = when (i) {
+        CheckoutIntent.Submit -> CheckoutState.Submitting(s.cart) to emptyList()
+        is CheckoutIntent.UpdateQuantity -> {
+            val updated = cartRepo.setQuantity(i.itemId, i.qty)
+            CheckoutState.Ready(updated, updated.total()) to emptyList()
+        }
+        else -> s to emptyList()
+    }
+
+    private suspend fun handleSubmitting(s: CheckoutState.Submitting, i: CheckoutIntent) =
+        // Submit has no user intents — handled by the side-effect runner
+        s to emptyList()
+
+    private suspend fun handleFailed(s: CheckoutState.Failed, i: CheckoutIntent) = when (i) {
+        CheckoutIntent.Retry -> CheckoutState.Submitting(s.cart) to emptyList()
+        else -> s to emptyList()
+    }
+}
+```
+
+## The ViewModel glue
+
+```kotlin
+@HiltViewModel
+class CheckoutViewModel @Inject constructor(
+    private val reducer: CheckoutReducer,
+    private val paymentsRepo: PaymentsRepository
+) : ViewModel() {
+
+    private val _state = MutableStateFlow<CheckoutState>(CheckoutState.Initial)
+    val state: StateFlow<CheckoutState> = _state.asStateFlow()
+
+    private val _effects = Channel<CheckoutEffect>(Channel.BUFFERED)
+    val effects: Flow<CheckoutEffect> = _effects.receiveAsFlow()
+
+    private val intents = Channel<CheckoutIntent>(Channel.UNLIMITED)
+
+    init {
+        viewModelScope.launch {
+            for (intent in intents) {
+                val (next, effects) = reducer.reduce(_state.value, intent)
+                _state.value = next
+                effects.forEach { _effects.send(it) }
+
+                // Start async side-effect for Submitting
+                if (next is CheckoutState.Submitting) launch { submit(next.cart) }
+            }
+        }
+        send(CheckoutIntent.LoadCart)
+    }
+
+    fun send(intent: CheckoutIntent) { intents.trySend(intent) }
+
+    private suspend fun submit(cart: Cart) {
+        runCatching { paymentsRepo.charge(cart) }
+            .onSuccess { order ->
+                _state.value = CheckoutState.Confirmed(order.id)
+                _effects.send(CheckoutEffect.NavigateToConfirmation(order.id))
+            }
+            .onFailure { e ->
+                _state.value = CheckoutState.Failed(cart, e.toPaymentError())
+            }
+    }
+}
+```
+
+## The View
+
+```kotlin
+@Composable
+fun CheckoutScreen(viewModel: CheckoutViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val navController = LocalNavController.current
+
+    LaunchedEffect(viewModel) {
+        viewModel.effects.collect { effect ->
+            when (effect) {
+                is CheckoutEffect.NavigateToConfirmation -> navController.navigate(Confirmation(effect.orderId))
+                is CheckoutEffect.ShowToast -> SnackbarHostState.showSnackbar(effect.message)
+            }
+        }
+    }
+
+    when (val s = state) {
+        is CheckoutState.Initial -> LoadingView()
+        is CheckoutState.Empty -> EmptyCartView(onShop = { navController.navigate(Catalog) })
+        is CheckoutState.Ready -> ReadyView(
+            cart = s.cart,
+            total = s.total,
+            onQuantityChange = { id, qty -> viewModel.send(CheckoutIntent.UpdateQuantity(id, qty)) },
+            onSubmit = { viewModel.send(CheckoutIntent.Submit) }
+        )
+        is CheckoutState.Submitting -> SubmittingView()
+        is CheckoutState.Failed -> FailedView(error = s.error, onRetry = { viewModel.send(CheckoutIntent.Retry) })
+        is CheckoutState.Confirmed -> ConfirmedView(orderId = s.orderId)
+    }
+}
+```
+
+## Testing MVI — pure reducer tests
+
+Because the reducer is a pure function, tests are trivial:
+
+```kotlin
+class CheckoutReducerTest {
+    private val cartRepo = mockk<CartRepository>()
+    private val reducer = CheckoutReducer(cartRepo, mockk())
+
+    @Test fun `Initial + LoadCart with items -> Ready`() = runTest {
+        coEvery { cartRepo.current() } returns sampleCart()
+        val (next, effects) = reducer.reduce(CheckoutState.Initial, CheckoutIntent.LoadCart)
+        assertIs<CheckoutState.Ready>(next)
+        assertTrue(effects.isEmpty())
+    }
+
+    @Test fun `Initial + LoadCart with empty cart -> Empty`() = runTest {
+        coEvery { cartRepo.current() } returns Cart(emptyList())
+        val (next, _) = reducer.reduce(CheckoutState.Initial, CheckoutIntent.LoadCart)
+        assertIs<CheckoutState.Empty>(next)
+    }
+
+    @Test fun `Ready + Submit -> Submitting`() = runTest {
+        val (next, _) = reducer.reduce(CheckoutState.Ready(sampleCart(), Cents(2000)), CheckoutIntent.Submit)
+        assertIs<CheckoutState.Submitting>(next)
+    }
+}
+```
+
+Every screen behavior is expressible as "given state X, intent Y, expect
+state Z and effects E." That's the entire spec.
+
+## When MVI beats MVVM
+
+<ComparisonCard
+  left={{
+    label: 'Prefer MVVM',
+    title: 'Simple screens',
+    variant: 'old',
+    points: [
+      'CRUD lists, settings pages, profile views',
+      'Single source of data, few states',
+      'No complex transitions',
+      'Small ViewModel (< 100 LOC)',
+      'Isolated screen with no cross-screen impact'
+    ]
+  }}
+  right={{
+    label: 'Prefer MVI',
+    title: 'Complex state spaces',
+    variant: 'new',
+    points: [
+      'Checkout / payment / onboarding flows',
+      'Multi-step wizards with branches',
+      'Collaborative editors, chat threads',
+      'Replayable bug reports ("send me the intent log")',
+      'QA-owned state diagrams with strict transitions'
+    ]
+  }}
+/>
+
+## Orbit / MVIKotlin / your-own
+
+Don't let a framework be the decision. Implement MVI by hand first — it's
+200 lines. Libraries to evaluate once you understand the pattern:
+
+- **Orbit** — pragmatic MVI for Android, StateFlow + Channel based
+- **MVIKotlin** — KMP-friendly, cross-platform redux-y
+- **Circuit** (Slack) — Compose-first, typed screen presenters
+- **Decompose** — full app structure + MVI, strong for KMP
+
+## Key takeaways
+
+<Callout kind="success" title="MVI principles">
+- Screen state is a **sealed hierarchy** — exhaustive, drawable as a state machine.
+- **Intents** are the only way to change state. Views never mutate state.
+- Reducers are **pure**: `(State, Intent) → (State, Effects)`. Testable trivially.
+- **Side effects** are one-shot and separate from state (navigation, toasts).
+- Use MVI for **complex state spaces**; keep MVVM for simple CRUD screens.
+</Callout>
+
+## Next
+
+Return to **[Module 04 Overview](./overview)** or read **[Offline-First Architecture](./offline-first)**.

@@ -1,0 +1,348 @@
+---
+id: performance
+title: Compose Performance
+sidebar_label: Compose Performance
+description: Stability, skippability, derivedStateOf, LazyList keys, Compose compiler metrics, recomposition debugging, and the patterns that keep Compose fast.
+---
+
+import { Callout, ComparisonCard, StepList, Diagram, ComposeRecompositionDiagram, RenderFlowDiagram } from '@site/src/components/Doc';
+
+# Compose Performance
+
+Compose is fast by default. It becomes slow when you **accidentally invalidate
+things that shouldn't invalidate**. This chapter teaches you to see, measure,
+and fix the three performance killers: unstable inputs, unnecessary
+recomposition, and layout thrash.
+
+<Callout kind="tip" title="Measure first">
+Never optimize Compose by vibes. Enable Compose compiler metrics, record a
+Perfetto trace, or use the Layout Inspector's recomposition counter. The
+fix is usually small once you know the cause.
+</Callout>
+
+## The mental model
+
+<Diagram title="Compose render flow" caption="Composition produces a UI tree of LayoutNodes. Only changed branches recompose.">
+  <RenderFlowDiagram />
+</Diagram>
+
+Each frame, Compose asks: "which composables have changed inputs?" If inputs
+are **equal** to last frame (`.equals()`), the composable is **skipped**. If
+any input is **unstable**, Compose can't prove equality and recomposes.
+
+## Stability — the #1 performance lever
+
+A type is **stable** if:
+
+1. Its `equals()` returns the same result for the same inputs forever, AND
+2. Every public property is stable (or marked `@Stable`).
+
+### What Compose considers stable by default
+
+- Primitives (`Int`, `Boolean`, `String`, `Float`, ...)
+- Function types (`() -> Unit`)
+- Enums
+- `@Immutable` and `@Stable` annotated types
+- `data class` with only stable properties (Kotlin 2.0+ inferred)
+
+### What is unstable
+
+- `List`, `Map`, `Set` — they're interfaces; the runtime can't prove immutability
+- `MutableState` is stable; `MutableList` is NOT
+- Lambdas that capture an unstable receiver
+- Classes from modules without the Compose compiler plugin
+
+### Make it stable
+
+```kotlin
+// UNSTABLE — List<Message> is an interface
+data class Inbox(val messages: List<Message>)
+
+// STABLE — annotate the container
+@Immutable
+data class Inbox(val messages: List<Message>)
+
+// BEST — use Kotlinx Immutable Collections (truly immutable at runtime)
+@Immutable
+data class Inbox(val messages: ImmutableList<Message>)
+```
+
+```kotlin
+// libs.versions.toml
+kotlinx-collections-immutable = "0.3.7"
+```
+
+```kotlin
+dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.3.7")
+}
+```
+
+```kotlin
+val messages: ImmutableList<Message> = messages.toImmutableList()
+```
+
+## Compose compiler metrics — the X-ray
+
+Enable compiler metrics to see exactly which composables are unstable, which
+are skippable, and which are restartable:
+
+```kotlin
+// build-logic/convention/AndroidComposeConventionPlugin.kt
+tasks.withType<KotlinCompile>().configureEach {
+    compilerOptions {
+        if (project.findProperty("composeMetrics") == "true") {
+            val reportDir = project.layout.buildDirectory.dir("compose-reports").get().asFile.absolutePath
+            freeCompilerArgs.addAll(
+                "-P", "plugin:androidx.compose.compiler.plugins.kotlin:metricsDestination=$reportDir",
+                "-P", "plugin:androidx.compose.compiler.plugins.kotlin:reportsDestination=$reportDir"
+            )
+        }
+    }
+}
+```
+
+Run:
+
+```bash
+./gradlew :app:assembleRelease -PcomposeMetrics=true
+```
+
+Inspect `build/compose-reports/*-classes.txt`:
+
+```text
+stable class Message { stable val id: String, stable val body: String }
+unstable class Inbox { unstable val messages: List<Message> }  // ⚠️ the culprit
+restartable skippable scheme("[androidx.compose.ui.UiComposable]") fun MessageRow
+restartable scheme("[androidx.compose.ui.UiComposable]") fun InboxScreen  // ⚠️ not skippable
+```
+
+Every unstable class or non-skippable composable is an optimization target.
+
+## `derivedStateOf` — compute once, not per frame
+
+When you compute a value from multiple states inside a composable, Compose
+recomputes it on every recomposition. `derivedStateOf` caches the computation
+and only re-emits when the **result** changes.
+
+```kotlin
+// BAD — `canSubmit` recomputes every char, even when the boolean doesn't change
+@Composable
+fun Form() {
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+
+    val canSubmit = email.contains("@") && password.length >= 8   // recomputes always
+
+    SubmitButton(enabled = canSubmit)   // invalidates SubmitButton on every keystroke
+}
+
+// GOOD — derivedStateOf cache; SubmitButton only recomposes when canSubmit flips
+@Composable
+fun Form() {
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+
+    val canSubmit by remember {
+        derivedStateOf { email.contains("@") && password.length >= 8 }
+    }
+
+    SubmitButton(enabled = canSubmit)
+}
+```
+
+**Rule of thumb**: use `derivedStateOf` when the derived value changes far
+less often than its inputs (e.g., a boolean derived from two strings).
+
+## LazyList — stable keys and content type
+
+```kotlin
+LazyColumn {
+    items(
+        items = messages,
+        key = { it.id },                // stable identity across reorders
+        contentType = { it.javaClass }  // type hint for item reuse
+    ) { message ->
+        MessageRow(message)
+    }
+}
+```
+
+Without a `key`: reorders scroll the wrong item into view, animations
+re-trigger, item state (e.g., swipe offset) jumps to the wrong row.
+
+Without `contentType`: when list has heterogeneous item types, Compose can't
+reuse the right composable slot, causing extra work.
+
+## Defer reads — `remember { ... }` a lambda
+
+If a composable passes state to a child through a **lambda**, Compose can
+delay reading the state until composition of the child:
+
+```kotlin
+// The `progress` state is read in the parent; parent recomposes on every progress tick
+@Composable
+fun ScrollToTop(progress: Float) {
+    Text("Progress: $progress")
+}
+
+// Lambda read — ScrollToTop doesn't recompose until children call it
+@Composable
+fun ScrollProgress(progressProvider: () -> Float) {
+    Canvas(Modifier.fillMaxWidth()) {
+        drawRect(color = Blue, size = Size(width = size.width * progressProvider(), height = size.height))
+    }
+}
+
+// Caller
+ScrollProgress(progressProvider = { scrollState.value.toFloat() / scrollState.maxValue })
+```
+
+This pattern is **huge** for animations: reading state inside draw callbacks
+skips the composition phase entirely.
+
+## `Modifier` allocation — reuse with `remember`
+
+Every `Modifier.padding(8.dp)` allocates. For hot leaf composables (inside
+`LazyColumn` items), pre-compute:
+
+```kotlin
+// BAD — allocates Modifier chain every recomposition
+@Composable
+fun MessageRow(message: Message) {
+    Row(modifier = Modifier.padding(12.dp).clip(RoundedCornerShape(8.dp))) { /* ... */ }
+}
+
+// GOOD — allocate once
+@Composable
+fun MessageRow(message: Message) {
+    val modifier = remember { Modifier.padding(12.dp).clip(RoundedCornerShape(8.dp)) }
+    Row(modifier = modifier) { /* ... */ }
+}
+```
+
+Don't do this prematurely; it's only worth it inside proven hot paths (long
+list items that re-render often).
+
+## Strong skipping mode (Compose 1.7+)
+
+Kotlin 2.0 + Compose Compiler 1.7+ introduced **strong skipping**: even
+non-`@Stable` types are skippable if their **reference** is equal. This
+drastically reduces the need to chase stability, but it's still worth
+fixing unstable collections — reference equality fails when you do a fresh
+`.copy()` of your UI state.
+
+```kotlin
+// build.gradle.kts
+android {
+    buildFeatures { compose = true }
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.15"
+    }
+}
+```
+
+```properties
+# gradle.properties — enable strong skipping explicitly in older Compose
+org.jetbrains.compose.experimental.strong-skipping.enabled=true
+```
+
+## Layout Inspector & recomposition counter
+
+In Android Studio, **Layout Inspector → Show recomposition counts**. Each
+composable gets two numbers:
+
+- **Composition count** — how many times the composable was called
+- **Skip count** — how many of those were skipped
+
+Target: skip count should dominate composition count for everything inside
+scrolling lists. If any list item shows high composition with zero skips,
+that's your culprit.
+
+## Baseline profiles for Compose startup
+
+Compose makes heavy use of generics and reified functions, so ART's JIT does
+a lot of work on first launch. A **baseline profile** precompiles the hot
+methods, cutting cold start by 20–40% on real devices.
+
+```kotlin
+// baseline-profile/src/main/kotlin/.../BaselineProfileGenerator.kt
+@OptIn(ExperimentalBaselineProfilesApi::class)
+class BaselineProfileGenerator {
+    @get:Rule val rule = BaselineProfileRule()
+
+    @Test fun generate() = rule.collect(
+        packageName = "com.myapp",
+        profileBlock = {
+            startActivityAndWait()
+            device.findObject(By.text("Inbox")).click()
+            device.wait(Until.hasObject(By.res("InboxList")), 5_000)
+            val list = device.findObject(By.res("InboxList"))
+            repeat(3) {
+                list.fling(Direction.DOWN)
+                device.waitForIdle()
+            }
+        }
+    )
+}
+```
+
+Generate with `./gradlew :app:generateBaselineProfile` (on a device). The
+profile is committed to your repo at `app/src/main/baseline-prof.txt`. See
+Module 10 for the full pipeline.
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Performance killers',
+    variant: 'old',
+    points: [
+      'List<T> in state (unstable)',
+      'Long lambdas inlined in call sites',
+      'No key in LazyColumn items',
+      'Reading state in parents that pass it to children',
+      'Computing derived values without derivedStateOf',
+      'Creating Modifier chains inline in hot paths'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Proven patterns',
+    variant: 'new',
+    points: [
+      'ImmutableList or @Immutable containers',
+      'Hoist lambdas to stable references',
+      'Stable key + contentType for LazyColumn',
+      'Pass lambdas (state providers), not raw state',
+      'derivedStateOf for computations with small result changes',
+      'remember { } for reused modifier chains in list items'
+    ]
+  }}
+/>
+
+## Debug checklist for "Compose feels slow"
+
+<StepList steps={[
+  { title: 'Enable Layout Inspector recomposition counts', description: 'Find composables with high composition count and low skip count. That\'s your hot path.' },
+  { title: 'Run Compose compiler metrics', description: './gradlew assembleRelease -PcomposeMetrics=true and inspect build/compose-reports for unstable classes and non-skippable composables.' },
+  { title: 'Record a Perfetto trace', description: 'Use Android Studio Profiler → CPU → System Trace. Look for long Choreographer frames. Each dropped frame over 16 ms is a janky scroll.' },
+  { title: 'Profile macrobenchmark startup', description: 'Use a macrobenchmark test (Module 10) to get cold/warm start distributions across device tiers.' },
+  { title: 'Apply fixes one at a time', description: 'ImmutableList, derivedStateOf, lambda providers, baseline profile. Measure between each — sometimes only one moves the needle.' }
+]} />
+
+## Key takeaways
+
+<Callout kind="success" title="Compose performance rules">
+- **Stability** is the #1 lever. Make containers `@Immutable` with `ImmutableList`.
+- **Stable keys + contentType** in LazyColumn always.
+- **`derivedStateOf`** when many inputs change but the result changes rarely.
+- **Pass lambdas** to defer state reads to the composable that actually draws.
+- **Compose compiler metrics** tell the truth; don't guess.
+- **Baseline profiles** reclaim the cold-start cost of Compose generics.
+</Callout>
+
+## Next
+
+Return to **[Module 03 Overview](./overview)** or continue to **[Module 04 — Architecture & Patterns](/docs/architecture-patterns/overview)**.

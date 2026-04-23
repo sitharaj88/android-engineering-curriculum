@@ -6,37 +6,50 @@ import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 /* ── Data ── */
 
 const modules = [
-  { num: 1, title: 'Kotlin Foundation', desc: 'Variables, OOP, null safety, collections, lambdas, scope functions, and coroutines basics — the language of modern Android.', weeks: '3 Weeks', topics: '4 Topics', link: '/docs/kotlin-foundation/overview' },
-  { num: 2, title: 'Android Fundamentals', desc: 'Platform architecture, Activities, Intents, Fragments, ViewGroups, ConstraintLayout, and resource management.', weeks: '3 Weeks', topics: '3 Topics', link: '/docs/android-fundamentals/overview' },
-  { num: 3, title: 'Modern UI with Jetpack Compose', desc: 'Declarative Composables, modifiers, Material 3 theming, state hoisting, navigation, animations, and Compose interop.', weeks: '4 Weeks', topics: '4 Topics', link: '/docs/jetpack-compose/overview' },
-  { num: 4, title: 'Architecture & Design Patterns', desc: 'MVVM, Clean Architecture layers, Repository pattern, Hilt DI, ViewModel + StateFlow, and modular architecture.', weeks: '3 Weeks', topics: '3 Topics', link: '/docs/architecture-patterns/overview' },
-  { num: 5, title: 'Data Storage & Persistence', desc: 'DataStore, Room database, migrations, Content Providers, encrypted storage, and caching strategies.', weeks: '2 Weeks', topics: '2 Topics', link: '/docs/data-persistence/overview' },
-  { num: 6, title: 'Networking & API Integration', desc: 'REST + HTTP, Retrofit, Moshi/Kotlinx serialization, OkHttp interceptors, Paging 3, image loading, and WebSockets.', weeks: '3 Weeks', topics: '3 Topics', link: '/docs/networking-api/overview' },
-  { num: 7, title: 'Firebase & Cloud Services', desc: 'Auth (Email/Google/Phone), Cloud Firestore, Cloud Storage, FCM push notifications, Analytics, Crashlytics, Remote Config.', weeks: '3 Weeks', topics: '3 Topics', link: '/docs/firebase-cloud/overview' },
-  { num: 8, title: 'Advanced Android Components', desc: 'Foreground/bound Services, WorkManager, notification channels, runtime permissions, CameraX, sensors, biometrics, Glance widgets.', weeks: '3 Weeks', topics: '3 Topics', link: '/docs/advanced-components/overview' },
-  { num: 9, title: 'Testing & Quality Assurance', desc: 'JUnit 5, MockK, Espresso, Compose Testing API, TDD methodology, code coverage, static analysis, and CI/CD.', weeks: '2 Weeks', topics: '2 Topics', link: '/docs/testing-quality/overview' },
-  { num: 10, title: 'Performance Optimization', desc: 'Memory profiling, LeakCanary, layout performance, app startup, R8/ProGuard, APK shrinking, baseline profiles.', weeks: '2 Weeks', topics: '2 Topics', link: '/docs/performance/overview' },
-  { num: 11, title: 'Google Play Store & Publishing', desc: 'Play Console, app signing, App Bundles, in-app purchases, subscriptions, AdMob monetization, and ASO strategies.', weeks: '2 Weeks', topics: '2 Topics', link: '/docs/publishing/overview' },
-  { num: 12, title: 'Advanced & Trending Topics', desc: 'Kotlin Multiplatform, ML Kit + TensorFlow Lite, Wear OS, Android TV, BLE/IoT, accessibility, security, adaptive layouts.', weeks: '3 Weeks', topics: '3 Topics', link: '/docs/advanced-trending/overview' },
-  { num: 13, title: 'Version Control & Collaboration', desc: 'Git fundamentals, branching strategies, pull requests, code reviews, and conventional commits for team workflows.', weeks: '1 Week', topics: '1 Topic', link: '/docs/version-control/overview' },
+  { num: 1, title: 'Kotlin Foundation', desc: 'Language, coroutines deep dive, advanced patterns — generics, DSLs, value classes, K2 compiler.', weeks: '3 Weeks', topics: '3 Chapters', link: '/docs/kotlin-foundation/overview' },
+  { num: 2, title: 'Android Fundamentals', desc: 'Platform architecture, Activities, Intents, Fragments, ViewGroups, ConstraintLayout, resources.', weeks: '3 Weeks', topics: '3 Topics', link: '/docs/android-fundamentals/overview' },
+  { num: 3, title: 'Jetpack Compose', desc: 'Declarative UI, Material 3, state hoisting, performance with compiler metrics, custom layouts & gestures.', weeks: '4 Weeks', topics: '3 Chapters', link: '/docs/jetpack-compose/overview' },
+  { num: 4, title: 'Architecture & Patterns', desc: 'MVVM, MVI state machines, Clean Architecture, offline-first with outbox pattern, Hilt DI.', weeks: '3 Weeks', topics: '3 Chapters', link: '/docs/architecture-patterns/overview' },
+  { num: 5, title: 'Data & Persistence', desc: 'DataStore, Room, migrations, Content Providers, encrypted storage, caching strategies.', weeks: '2 Weeks', topics: '2 Topics', link: '/docs/data-persistence/overview' },
+  { num: 6, title: 'Networking & API', desc: 'REST, GraphQL with Apollo, WebSocket, gRPC, Server-Sent Events — the full modern networking stack.', weeks: '3 Weeks', topics: '2 Chapters', link: '/docs/networking-api/overview' },
+  { num: 7, title: 'Firebase & Cloud', desc: 'Auth, Firestore, Cloud Storage, FCM, Analytics, Crashlytics, Remote Config, App Check.', weeks: '3 Weeks', topics: '3 Topics', link: '/docs/firebase-cloud/overview' },
+  { num: 8, title: 'Advanced Components', desc: 'Services, WorkManager, notification channels, permissions, CameraX, sensors, biometrics, Glance.', weeks: '3 Weeks', topics: '3 Topics', link: '/docs/advanced-components/overview' },
+  { num: 9, title: 'Testing & Quality', desc: 'JUnit 5, MockK, Turbine, Espresso, Compose Testing, TDD, Kover, detekt, Konsist boundaries.', weeks: '2 Weeks', topics: '2 Topics', link: '/docs/testing-quality/overview' },
+  { num: 10, title: 'Performance', desc: 'Memory profiling, LeakCanary, R8, baseline profiles, Macrobenchmark, startup optimization.', weeks: '2 Weeks', topics: '2 Chapters', link: '/docs/performance/overview' },
+  { num: 11, title: 'Publishing', desc: 'Play Console, App Bundles, signing, in-app purchases, subscriptions, AdMob, ASO.', weeks: '2 Weeks', topics: '2 Topics', link: '/docs/publishing/overview' },
+  { num: 12, title: 'Advanced & Trending', desc: 'Kotlin Multiplatform, Compose Multiplatform, ML Kit, Wear OS, Android TV, BLE/IoT, XR.', weeks: '3 Weeks', topics: '3 Topics', link: '/docs/advanced-trending/overview' },
+  { num: 13, title: 'Version Control', desc: 'Git fundamentals, branching strategies, pull requests, code reviews, conventional commits.', weeks: '1 Week', topics: '1 Topic', link: '/docs/version-control/overview' },
+  { num: 14, title: 'Gradle & Build Systems', desc: 'Kotlin DSL, version catalogs, convention plugins, configuration cache, build scans — enterprise build infrastructure.', weeks: '2 Weeks', topics: '4 Topics', link: '/docs/gradle-build/overview' },
+  { num: 15, title: 'Modularization at Scale', desc: '30+ feature modules, API/impl separation, Konsist architectural tests, dynamic feature delivery.', weeks: '2 Weeks', topics: '4 Topics', link: '/docs/modularization/overview' },
+  { num: 16, title: 'Security & Compliance', desc: 'OWASP MASVS, cert pinning, Keystore, Play Integrity, R8 tamper detection, GDPR/CCPA, Data Safety.', weeks: '2 Weeks', topics: '5 Topics', link: '/docs/security-compliance/overview' },
+  { num: 17, title: 'CI/CD & DevOps', desc: 'GitHub Actions, Fastlane, Play Console API, staged rollouts with auto-halt, flaky test quarantine.', weeks: '2 Weeks', topics: '5 Topics', link: '/docs/cicd-devops/overview' },
+  { num: 18, title: 'Observability', desc: 'Crashlytics, Firebase Performance, custom traces, OpenTelemetry distributed tracing, SLOs + alerting.', weeks: '2 Weeks', topics: '5 Topics', link: '/docs/observability/overview' },
+  { num: 19, title: 'Enterprise UX', desc: 'Design systems, tokens, TalkBack, WCAG 2.2, i18n, RTL, Window Size Classes, foldables, motion.', weeks: '2 Weeks', topics: '5 Topics', link: '/docs/enterprise-ux/overview' },
+  { num: 20, title: 'Career & Interview', desc: 'Leveling (L3-Principal), system design framework, 50+ question bank, portfolio strategy, negotiation.', weeks: '1 Week', topics: '5 Topics', link: '/docs/career-interview/overview' },
 ];
 
 const features = [
-  { icon: '🤖', title: 'Modern Android Stack', desc: 'Kotlin-first curriculum aligned with the latest Jetpack libraries, Material 3, and Google\'s recommended architecture.' },
-  { icon: '🧩', title: 'Jetpack Compose First', desc: 'Declarative UI from day one — state hoisting, side effects, animations, navigation, and Compose-XML interop.' },
-  { icon: '🏗️', title: 'Clean MVVM Architecture', desc: 'Layered Domain/Data/Presentation, Repository pattern, Hilt DI, and StateFlow — production-grade structure.' },
-  { icon: '🧪', title: 'Test-Driven Mindset', desc: 'JUnit 5, MockK, Turbine for Flow, Espresso, and the Compose Testing API — confidence at every layer.' },
-  { icon: '⚡', title: 'Production Performance', desc: 'Baseline profiles, R8 minification, startup tracing, memory profiling, and LeakCanary in real apps.' },
-  { icon: '🚀', title: 'Ship to Play Store', desc: 'App Bundles, Play Console, signing, in-app purchases, AdMob, and ASO — end-to-end release pipeline.' },
+  { icon: '🤖', title: 'Modern Android Stack', desc: 'Kotlin 2.x + K2 compiler, Compose, Material 3, coroutines, Flow — the full stack top engineering teams actually ship.' },
+  { icon: '🧩', title: 'Compose First', desc: 'Declarative UI with state hoisting, compiler metrics for performance, custom layouts, gestures, and Compose Multiplatform.' },
+  { icon: '🏗️', title: 'Enterprise Architecture', desc: 'MVVM, MVI state machines, Clean Architecture, offline-first with outbox, Hilt DI, modular 30+ module codebases.' },
+  { icon: '🧪', title: 'Test-Driven Mindset', desc: 'JUnit 5, MockK, Turbine, Compose Testing, Paparazzi snapshots, Macrobenchmark — confidence at every layer.' },
+  { icon: '⚡', title: 'Production Performance', desc: 'Baseline profiles, R8 full mode, configuration cache, startup tracing, LeakCanary — measured wins, not vibes.' },
+  { icon: '🚀', title: 'Ship to Production', desc: 'GitHub Actions, Fastlane, Play Console API, staged rollouts with auto-halt, SLO-based alerting.' },
+  { icon: '🔐', title: 'Security & Compliance', desc: 'OWASP MASVS, cert pinning, Play Integrity, encrypted storage, R8 obfuscation, GDPR/CCPA data inventory.' },
+  { icon: '🌍', title: 'World-Class UX', desc: 'Design tokens, TalkBack, WCAG 2.2 AA, i18n, RTL, foldables, Window Size Classes, motion design.' },
+  { icon: '📈', title: 'Career-Ready', desc: 'Leveling from junior to principal, system design framework, 50+ interview questions, portfolio and negotiation guidance.' },
 ];
 
 const techStack = [
-  'Kotlin', 'Jetpack Compose', 'Material 3', 'Coroutines', 'Flow',
-  'StateFlow', 'Hilt', 'Room', 'DataStore', 'Retrofit',
-  'OkHttp', 'Moshi', 'Coil', 'Paging 3', 'Navigation',
-  'WorkManager', 'CameraX', 'Firebase', 'FCM', 'Crashlytics',
-  'JUnit 5', 'MockK', 'Espresso', 'Compose Testing', 'R8',
-  'Baseline Profiles', 'KMP', 'ML Kit', 'Glance', 'Gradle',
+  'Kotlin 2.x', 'Jetpack Compose', 'Material 3', 'Coroutines', 'Flow', 'StateFlow',
+  'Hilt', 'Room', 'DataStore', 'Paging 3', 'Retrofit', 'OkHttp',
+  'Apollo GraphQL', 'gRPC', 'WebSocket', 'Moshi', 'Coil', 'Navigation Compose',
+  'WorkManager', 'CameraX', 'Glance', 'Firebase', 'FCM', 'Crashlytics',
+  'Remote Config', 'Play Integrity', 'JUnit 5', 'MockK', 'Turbine', 'Espresso',
+  'Compose Testing', 'Paparazzi', 'Macrobenchmark', 'Baseline Profiles', 'R8',
+  'Gradle Kotlin DSL', 'Version Catalogs', 'Convention Plugins', 'KSP',
+  'GitHub Actions', 'Fastlane', 'OpenTelemetry', 'KMP', 'Compose Multiplatform',
+  'ML Kit', 'Wear OS', 'Health Connect', 'Konsist', 'Detekt', 'Kover',
 ];
 
 const projects = [
@@ -48,10 +61,12 @@ const projects = [
 ];
 
 const careers = [
-  { icon: '🤖', title: 'Android Developer', desc: 'Build and ship native Android apps for top product companies' },
-  { icon: '📱', title: 'Mobile App Developer', desc: 'Cross-functional engineer across native and hybrid stacks' },
-  { icon: '⚙️', title: 'Kotlin Developer', desc: 'Backend, KMP, and full-stack Kotlin opportunities' },
-  { icon: '🏗️', title: 'Full-Stack Mobile Developer', desc: 'End-to-end mobile + cloud delivery for startups and SMBs' },
+  { icon: '🤖', title: 'Android Engineer (L3–L5)', desc: 'Native Android apps at top product and fintech companies' },
+  { icon: '⚙️', title: 'Senior Android Engineer (L5–L6)', desc: 'Architecture, system design, mentorship, cross-team leadership' },
+  { icon: '🏗️', title: 'Staff / Principal Engineer', desc: 'Platform direction, build infrastructure, organization-level impact' },
+  { icon: '📱', title: 'Kotlin Multiplatform Engineer', desc: 'Share code across Android, iOS, Desktop, and Web with Compose Multiplatform' },
+  { icon: '🔐', title: 'Mobile Security Engineer', desc: 'OWASP MASVS audits, Play Integrity, supply-chain hardening for banking/health apps' },
+  { icon: '🚀', title: 'Mobile Platform / DevOps', desc: 'Build systems, CI/CD, observability, release automation' },
 ];
 
 const prerequisites = [
@@ -132,15 +147,14 @@ export default function Home(): React.JSX.Element {
           </div>
 
           <h1 className="hero-title">
-            Android Development<br />
-            <span className="hero-title-accent">Complete Guide</span>
+            Android Engineering<br />
+            <span className="hero-title-accent">World-Class Curriculum</span>
           </h1>
 
           <p className="hero-description">
-            A comprehensive, production-focused curriculum covering every topic from
-            Kotlin fundamentals to Play Store publishing. Built for students,
-            self-learners, and professionals upskilling to modern Android with
-            Kotlin &amp; Jetpack Compose.
+            The world-class, enterprise-grade Android curriculum — 20 modules, 100+ topics,
+            5 capstone projects. From Kotlin fundamentals to shipping, scaling, and operating
+            apps at principal engineer level. The patterns and practices real teams use.
           </p>
 
           <div className="hero-actions">
@@ -158,24 +172,24 @@ export default function Home(): React.JSX.Element {
 
           <div className="hero-stats">
             <div className="hero-stat">
-              <div className="hero-stat-value">13</div>
+              <div className="hero-stat-value">20</div>
               <div className="hero-stat-label">Modules</div>
             </div>
             <div className="hero-stat">
-              <div className="hero-stat-value">73+</div>
+              <div className="hero-stat-value">100+</div>
               <div className="hero-stat-label">Topics</div>
             </div>
             <div className="hero-stat">
-              <div className="hero-stat-value">34</div>
+              <div className="hero-stat-value">44</div>
               <div className="hero-stat-label">Weeks</div>
             </div>
             <div className="hero-stat">
-              <div className="hero-stat-value">120h</div>
+              <div className="hero-stat-value">180h</div>
               <div className="hero-stat-label">Content</div>
             </div>
             <div className="hero-stat">
               <div className="hero-stat-value">5</div>
-              <div className="hero-stat-label">Projects</div>
+              <div className="hero-stat-label">Capstones</div>
             </div>
           </div>
         </div>
@@ -225,10 +239,10 @@ export default function Home(): React.JSX.Element {
           <div className="section-inner">
             <div className="section-header">
               <div className="section-overline">Complete Curriculum</div>
-              <h2 className="section-title">13 Training Modules</h2>
+              <h2 className="section-title">20 Training Modules · 5 Phases</h2>
               <p className="section-description">
-                A structured learning path from Kotlin fundamentals to Play Store
-                publishing — each module building on the previous.
+                Foundations → Data &amp; Services → Quality &amp; Performance → Enterprise Engineering → Career.
+                Every module builds on the previous; enterprise phase separates senior from staff.
               </p>
             </div>
             <div className="modules-grid">

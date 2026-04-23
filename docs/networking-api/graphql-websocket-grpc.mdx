@@ -1,0 +1,413 @@
+---
+id: graphql-websocket-grpc
+title: GraphQL, WebSocket & gRPC
+sidebar_label: GraphQL, WebSocket & gRPC
+description: Beyond REST — Apollo Kotlin for GraphQL, OkHttp WebSocket for real-time, and gRPC/Protobuf for high-performance binary APIs.
+---
+
+import { Callout, ComparisonCard, StepList, LibraryGrid, Diagram, NetworkingDiagram } from '@site/src/components/Doc';
+
+# GraphQL, WebSocket & gRPC
+
+REST is the starting point, not the finish line. Production Android apps
+increasingly speak **GraphQL** (flexible queries, typed schema), **WebSocket**
+(real-time bidirectional), and **gRPC** (fast binary, microservices). This
+chapter shows you how, and when to pick each.
+
+## When to pick which
+
+<ComparisonCard
+  left={{
+    label: 'REST',
+    title: 'When to use',
+    variant: 'new',
+    points: [
+      'Public APIs, well-documented endpoints',
+      'Cache-friendly GET semantics',
+      'Team familiarity; standard tooling',
+      'When backend controls payload shape'
+    ]
+  }}
+  right={{
+    label: 'GraphQL / gRPC / WebSocket',
+    title: 'When to upgrade',
+    variant: 'new',
+    points: [
+      'GraphQL: clients over-fetch or under-fetch with REST',
+      'WebSocket: real-time chat, notifications, live dashboards',
+      'gRPC: internal microservices, tight performance budgets',
+      'All three: strong schema → generated clients → type safety'
+    ]
+  }}
+/>
+
+---
+
+## GraphQL with Apollo Kotlin
+
+GraphQL lets the client specify **exactly what fields it wants**. Apollo
+Kotlin generates typed models from a schema — no manual DTOs.
+
+### Setup
+
+```kotlin
+// libs.versions.toml
+apollo = "4.1.0"
+
+// build.gradle.kts
+plugins {
+    alias(libs.plugins.apollo)
+}
+
+apollo {
+    service("api") {
+        packageName.set("com.myapp.graphql")
+        introspection {
+            endpointUrl.set("https://api.example.com/graphql")
+            schemaFile.set(file("src/main/graphql/schema.graphqls"))
+        }
+    }
+}
+
+dependencies {
+    implementation("com.apollographql.apollo:apollo-runtime:4.1.0")
+    implementation("com.apollographql.apollo:apollo-normalized-cache-sqlite:4.1.0")
+}
+```
+
+### Define a query
+
+```graphql
+# src/main/graphql/GetUser.graphql
+query GetUser($id: ID!) {
+    user(id: $id) {
+        id
+        name
+        email
+        avatar
+        followerCount
+        recentPosts(limit: 5) {
+            id
+            title
+            createdAt
+        }
+    }
+}
+```
+
+Apollo generates `GetUserQuery`, `User`, `Post` — typed Kotlin classes.
+
+### Call it
+
+```kotlin
+class UserRepository @Inject constructor(private val apollo: ApolloClient) {
+    suspend fun getUser(id: String): User {
+        val response = apollo.query(GetUserQuery(id)).execute()
+        if (response.hasErrors()) throw GraphQlException(response.errors!!)
+        return response.data!!.user.toDomain()
+    }
+
+    fun observeUser(id: String): Flow<User> =
+        apollo.query(GetUserQuery(id))
+            .fetchPolicy(FetchPolicy.CacheAndNetwork)
+            .toFlow()
+            .mapNotNull { it.data?.user?.toDomain() }
+}
+```
+
+### Normalized cache — the superpower
+
+Apollo's normalized cache stores GraphQL objects by ID. Mutating `User:u1`
+updates it **everywhere it appears** — profile screen, comment author,
+message sender — with zero extra code.
+
+```kotlin
+val apollo = ApolloClient.Builder()
+    .serverUrl("https://api.example.com/graphql")
+    .normalizedCache(
+        SqlNormalizedCacheFactory(context, "apollo.db"),
+        cacheKeyGenerator = TypePolicyCacheKeyGenerator()
+    )
+    .build()
+
+// After a "like" mutation, the cache auto-updates everywhere
+apollo.mutation(LikePostMutation(postId = "p1")).execute()
+// Any observer of that post anywhere re-emits with likeCount + 1
+```
+
+### Subscriptions over WebSocket
+
+GraphQL subscriptions use WebSocket under the hood:
+
+```graphql
+subscription NewMessages($conversationId: ID!) {
+    messageAdded(conversationId: $conversationId) {
+        id
+        author { id name }
+        body
+        sentAt
+    }
+}
+```
+
+```kotlin
+fun subscribeToMessages(conversationId: String): Flow<Message> =
+    apollo.subscription(NewMessagesSubscription(conversationId))
+        .toFlow()
+        .mapNotNull { it.data?.messageAdded?.toDomain() }
+```
+
+---
+
+## WebSocket for real-time
+
+Even without GraphQL, raw WebSocket is a first-class citizen in OkHttp:
+
+```kotlin
+class ChatSocket @Inject constructor(
+    private val client: OkHttpClient,
+    private val json: Json
+) {
+    private var socket: WebSocket? = null
+    private val _events = MutableSharedFlow<ChatEvent>(extraBufferCapacity = 64)
+    val events: SharedFlow<ChatEvent> = _events.asSharedFlow()
+
+    fun connect(token: String, conversationId: String) {
+        val request = Request.Builder()
+            .url("wss://api.example.com/chat/$conversationId")
+            .header("Authorization", "Bearer $token")
+            .build()
+
+        socket = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                _events.tryEmit(ChatEvent.Connected)
+            }
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                runCatching { json.decodeFromString<ChatMessage>(text) }
+                    .onSuccess { _events.tryEmit(ChatEvent.MessageReceived(it)) }
+            }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                _events.tryEmit(ChatEvent.Error(t))
+                scheduleReconnect()
+            }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                _events.tryEmit(ChatEvent.Disconnected(code))
+                if (code !in NORMAL_CLOSES) scheduleReconnect()
+            }
+        })
+    }
+
+    fun send(message: ChatMessage): Boolean =
+        socket?.send(json.encodeToString(message)) ?: false
+
+    fun close() {
+        socket?.close(1000, "user left")
+        socket = null
+    }
+
+    private fun scheduleReconnect() { /* exponential backoff + connect() */ }
+}
+```
+
+### Reconnection discipline
+
+- **Exponential backoff** starting at 1s, cap at 60s
+- **Jitter** (randomize ±30%) to avoid thundering herd at server restart
+- **Resume cursor** — after reconnect, send `{ since: lastEventId }` to catch up
+- **Lifecycle-aware** — tear down when the app goes background for > 5 min
+
+```kotlin
+class ReconnectingChatSocket @Inject constructor(
+    private val delegate: ChatSocket,
+    private val lifecycle: ProcessLifecycleOwner
+) {
+    private var attempt = 0
+
+    fun connectLifecycleAware(token: String, conversationId: String) {
+        lifecycle.lifecycle.coroutineScope.launch {
+            lifecycle.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                while (isActive) {
+                    delegate.connect(token, conversationId)
+                    delegate.events.collect { event ->
+                        when (event) {
+                            is ChatEvent.Disconnected, is ChatEvent.Error -> {
+                                val delayMs = minOf(60_000L, 1000L * (1 shl attempt))
+                                    .let { it + Random.nextLong(-it / 3, it / 3) }
+                                delay(delayMs)
+                                attempt++
+                            }
+                            is ChatEvent.Connected -> attempt = 0
+                            else -> {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+---
+
+## gRPC with Kotlin
+
+gRPC uses **Protobuf** for wire format and **HTTP/2** for transport. It is
+the fastest, most efficient choice for high-volume Android-to-backend
+communication — often 5-10× smaller payloads than JSON.
+
+### Schema — the source of truth
+
+```proto
+// src/main/proto/user_service.proto
+syntax = "proto3";
+package com.myapp.api;
+
+option java_multiple_files = true;
+option java_package = "com.myapp.api.grpc";
+
+service UserService {
+    rpc GetUser(GetUserRequest) returns (User);
+    rpc StreamPresence(stream PresenceEvent) returns (stream PresenceUpdate);
+}
+
+message GetUserRequest { string id = 1; }
+message User {
+    string id = 1;
+    string name = 2;
+    string email = 3;
+    int64 created_at = 4;
+}
+```
+
+### Gradle
+
+```kotlin
+plugins {
+    id("com.google.protobuf") version "0.9.4"
+}
+
+dependencies {
+    implementation("io.grpc:grpc-kotlin-stub:1.4.1")
+    implementation("io.grpc:grpc-okhttp:1.68.0")
+    implementation("com.google.protobuf:protobuf-kotlin-lite:4.28.0")
+}
+
+protobuf {
+    protoc { artifact = "com.google.protobuf:protoc:4.28.0" }
+    plugins {
+        id("java")   { artifact = "io.grpc:protoc-gen-grpc-java:1.68.0" }
+        id("grpc")   { artifact = "io.grpc:protoc-gen-grpc-java:1.68.0" }
+        id("grpckt") { artifact = "io.grpc:protoc-gen-grpc-kotlin:1.4.1:jdk8@jar" }
+    }
+    generateProtoTasks {
+        all().forEach { task ->
+            task.builtins { create("java") { option("lite") } }
+            task.plugins {
+                create("grpc") { option("lite") }
+                create("grpckt") { option("lite") }
+            }
+        }
+    }
+}
+```
+
+### Client
+
+```kotlin
+class UserGrpcClient @Inject constructor(@Named("grpcChannel") channel: ManagedChannel) {
+    private val stub = UserServiceGrpcKt.UserServiceCoroutineStub(channel)
+
+    suspend fun get(id: String): User =
+        stub.getUser(GetUserRequest.newBuilder().setId(id).build()).toDomain()
+
+    fun streamPresence(events: Flow<PresenceEvent>): Flow<PresenceUpdate> =
+        stub.streamPresence(events).map { it.toDomain() }
+}
+
+@Provides @Singleton @Named("grpcChannel")
+fun provideChannel(): ManagedChannel =
+    AndroidChannelBuilder.forAddress("grpc.example.com", 443)
+        .useTransportSecurity()
+        .keepAliveTime(30, TimeUnit.SECONDS)
+        .build()
+```
+
+### Bidirectional streaming
+
+The `streamPresence` example above is **bidirectional** — client streams
+presence events (typing, seen), server streams presence updates (other
+users). One TCP connection, multiplexed via HTTP/2.
+
+<Callout kind="tip" title="When gRPC shines">
+gRPC excels at **internal microservices** where you control both ends. For
+public APIs, REST/GraphQL are more accessible (browsers, cURL, Postman).
+Many apps end up with REST at the edge and gRPC between backend services,
+using gRPC-Web or BFF for mobile.
+</Callout>
+
+---
+
+## Server-Sent Events (SSE) — the forgotten option
+
+For server→client streaming without bidirectional need (activity feeds,
+notifications), **SSE** is simpler than WebSocket and works over plain HTTP:
+
+```kotlin
+// OkHttp-SSE dependency: com.squareup.okhttp3:okhttp-sse:4.12.0
+
+class NotificationStream @Inject constructor(
+    private val client: OkHttpClient,
+    private val factory: EventSource.Factory = EventSources.createFactory(client)
+) {
+    fun subscribe(): Flow<Notification> = callbackFlow {
+        val request = Request.Builder().url("https://api.example.com/events/sse").build()
+        val source = factory.newEventSource(request, object : EventSourceListener() {
+            override fun onEvent(source: EventSource, id: String?, type: String?, data: String) {
+                trySend(Json.decodeFromString<Notification>(data))
+            }
+            override fun onFailure(source: EventSource, t: Throwable?, response: Response?) { close(t) }
+        })
+        awaitClose { source.cancel() }
+    }
+}
+```
+
+---
+
+## The modern mobile networking stack
+
+<LibraryGrid libraries={[
+  { name: 'Apollo Kotlin', tagline: 'GraphQL client', description: 'Type-safe GraphQL with normalized cache. First-class coroutines + Flow. Works great with KMP.', url: 'https://www.apollographql.com/docs/kotlin' },
+  { name: 'OkHttp WebSocket', tagline: 'Real-time', description: 'Production-grade WebSocket client with ping/pong, auth headers, and lifecycle. Ships with Retrofit.', url: 'https://square.github.io/okhttp/5.x/okhttp/okhttp3/-web-socket/' },
+  { name: 'gRPC-Kotlin', tagline: 'Binary RPC', description: 'Coroutine-friendly gRPC with generated stubs. 5-10× smaller than JSON, HTTP/2 multiplexing.', url: 'https://grpc.io/docs/languages/kotlin/' },
+  { name: 'Ktor Client', tagline: 'Pure Kotlin HTTP', description: 'KMP-friendly alternative to Retrofit; same code for Android, iOS, desktop, JS.', url: 'https://ktor.io/docs/client.html' },
+  { name: 'Protobuf', tagline: 'Wire format', description: 'Binary schema for gRPC and also for local Room columns or DataStore. Evolvable, compact.', url: 'https://protobuf.dev/' }
+]} />
+
+---
+
+## Picking the right tool — decision table
+
+| Scenario                                           | Best choice              |
+|---------------------------------------------------|--------------------------|
+| Public CRUD API, third-party integrations          | REST + JSON              |
+| Mobile with complex nested screens                 | GraphQL (Apollo Kotlin)  |
+| Real-time chat, typing indicators, presence       | WebSocket                |
+| Server push only (notifications, live feeds)      | Server-Sent Events       |
+| Internal microservices, high QPS                  | gRPC                     |
+| KMP shared network code                            | Ktor Client              |
+| Collaborative doc editing                          | CRDT over WebSocket      |
+
+## Key takeaways
+
+<Callout kind="success" title="Beyond REST">
+- **GraphQL + Apollo** solves over/under-fetching; normalized cache is magic.
+- **WebSocket** for bidirectional real-time; add exponential backoff + jitter + resume.
+- **gRPC** for internal, high-performance, schema-strict APIs.
+- **SSE** is the simplest fit for one-way server push.
+- Match the tool to the requirement — don't rebuild REST in GraphQL clothing.
+</Callout>
+
+## Next
+
+Return to **[Module 06 Overview](./overview)** or continue to **[Module 07 — Firebase & Cloud Services](/docs/firebase-cloud/overview)**.
