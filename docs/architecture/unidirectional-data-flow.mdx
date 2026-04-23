@@ -1,0 +1,525 @@
+---
+id: unidirectional-data-flow
+title: Unidirectional Data Flow (UDF)
+sidebar_label: Unidirectional Data Flow
+description: The principle that unlocks reactive UI — state flows down, events flow up. Why UDF, immutable state, single source of truth, and how Compose enforces it.
+---
+
+import { Callout, ComparisonCard, StepList, Diagram, ReduxFlowDiagram } from '@site/src/components/Doc';
+
+# Unidirectional Data Flow
+
+UDF is the single most important architectural concept in modern Android.
+Every framework — Compose, React, SwiftUI, Flutter — is built on it.
+Understanding UDF turns state management from a constant source of bugs into
+a predictable, testable, time-travel-debuggable system.
+
+<Callout kind="tip" title="The one-sentence principle">
+**Data flows in one direction: down. Events flow in one direction: up. There
+is exactly one source of truth for every piece of state.**
+
+That's it. Every UDF pattern — MVI, MVVM, Redux, Elm — is a specific
+application of this rule.
+</Callout>
+
+## The alternative: bidirectional state
+
+Before UDF, UI frameworks allowed **two-way binding**: the View could
+mutate state directly, state could mutate View. This is what Android's
+old `View` + `findViewById` + `setText` world looked like:
+
+```kotlin
+// Imperative, bidirectional — the bug factory
+class OrderActivity : AppCompatActivity() {
+    var total: Double = 0.0
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        /* ... */
+        binding.quantityEdit.addTextChangedListener {
+            total = binding.unitPriceText.text.toString().toDouble() * it.toString().toInt()
+            binding.totalText.text = "Total: $total"
+
+            // Also update the checkout button state...
+            binding.checkoutBtn.isEnabled = total > 0
+
+            // Oh and the badge...
+            binding.badge.text = "${binding.cartItems.size} items"
+
+            // And the discount indicator...
+            binding.discountLabel.visibility = if (total > 100) VISIBLE else GONE
+        }
+    }
+}
+```
+
+Every widget mutates the next. State is scattered across instance variables
+and view properties. A bug in quantity leaks into four visible places.
+Config changes reset everything. Testing requires an emulator.
+
+---
+
+## The UDF loop
+
+<Diagram title="UDF flow" caption="Events go up, state comes down. The reducer is pure.">
+  <ReduxFlowDiagram />
+</Diagram>
+
+```text
+┌───────────────────────────────────────────────────────────────┐
+│  VIEW (Compose / Fragment)                                    │
+│    observes state  ↑               emits intents  ↓           │
+│                                                                │
+│  STATE HOLDER (ViewModel + StateFlow)                         │
+│    holds one immutable UiState                                │
+│    receives intents; calls use cases                          │
+│    emits new state via _state.update { ... }                  │
+│                                                                │
+│  DOMAIN + DATA                                                 │
+│    use cases + repositories + network/DB                      │
+│    no knowledge of UI                                          │
+└───────────────────────────────────────────────────────────────┘
+```
+
+At every moment, the screen **is** the current state. There is no "current
+UI" that can disagree with the state. Rotate the device, kill the process,
+swap languages, the state re-renders identically.
+
+---
+
+## The three UDF laws
+
+### Law 1 — Single source of truth
+
+For every piece of state, exactly one location owns it. Everything else
+observes or derives.
+
+```kotlin
+// ❌ BROKEN — count lives in two places
+class ProductViewModel : ViewModel() {
+    val items = MutableStateFlow<List<Item>>(emptyList())
+    val itemCount = MutableStateFlow(0)   // out of sync if you forget to update both
+}
+
+// ✅ SOUND — items is the source; count is derived
+class ProductViewModel : ViewModel() {
+    val items = MutableStateFlow<List<Item>>(emptyList())
+    val itemCount: StateFlow<Int> = items
+        .map { it.size }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+}
+```
+
+At the app level, the source of truth is usually **Room** (the local DB).
+The network is a sync mechanism. The UI is an observer. See
+[Offline-First Architecture](/docs/architecture-patterns/offline-first).
+
+### Law 2 — State is immutable
+
+You never mutate state. You **produce a new state**.
+
+```kotlin
+// ❌ Mutation — defeats observability
+_state.value.copy().also { it.products += product }     // won't emit
+
+// ✅ New value — observers see the change
+_state.update { current ->
+    current.copy(products = current.products + product)
+}
+```
+
+Immutability is what makes `StateFlow` work: comparing old vs new via
+`==` detects change, and re-emission is cheap. Mutating in place breaks
+the entire reactive chain.
+
+### Law 3 — Events travel up; state travels down
+
+The View emits intents (clicks, scrolls, text input). The state holder
+receives them, updates state. The View re-observes.
+
+```kotlin
+// View side — stateless
+@Composable
+fun CatalogScreen(
+    state: CatalogUiState,                           // comes DOWN
+    onIntent: (CatalogIntent) -> Unit                // goes UP
+) {
+    LazyColumn {
+        items(state.products) { product ->
+            ProductRow(
+                product = product,
+                onClick = { onIntent(CatalogIntent.OpenProduct(product.id)) }
+            )
+        }
+    }
+}
+
+// State holder side
+class CatalogViewModel : ViewModel() {
+    private val _state = MutableStateFlow(CatalogUiState())
+    val state: StateFlow<CatalogUiState> = _state.asStateFlow()
+
+    fun onIntent(intent: CatalogIntent) { /* ... update _state ... */ }
+}
+```
+
+The View never owns state that affects behavior. The state holder never
+mutates the View.
+
+---
+
+## Why this works — the properties you gain
+
+<StepList steps={[
+  { title: 'Determinism', description: 'Given state X and intent Y, the next state Z is pure and repeatable. Tests assert this directly; no flaky timing.' },
+  { title: 'Time-travel debugging', description: 'Log every intent and state. Replay any session by replaying intents. A bug report = a log file.' },
+  { title: 'Config-change survival', description: 'Rotating the device re-renders the current state. Nothing to save and restore by hand.' },
+  { title: 'Testability', description: 'The state-holder becomes a pure function test. No Android runtime, no emulator, no Thread.sleep.' },
+  { title: 'Concurrency safety', description: 'Immutable state + atomic `update { }` means no race conditions on UI state. Compose commits are atomic too.' },
+  { title: 'Local reasoning', description: 'Every render is a function of the current state. To understand what you see, read one data class.' }
+]} />
+
+---
+
+## Anatomy of a UDF screen
+
+```kotlin
+// ───────────────────────────────────────────────
+// 1. The state — an immutable, exhaustive class
+// ───────────────────────────────────────────────
+@Immutable
+data class CheckoutUiState(
+    val phase: Phase = Phase.Initial,
+    val cart: Cart = Cart.Empty,
+    val address: Address? = null,
+    val paymentMethod: PaymentMethod? = null,
+    val discount: Discount? = null,
+    val total: Money = Money.Zero,
+    val error: String? = null
+) {
+    enum class Phase { Initial, AddressEntry, PaymentEntry, Review, Submitting, Confirmed }
+
+    val canSubmit: Boolean get() = phase == Phase.Review && address != null && paymentMethod != null
+}
+
+// ───────────────────────────────────────────────
+// 2. The intents — every user action
+// ───────────────────────────────────────────────
+sealed interface CheckoutIntent {
+    data object Start : CheckoutIntent
+    data class SelectAddress(val address: Address) : CheckoutIntent
+    data class SelectPayment(val method: PaymentMethod) : CheckoutIntent
+    data class ApplyDiscount(val code: String) : CheckoutIntent
+    data object Submit : CheckoutIntent
+    data object Retry : CheckoutIntent
+    data object Back : CheckoutIntent
+}
+
+// ───────────────────────────────────────────────
+// 3. The events — one-shot things that aren't state
+// ───────────────────────────────────────────────
+sealed interface CheckoutEvent {
+    data class NavigateToConfirmation(val orderId: String) : CheckoutEvent
+    data class ShowToast(val message: String) : CheckoutEvent
+}
+
+// ───────────────────────────────────────────────
+// 4. The state holder
+// ───────────────────────────────────────────────
+@HiltViewModel
+class CheckoutViewModel @Inject constructor(
+    private val cartRepo: CartRepository,
+    private val discountRepo: DiscountRepository,
+    private val paymentsRepo: PaymentsRepository
+) : ViewModel() {
+
+    private val _state = MutableStateFlow(CheckoutUiState())
+    val state: StateFlow<CheckoutUiState> = _state.asStateFlow()
+
+    private val _events = Channel<CheckoutEvent>(capacity = 64)
+    val events: Flow<CheckoutEvent> = _events.receiveAsFlow()
+
+    fun onIntent(intent: CheckoutIntent) = when (intent) {
+        CheckoutIntent.Start -> loadCart()
+        is CheckoutIntent.SelectAddress -> _state.update {
+            it.copy(address = intent.address, phase = CheckoutUiState.Phase.PaymentEntry)
+        }
+        is CheckoutIntent.SelectPayment -> _state.update {
+            it.copy(paymentMethod = intent.method, phase = CheckoutUiState.Phase.Review)
+        }
+        is CheckoutIntent.ApplyDiscount -> applyDiscount(intent.code)
+        CheckoutIntent.Submit -> submit()
+        CheckoutIntent.Retry -> retry()
+        CheckoutIntent.Back -> goBack()
+    }
+
+    private fun submit() {
+        val snapshot = _state.value
+        if (!snapshot.canSubmit) return
+
+        viewModelScope.launch {
+            _state.update { it.copy(phase = CheckoutUiState.Phase.Submitting, error = null) }
+            runCatching { paymentsRepo.charge(snapshot.cart, snapshot.address!!, snapshot.paymentMethod!!) }
+                .onSuccess { result ->
+                    _state.update { it.copy(phase = CheckoutUiState.Phase.Confirmed) }
+                    _events.send(CheckoutEvent.NavigateToConfirmation(result.orderId))
+                }
+                .onFailure { e ->
+                    _state.update { it.copy(phase = CheckoutUiState.Phase.Review, error = e.message) }
+                    _events.send(CheckoutEvent.ShowToast("Payment failed"))
+                }
+        }
+    }
+    /* ... */
+}
+
+// ───────────────────────────────────────────────
+// 5. The view — stateless, pure render
+// ───────────────────────────────────────────────
+@Composable
+fun CheckoutRoute(viewModel: CheckoutViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val navController = LocalNavController.current
+
+    LaunchedEffect(Unit) {
+        viewModel.events.collect { event ->
+            when (event) {
+                is CheckoutEvent.NavigateToConfirmation ->
+                    navController.navigate(Confirmation(event.orderId))
+                is CheckoutEvent.ShowToast ->
+                    /* show snackbar */
+            }
+        }
+    }
+
+    CheckoutScreen(state = state, onIntent = viewModel::onIntent)
+}
+```
+
+---
+
+## State vs events — the boundary
+
+Not everything is state. Some things fire **once** and should never replay.
+
+| Concept                  | State or Event?  | Why                                              |
+|--------------------------|------------------|--------------------------------------------------|
+| Product list             | State            | Re-renders identically on rotation               |
+| Loading indicator        | State            | Spinner keeps spinning if still loading          |
+| Error banner             | State            | Should stay visible after rotation               |
+| Snackbar / Toast         | Event            | Showing twice on rotation is wrong               |
+| Navigation action        | Event            | Re-navigating on rotation is a bug               |
+| Haptic feedback          | Event            | Vibrating again is annoying                      |
+| Selected tab index       | State            | Survives rotation                                |
+| Downloaded file name     | State            | The result is part of the screen                 |
+| "Saved!" confirmation    | Event            | One toast, then it's over                        |
+| Network retry count      | State            | Part of the current screen's context             |
+
+<Callout kind="danger" title="Don't hide events in state">
+A common anti-pattern is `data class UiState(val toast: String? = null, ...)`.
+After showing the toast, you set `toast = null`. If you forget, it replays on
+rotation. If you do it wrong, it races.
+
+**Use a Channel or SharedFlow with `replay = 0` for events.** The type
+system will stop you from observing an event twice.
+</Callout>
+
+---
+
+## Handling events without replays
+
+There are three correct patterns. Pick one per project and stay consistent.
+
+### Pattern A — Channel to Flow
+
+```kotlin
+private val _events = Channel<Event>(Channel.BUFFERED)
+val events: Flow<Event> = _events.receiveAsFlow()   // single consumer; no replay
+```
+
+Used above. Best for nav + snackbar streams. Each event is delivered
+**once**, even if the UI re-subscribes after rotation (the channel buffers
+until delivered).
+
+### Pattern B — SharedFlow with replay = 0
+
+```kotlin
+private val _events = MutableSharedFlow<Event>(replay = 0)
+val events: SharedFlow<Event> = _events.asSharedFlow()
+
+// emit via tryEmit or emit
+```
+
+Works well when you might have multiple consumers, but understand that
+events emitted while no collector is active are **lost**. Prefer Channel.
+
+### Pattern C — EffectFlow (MVI framework style)
+
+Libraries like Orbit expose `SideEffect` streams that are semantically
+channels but typed differently. Same idea — one-shot delivery.
+
+---
+
+## UDF beyond a single screen
+
+The same discipline applies at the app level — a global state store holds
+session, settings, feature flags:
+
+```kotlin
+@Singleton
+class AppStateStore @Inject constructor(
+    authRepo: AuthRepository,
+    settingsRepo: SettingsRepository,
+    featureFlags: FeatureFlags
+) {
+    val appState: StateFlow<AppState> = combine(
+        authRepo.userFlow,
+        settingsRepo.theme,
+        featureFlags.observe()
+    ) { user, theme, flags ->
+        AppState(user = user, theme = theme, flags = flags)
+    }.stateIn(
+        scope = ProcessLifecycleOwner.get().lifecycleScope,
+        started = SharingStarted.Eagerly,
+        initialValue = AppState.Initial
+    )
+}
+
+data class AppState(
+    val user: User? = null,
+    val theme: Theme = Theme.System,
+    val flags: FeatureFlags = FeatureFlags.Defaults
+) {
+    companion object { val Initial = AppState() }
+}
+```
+
+Feature ViewModels can observe `appState` for cross-cutting data without
+direct dependencies on each other.
+
+---
+
+## UDF and immutable collections
+
+`List<T>` is an interface — Compose can't prove it's immutable and treats
+it as unstable (impacts skippability). Use `ImmutableList` from
+`kotlinx.collections.immutable`:
+
+```kotlin
+@Immutable
+data class CatalogUiState(
+    val products: ImmutableList<Product> = persistentListOf()
+)
+```
+
+See [Compose Performance](/docs/jetpack-compose/performance) for the full
+stability story.
+
+---
+
+## Common UDF anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'What breaks UDF',
+    variant: 'old',
+    points: [
+      'Multiple Flow sources the UI has to combine',
+      'ViewModels calling each other directly',
+      'State stored as var properties on the VM',
+      'Views emitting state changes via callbacks that mutate data',
+      'Event types stored as state fields',
+      'Updating state from multiple threads without update { }'
+    ]
+  }}
+  right={{
+    label: 'UDF done right',
+    title: 'Proven patterns',
+    variant: 'new',
+    points: [
+      'One StateFlow<UiState> per screen (combine in VM)',
+      'ViewModels observe a shared AppState or repositories',
+      'Immutable UiState data class; _state.update { }',
+      'onIntent is the only input channel',
+      'Separate Channel<Event> for one-shots',
+      '_state.update { } is atomic; safe from any thread'
+    ]
+  }}
+/>
+
+---
+
+## Testing UDF
+
+Because the state holder is a pure function over state + intents, tests
+are trivial:
+
+```kotlin
+class CheckoutViewModelTest {
+    @get:Rule val mainDispatcher = MainDispatcherRule()
+
+    private val cartRepo = mockk<CartRepository>()
+    private val paymentsRepo = mockk<PaymentsRepository>()
+    private val vm = CheckoutViewModel(cartRepo, mockk(), paymentsRepo)
+
+    @Test fun `select address moves to payment entry`() = runTest {
+        vm.state.test {
+            assertEquals(CheckoutUiState.Phase.Initial, awaitItem().phase)
+
+            vm.onIntent(CheckoutIntent.SelectAddress(sampleAddress))
+
+            val next = awaitItem()
+            assertEquals(CheckoutUiState.Phase.PaymentEntry, next.phase)
+            assertEquals(sampleAddress, next.address)
+        }
+    }
+
+    @Test fun `submit failure returns to review with error`() = runTest {
+        coEvery { paymentsRepo.charge(any(), any(), any()) } throws IOException("no net")
+
+        vm.state.test {
+            skipItems(1)
+            vm.onIntent(CheckoutIntent.SelectAddress(sampleAddress))
+            skipItems(1)
+            vm.onIntent(CheckoutIntent.SelectPayment(samplePayment))
+            skipItems(1)
+            vm.onIntent(CheckoutIntent.Submit)
+
+            assertEquals(CheckoutUiState.Phase.Submitting, awaitItem().phase)
+            val failed = awaitItem()
+            assertEquals(CheckoutUiState.Phase.Review, failed.phase)
+            assertEquals("no net", failed.error)
+        }
+    }
+}
+```
+
+Every test is a statement about **this intent + this state → that state**.
+No emulator. No fragile timing.
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="UDF in one paragraph">
+Every screen has **one immutable state class**, **one intent type**, **one
+event channel**. The View renders from state and emits intents. The state
+holder receives intents and produces new state atomically via `update { }`.
+Events use a Channel, never state. Every piece of data has exactly one
+owner — the single source of truth.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Audit a screen', description: 'Pick a screen in your app. List every mutable variable. Ask which ones belong in UiState vs which are events. Move them.' },
+  { title: 'Collapse multiple Flows', description: 'Find a screen observing 3+ Flows. Combine them in the VM into a single StateFlow<UiState>.' },
+  { title: 'Add a replay-less event channel', description: 'Migrate a toast that shows twice on rotation to a Channel<Event>. Verify it fires exactly once.' },
+  { title: 'Test a reducer', description: 'Write 5 tests for your state holder asserting (state, intent) → state transitions. No mocks beyond the repositories.' }
+]} />
+
+## Continue reading
+
+- **[Hexagonal / Ports & Adapters](./hexagonal-ports-adapters)** — how UDF fits a broader architectural pattern
+- **[Dependency Injection](./dependency-injection)** — wiring the state holder and its collaborators
+- **[Error Handling](./error-handling)** — typed errors that survive the UDF pipeline

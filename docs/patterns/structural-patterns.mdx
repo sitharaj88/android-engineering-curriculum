@@ -1,0 +1,602 @@
+---
+id: structural-patterns
+title: Structural Patterns
+sidebar_label: Structural Patterns
+description: All seven GoF structural patterns with Kotlin/Android code — Adapter, Bridge, Composite, Decorator, Facade, Flyweight, Proxy.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Structural Patterns
+
+Structural patterns shape **how objects and classes compose** to form
+larger structures. The Android framework and Jetpack libraries are a
+catalog of these patterns in production — once you can name them, you see
+them everywhere.
+
+## 1. Adapter — convert one interface to another
+
+**Intent**: Wrap an object in a new interface that the consumer expects.
+
+### The classic — `RecyclerView.Adapter`
+
+The canonical Android example. Your data model doesn't match the View
+recycling protocol, so an adapter bridges the two:
+
+```kotlin
+class ProductAdapter(
+    private val products: List<Product>,
+    private val onClick: (Product) -> Unit
+) : RecyclerView.Adapter<ProductAdapter.ViewHolder>() {
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
+        val binding = ItemProductBinding.inflate(LayoutInflater.from(parent.context), parent, false)
+        return ViewHolder(binding, onClick)
+    }
+
+    override fun onBindViewHolder(holder: ViewHolder, position: Int) {
+        holder.bind(products[position])
+    }
+
+    override fun getItemCount() = products.size
+
+    class ViewHolder(private val binding: ItemProductBinding, private val onClick: (Product) -> Unit) : RecyclerView.ViewHolder(binding.root) {
+        fun bind(product: Product) {
+            binding.name.text = product.name
+            binding.price.text = product.price.format()
+            binding.root.setOnClickListener { onClick(product) }
+        }
+    }
+}
+```
+
+### Mappers as adapters
+
+In clean architecture, mappers (`DTO → Entity → Domain`) are adapters.
+They translate shapes between layers without leaking representations.
+
+```kotlin
+// :data/remote
+data class ProductDto(
+    val id: String,
+    val name: String?,               // server can return null
+    @Json(name = "price_cents") val priceCents: Long?,
+    val images: List<String>? = null
+)
+
+// :data/local
+@Entity(tableName = "products")
+data class ProductEntity(
+    @PrimaryKey val id: String,
+    val name: String,
+    val priceCents: Long,
+    val imagesCsv: String,
+    val fetchedAt: Long
+)
+
+// :domain
+data class Product(
+    val id: ProductId,
+    val name: NonEmptyString,
+    val price: Money,
+    val images: ImmutableList<Url>
+)
+
+// Adapters — parse DTO into Entity, Entity into Domain
+fun ProductDto.toEntity(now: Long = System.currentTimeMillis()) = ProductEntity(
+    id = id,
+    name = name ?: error("Product name missing"),
+    priceCents = priceCents ?: 0L,
+    imagesCsv = images?.joinToString(",") ?: "",
+    fetchedAt = now
+)
+
+fun ProductEntity.toDomain() = Product(
+    id = ProductId(id),
+    name = NonEmptyString(name),
+    price = Money.fromCents(priceCents),
+    images = imagesCsv.split(",").filter { it.isNotBlank() }.map(::Url).toImmutableList()
+)
+```
+
+<Callout kind="tip" title="Three layers, three shapes">
+Keep the shapes intentionally different. DTOs are **lenient** (nullable,
+extra fields tolerated). Entities are **storage-optimized** (serialized
+collections, denormalized). Domain types are **strict** (non-null,
+typed). Resisting the temptation to collapse them saves you from a
+thousand bugs.
+</Callout>
+
+### Kotlin extension functions as adapters
+
+```kotlin
+// Adapt Retrofit Response<T> into an Outcome<T, ApiError>
+fun <T> Response<T>.toOutcome(): Outcome<T, ApiError> = when {
+    isSuccessful -> body()?.let(Outcome::Ok) ?: Outcome.Err(ApiError.EmptyBody)
+    code() == 401 -> Outcome.Err(ApiError.Unauthorized)
+    code() in 500..599 -> Outcome.Err(ApiError.Server(code()))
+    else -> Outcome.Err(ApiError.Unknown(code()))
+}
+```
+
+Extension functions shine for ad-hoc adaptation — no interface, no class,
+just a conversion.
+
+---
+
+## 2. Bridge — decouple abstraction from implementation
+
+**Intent**: Separate an abstraction from its implementation so both can
+vary independently.
+
+### The shape
+
+```kotlin
+// Abstraction
+abstract class NotificationRenderer(protected val transport: NotificationTransport) {
+    abstract fun notify(event: NotificationEvent)
+}
+
+// Refined abstractions — vary on the "what to render" axis
+class RichNotificationRenderer(transport: NotificationTransport) : NotificationRenderer(transport) {
+    override fun notify(event: NotificationEvent) {
+        val payload = renderRichPayload(event)     // image, action buttons
+        transport.send(payload)
+    }
+}
+
+class TextOnlyRenderer(transport: NotificationTransport) : NotificationRenderer(transport) {
+    override fun notify(event: NotificationEvent) {
+        transport.send(renderTextPayload(event))
+    }
+}
+
+// Implementations — vary on the "how to deliver" axis
+interface NotificationTransport {
+    fun send(payload: NotificationPayload)
+}
+
+class FcmTransport @Inject constructor(...) : NotificationTransport { override fun send(...) }
+class EmailTransport @Inject constructor(...) : NotificationTransport { override fun send(...) }
+class SmsTransport @Inject constructor(...) : NotificationTransport { override fun send(...) }
+```
+
+Now you have **2 renderers × 3 transports = 6 combinations** from just
+5 classes. Without Bridge, you'd need 6 classes.
+
+### When to recognize it
+
+Anytime you have "M variations of X combined with N variations of Y," the
+Bridge pattern keeps the combinatorial explosion in check. Examples:
+
+- Themes (light/dark) × Components (button/card/chip) — Material 3 is
+  structured this way
+- Codecs (H.264/H.265/AV1) × Containers (MP4/MKV/WebM)
+- Renderers (Compose/XML) × State holders (MVVM/MVI)
+
+---
+
+## 3. Composite — treat groups and individuals uniformly
+
+**Intent**: Compose objects into tree structures where clients treat
+individual objects and compositions uniformly.
+
+### Compose's UI tree IS a Composite
+
+Every `@Composable` produces a node. Container composables (`Column`,
+`Row`, `Box`) hold children; leaf composables (`Text`, `Image`) don't.
+Both are rendered by the same system — that's the composite pattern.
+
+```kotlin
+@Composable
+fun App() {
+    Column {                          // composite
+        Header()                      // could be composite or leaf
+        Row {                         // composite
+            Icon(Icons.Default.Home, null)   // leaf
+            Text("Home")                     // leaf
+        }
+        LazyColumn {                   // composite with dynamic children
+            items(messages) { Message(it) }
+        }
+    }
+}
+```
+
+Every `Modifier` chain is also a composite — each modifier wraps the next.
+
+### Custom composite — navigation tree
+
+```kotlin
+sealed interface NavNode {
+    val id: String
+    val title: String
+}
+
+data class NavLeaf(
+    override val id: String,
+    override val title: String,
+    val destination: Destination
+) : NavNode
+
+data class NavGroup(
+    override val id: String,
+    override val title: String,
+    val children: List<NavNode>
+) : NavNode
+
+// Uniform traversal — treats leaves and groups the same
+fun NavNode.flatten(): List<NavLeaf> = when (this) {
+    is NavLeaf -> listOf(this)
+    is NavGroup -> children.flatMap { it.flatten() }
+}
+
+fun NavNode.findById(id: String): NavNode? = when (this) {
+    is NavLeaf -> if (this.id == id) this else null
+    is NavGroup -> if (this.id == id) this else children.firstNotNullOfOrNull { it.findById(id) }
+}
+```
+
+### Android examples of composite
+
+- **View tree** — `ViewGroup` contains `View`s; both extend `View`
+- **Fragment tree** — parent fragments contain child fragments
+- **Navigation graph** — `NavGraph` contains `NavDestination`s (both extend `NavDestination`)
+- **File system** — directories and files share one API
+
+---
+
+## 4. Decorator — add behavior without subclassing
+
+**Intent**: Attach additional responsibilities to an object dynamically.
+
+### Interceptor-as-decorator — OkHttp
+
+OkHttp's interceptor chain is a pure decorator pattern. Each interceptor
+wraps the next and can modify the request/response:
+
+```kotlin
+class AuthInterceptor @Inject constructor(
+    private val sessionStore: SessionStore
+) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val token = sessionStore.currentToken ?: return chain.proceed(chain.request())
+        val authedRequest = chain.request().newBuilder()
+            .header("Authorization", "Bearer $token")
+            .build()
+        return chain.proceed(authedRequest)
+    }
+}
+
+class LoggingInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val req = chain.request()
+        val start = System.nanoTime()
+        val response = chain.proceed(req)
+        val durMs = (System.nanoTime() - start) / 1_000_000
+        Log.d("HTTP", "${req.method} ${req.url} -> ${response.code} in ${durMs}ms")
+        return response
+    }
+}
+
+val client = OkHttpClient.Builder()
+    .addInterceptor(AuthInterceptor(sessionStore))
+    .addInterceptor(LoggingInterceptor())
+    .addInterceptor(CacheInterceptor())
+    .build()
+```
+
+### Wrapping repositories — cross-cutting behavior
+
+```kotlin
+class CachingProductRepository(
+    private val delegate: ProductRepository,
+    private val cache: Cache<ProductId, Product>
+) : ProductRepository {
+    override suspend fun fetch(id: ProductId): Product = cache.getOrPut(id) { delegate.fetch(id) }
+    override suspend fun invalidate(id: ProductId) { cache.remove(id); delegate.invalidate(id) }
+}
+
+class LoggingProductRepository(
+    private val delegate: ProductRepository,
+    private val logger: Logger
+) : ProductRepository {
+    override suspend fun fetch(id: ProductId): Product {
+        logger.info("fetching product $id")
+        return delegate.fetch(id).also { logger.info("fetched $id") }
+    }
+}
+
+// Compose at the DI layer
+@Provides @Singleton
+fun provideProductRepository(
+    impl: ProductRepositoryImpl,
+    cache: ProductCache,
+    logger: Logger
+): ProductRepository = LoggingProductRepository(
+    delegate = CachingProductRepository(delegate = impl, cache = cache),
+    logger = logger
+)
+```
+
+Decorators compose from the inside out. The outer one sees logs first,
+then caching, then the real impl.
+
+### Modifier as decorator
+
+```kotlin
+Modifier
+    .padding(16.dp)                        // outer wrapper
+    .clip(RoundedCornerShape(8.dp))
+    .background(Color.Blue)
+    .clickable { onClick() }               // inner wrapper
+```
+
+Each modifier wraps the next with additional behavior — drawing, clicks,
+clipping. See [Modifiers Deep Dive](/docs/jetpack-compose/modifiers-deep-dive).
+
+---
+
+## 5. Facade — simplify a complex subsystem
+
+**Intent**: Provide a unified interface to a set of interfaces in a
+subsystem.
+
+### Repository as facade
+
+A `Repository` hides network, cache, parsing, threading, and error-mapping
+behind a single coherent interface:
+
+```kotlin
+class OrderRepositoryImpl @Inject constructor(
+    private val api: OrderApi,                         // Retrofit
+    private val dao: OrderDao,                         // Room
+    private val syncWorker: SyncWorker,                 // WorkManager
+    private val eventBus: DomainEventBus,               // event publisher
+    @IoDispatcher private val io: CoroutineDispatcher
+) : OrderRepository {
+
+    override fun observe(userId: UserId): Flow<List<Order>> = dao.observeByUser(userId.raw)
+        .map { list -> list.map(OrderEntity::toDomain) }
+
+    override suspend fun place(order: Order): Outcome<OrderId, OrderError> = withContext(io) {
+        try {
+            val response = api.placeOrder(order.toRequest())
+            dao.upsert(response.toEntity())
+            eventBus.publish(OrderEvent.Placed(response.id))
+            Outcome.Ok(OrderId(response.id))
+        } catch (c: CancellationException) { throw c }
+        catch (e: IOException) { Outcome.Err(OrderError.Network) }
+        catch (e: HttpException) { Outcome.Err(OrderError.fromHttp(e)) }
+    }
+}
+```
+
+Callers see one method: `repository.place(order)`. Behind it: four
+subsystems, two threads, four error types. That's a facade.
+
+### Application class as façade
+
+Your `MyApp` often hides DI initialization, Crashlytics setup, Timber
+trees, and analytics bootstrap:
+
+```kotlin
+@HiltAndroidApp
+class MyApp : Application() {
+
+    @Inject lateinit var crashReporter: CrashReporter
+    @Inject lateinit var analytics: Analytics
+    @Inject lateinit var featureFlags: FeatureFlags
+    @Inject lateinit var initializers: Set<@JvmSuppressWildcards AppInitializer>
+
+    override fun onCreate() {
+        super.onCreate()
+        Timber.plant(if (BuildConfig.DEBUG) Timber.DebugTree() else CrashReportingTree(crashReporter))
+        initializers.forEach { it.initialize() }
+        analytics.setUser(/* ... */)
+        featureFlags.warm()
+    }
+}
+```
+
+### Android SDK facades
+
+- `NotificationManagerCompat` — facade for platform notification APIs across SDK versions
+- `Firebase` (as `Firebase.auth`, `Firebase.firestore`) — facades for each service's complex subsystem
+- `WorkManager` — hides `JobScheduler`, `AlarmManager`, and the old `GcmNetworkManager`
+- `CameraX` — facade over the messy `Camera2` API
+
+---
+
+## 6. Flyweight — share common state across many instances
+
+**Intent**: Use sharing to support large numbers of fine-grained objects
+efficiently.
+
+### The problem it solves
+
+Imagine a LazyColumn rendering 10,000 text items with the same style.
+Each `TextStyle` has color, font, size, letter spacing — ~100 bytes. At
+10,000 copies that's 1 MB for duplicate style info.
+
+**Flyweight separates intrinsic state (shared) from extrinsic state
+(per-instance)**:
+
+```kotlin
+// Intrinsic — shared across all usages
+data class TextStyleFlyweight(
+    val color: Color,
+    val fontSize: TextUnit,
+    val fontWeight: FontWeight,
+    val letterSpacing: TextUnit
+)
+
+// The registry — hands out shared instances
+object TextStyles {
+    val bodyLarge = TextStyleFlyweight(Color.Black, 16.sp, FontWeight.Normal, 0.5.sp)
+    val bodyMedium = TextStyleFlyweight(Color.Black, 14.sp, FontWeight.Normal, 0.25.sp)
+    val titleLarge = TextStyleFlyweight(Color.Black, 22.sp, FontWeight.Medium, 0.sp)
+    // ... just 5 instances, regardless of how many Texts render them
+}
+
+// Extrinsic — passed in per-render
+@Composable
+fun StyledText(content: String, style: TextStyleFlyweight) {
+    /* render using style */
+}
+```
+
+### Real Android examples
+
+- **String interning** — identical String literals share memory
+- **Drawable constant state** — `ColorDrawable(RED)` shares a `ConstantState` across instances
+- **Typeface cache** — `Typeface.create()` returns a cached instance per family/style
+- **Paint objects** — reusable paint instances in custom Views
+- **Compose font caching** — `Typeface` objects are cached, so rendering
+  10,000 Texts with the same style doesn't allocate 10,000 Typefaces
+
+### Shared resources in Jetpack
+
+```kotlin
+// androidx.core.graphics.drawable uses flyweight internally
+val tint = ColorStateList.valueOf(Color.BLUE)   // immutable, safe to share
+button1.backgroundTintList = tint
+button2.backgroundTintList = tint
+button3.backgroundTintList = tint
+// All three share the same ColorStateList instance
+```
+
+### When Flyweight hurts
+
+- Under contention — if intrinsic state mutations are possible, shared
+  instances break
+- Small caches — pointless if you have 10 items total
+- Debug complexity — shared state means harder-to-reproduce bugs
+
+Flyweight is almost always an **optimization** applied after profiling,
+not a pattern you reach for eagerly.
+
+---
+
+## 7. Proxy — control access to an object
+
+**Intent**: Provide a surrogate or placeholder for another object to
+control access to it.
+
+### Four common proxy variants
+
+#### Lazy proxy — defer expensive creation
+
+```kotlin
+class LazyAnalytics : Analytics {
+    private val real: Analytics by lazy { FirebaseAnalyticsImpl() }
+    override fun log(event: Event) = real.log(event)
+}
+```
+
+Kotlin's `by lazy` is a built-in lazy proxy.
+
+#### Caching proxy — short-circuit repeat calls
+
+See the `CachingProductRepository` above — a proxy that adds caching.
+
+#### Protection proxy — authorization
+
+```kotlin
+class AuthorizedOrderRepository @Inject constructor(
+    private val delegate: OrderRepository,
+    private val permissions: PermissionChecker
+) : OrderRepository {
+    override suspend fun place(order: Order): Outcome<OrderId, OrderError> {
+        if (!permissions.canPlaceOrders(order.userId)) {
+            return Outcome.Err(OrderError.Unauthorized)
+        }
+        return delegate.place(order)
+    }
+}
+```
+
+#### Remote proxy — hide the network
+
+Retrofit's `@GET`-annotated interfaces are proxies. You write:
+
+```kotlin
+interface UserApi {
+    @GET("users/{id}")
+    suspend fun getUser(@Path("id") id: String): UserDto
+}
+
+val api: UserApi = retrofit.create(UserApi::class.java)
+api.getUser("u1")    // looks local; it's HTTP
+```
+
+Retrofit generates an implementation that proxies your interface calls
+into HTTP requests. The caller doesn't know (or care) it's remote.
+
+### Hilt provider — `Provider<T>` and `Lazy<T>`
+
+Dagger/Hilt's `Provider<T>` and `Lazy<T>` are proxies that control
+instantiation:
+
+```kotlin
+class MyViewModel @Inject constructor(
+    private val expensiveClientLazy: dagger.Lazy<ExpensiveClient>   // created on first .get()
+) : ViewModel() {
+    fun onAction() {
+        val client = expensiveClientLazy.get()    // instantiated here, not earlier
+    }
+}
+```
+
+Use `dagger.Lazy` to defer expensive construction until it's actually
+needed — a lazy proxy hidden in the DI graph.
+
+### ContentResolver as proxy
+
+`ContentResolver.query(...)` proxies into ContentProvider in another
+process. Your code looks local; it's cross-process IPC. Same for `Binder`
+interfaces in general.
+
+---
+
+## Structural family at a glance
+
+| Pattern     | Adds what                           | Common Android examples                                |
+|-------------|-------------------------------------|--------------------------------------------------------|
+| Adapter     | Shape conversion                    | RecyclerView.Adapter, DTO/Entity/Domain mappers        |
+| Bridge      | Decouple two axes of variation      | Renderer × Transport; Theme × Component                |
+| Composite   | Tree of same-typed nodes            | Compose UI tree, View tree, NavGraph                   |
+| Decorator   | Additive behavior                   | OkHttp Interceptors, Modifier chain                    |
+| Facade      | Simpler API for complex subsystem   | Repository, Firebase.*, WorkManager, CameraX          |
+| Flyweight   | Memory sharing                      | String intern, Typeface cache, Drawable ConstantState  |
+| Proxy       | Control access                      | Retrofit impls, Dagger `Provider`/`Lazy`, ContentResolver |
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Structural pattern rules">
+- **Adapter** is the mapper layer between DTO/Entity/Domain — it lives in `:data`.
+- **Bridge** separates "what varies" from "how it varies." Ask: do I have M × N combinations?
+- **Composite** is the UI tree, navigation graph, filesystem — anywhere leaves and groups share an interface.
+- **Decorator** is the cross-cutting tool — caching, logging, auth, retry. Compose at the DI layer.
+- **Facade** is the repository, the Application class, and every Firebase sub-API.
+- **Flyweight** is an optimization for memory — look at intrinsic vs extrinsic state separation.
+- **Proxy** controls access — lazy, remote, protection, caching — Retrofit generates them; Hilt does too.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Build a decorator chain', description: 'Take a repository. Wrap its real impl with a LoggingX + CachingX + RetryingX decorator chain. Bind the final stack in Hilt.' },
+  { title: 'Bridge two axes', description: 'Pick a feature with two independent variation axes (e.g., notification type × transport). Model with Bridge.' },
+  { title: 'Write a protection proxy', description: 'Add an AuthorizedRepository that checks a PermissionChecker before each call. Bind it in front of the real repo in Hilt.' },
+  { title: 'Flyweight a theme', description: 'Identify a repeated style in your app (1000+ Text instances with identical style). Extract into a shared TextStyle constant. Measure memory savings.' },
+  { title: 'Adapter refactor', description: 'Find a ViewModel that reads DTO fields directly. Introduce a DTO.toDomain() adapter and make the ViewModel consume the domain type only.' }
+]} />
+
+## Continue reading
+
+- **[Creational Patterns](./creational-patterns)** — object construction
+- **[Behavioral Patterns](./behavioral-patterns)** — distributing responsibility
+- **[Component Patterns](./component-patterns)** — slot APIs as Compose structural patterns

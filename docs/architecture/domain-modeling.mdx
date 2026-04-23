@@ -1,0 +1,586 @@
+---
+id: domain-modeling
+title: Domain Modeling
+sidebar_label: Domain Modeling
+description: Entities vs value objects, aggregates, invariants, domain events, specification pattern, and making illegal states unrepresentable with Kotlin's type system.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Domain Modeling
+
+A well-modeled domain is one where **the types tell the truth** — and
+where illegal states **can't be expressed**. Bad domain models scatter
+validation across 30 files and still miss cases; good ones let the
+compiler reject the bug. This chapter covers the DDD vocabulary (entities,
+value objects, aggregates, domain events, specifications) and shows how
+Kotlin's type system makes it all lightweight.
+
+<Callout kind="tip" title="The north star">
+**Make illegal states unrepresentable.** If `Email` can only exist when
+the string is valid, you'll never check `isValidEmail(x)` again. Put
+invariants in constructors, not in spread-out validation code.
+</Callout>
+
+## Entities vs value objects
+
+Two fundamental kinds of domain types.
+
+### Entity — has identity
+
+```kotlin
+data class User(
+    val id: UserId,          // identity — what makes it "the same user"
+    val name: String,
+    val email: Email,
+    val createdAt: Instant
+)
+```
+
+Two `User`s with the same `name` but different `id` are **different
+users**. Identity is the defining attribute.
+
+### Value object — defined entirely by its fields
+
+```kotlin
+@JvmInline
+value class Email(val raw: String) {
+    init {
+        require(raw.matches(EMAIL_REGEX)) { "Invalid email: $raw" }
+    }
+    companion object {
+        private val EMAIL_REGEX = Regex("""^[^@\s]+@[^@\s]+\.[^@\s]+$""")
+    }
+}
+```
+
+Two `Email`s with the same string are the **same email**. No identity
+beyond the value.
+
+<Callout kind="success" title="The rule of thumb">
+If replacing one object with another (same contents, different instance)
+changes meaning — it's an **entity**. If the two are interchangeable,
+it's a **value object**.
+</Callout>
+
+---
+
+## Value classes — Kotlin's superpower for domain modeling
+
+`@JvmInline value class` wraps a primitive with type safety at **zero
+runtime cost** (usually). Perfect for IDs, measurements, currency:
+
+```kotlin
+@JvmInline value class UserId(val raw: String)
+@JvmInline value class OrderId(val raw: String)
+@JvmInline value class ProductId(val raw: String)
+@JvmInline value class Cents(val raw: Long) {
+    operator fun plus(other: Cents) = Cents(raw + other.raw)
+    operator fun minus(other: Cents) = Cents(raw - other.raw)
+    operator fun times(quantity: Int) = Cents(raw * quantity)
+    val dollars: Double get() = raw / 100.0
+}
+@JvmInline value class Meters(val raw: Double) {
+    fun toKm() = Kilometers(raw / 1000)
+}
+@JvmInline value class Kilometers(val raw: Double)
+```
+
+Now the compiler prevents `charge(user.id, orderTotal)` vs `charge(order.id,
+userTotal)` mixups:
+
+```kotlin
+// Before — easy to swap argument order
+fun charge(userId: String, orderId: String, cents: Long)
+charge(order.id, user.id, 4999)   // bug!
+
+// After — swap produces a compile error
+fun charge(userId: UserId, orderId: OrderId, amount: Cents)
+charge(user.id, order.id, Cents(4999))   // compile-check
+```
+
+### Validation in the constructor
+
+```kotlin
+@JvmInline
+value class PositiveInt(val raw: Int) {
+    init { require(raw > 0) { "Must be positive: $raw" } }
+}
+
+@JvmInline
+value class PhoneNumber(val raw: String) {
+    init {
+        require(raw.matches(PHONE_REGEX)) { "Invalid phone: $raw" }
+    }
+    companion object { val PHONE_REGEX = Regex("""\+?[1-9]\d{1,14}""") }
+}
+```
+
+A `PhoneNumber` value cannot exist unless the string is valid. No
+`validatePhone()` checks scattered across the codebase.
+
+### Smart constructors
+
+For error handling without exceptions, return `Outcome`:
+
+```kotlin
+@JvmInline
+value class Email private constructor(val raw: String) {
+    companion object {
+        private val REGEX = Regex("""^[^@\s]+@[^@\s]+\.[^@\s]+$""")
+
+        fun parse(raw: String): Outcome<Email, EmailError> {
+            val trimmed = raw.trim().lowercase()
+            return when {
+                trimmed.isBlank() -> Outcome.Err(EmailError.Blank)
+                !trimmed.matches(REGEX) -> Outcome.Err(EmailError.InvalidFormat)
+                else -> Outcome.Ok(Email(trimmed))
+            }
+        }
+    }
+}
+
+sealed interface EmailError {
+    data object Blank : EmailError
+    data object InvalidFormat : EmailError
+}
+```
+
+Now UI validation uses the same rules as the domain — no duplication:
+
+```kotlin
+when (val result = Email.parse(input)) {
+    is Outcome.Ok -> _state.update { it.copy(email = result.value, emailError = null) }
+    is Outcome.Err -> _state.update { it.copy(emailError = result.error) }
+}
+```
+
+---
+
+## Aggregates — consistency boundaries
+
+An **aggregate** is a cluster of entities + value objects that change
+together and must remain internally consistent. One entity acts as the
+**aggregate root** — the only entry point.
+
+```kotlin
+// Aggregate root: Order
+// Contained entities: LineItem (has identity within the order)
+// Value objects: Address, Money, OrderStatus
+
+data class Order(
+    val id: OrderId,
+    val userId: UserId,
+    val items: List<LineItem>,
+    val shippingAddress: Address,
+    val subtotal: Money,
+    val tax: Money,
+    val total: Money,
+    val status: OrderStatus,
+    val placedAt: Instant
+) {
+    init {
+        require(items.isNotEmpty()) { "Order must have at least one item" }
+        require(total == subtotal + tax) { "Total must equal subtotal + tax" }
+    }
+
+    fun cancel(reason: String): Outcome<Order, OrderError> = when (status) {
+        OrderStatus.Placed -> Outcome.Ok(copy(status = OrderStatus.Cancelled(reason)))
+        OrderStatus.Shipped -> Outcome.Err(OrderError.AlreadyShipped)
+        is OrderStatus.Cancelled -> Outcome.Err(OrderError.AlreadyCancelled)
+        OrderStatus.Delivered -> Outcome.Err(OrderError.AlreadyDelivered)
+    }
+
+    fun addItem(item: LineItem): Outcome<Order, OrderError> = when (status) {
+        OrderStatus.Placed -> Outcome.Ok(copy(
+            items = items + item,
+            subtotal = subtotal + item.lineTotal,
+            total = total + item.lineTotal    // simplified
+        ))
+        else -> Outcome.Err(OrderError.CannotModify)
+    }
+}
+
+data class LineItem(
+    val id: LineItemId,         // local identity within the order
+    val productId: ProductId,
+    val quantity: PositiveInt,
+    val unitPrice: Money
+) {
+    val lineTotal: Money get() = unitPrice * quantity.raw
+}
+
+sealed interface OrderStatus {
+    data object Placed : OrderStatus
+    data object Shipped : OrderStatus
+    data object Delivered : OrderStatus
+    data class Cancelled(val reason: String) : OrderStatus
+}
+```
+
+**Rules of aggregates:**
+
+1. **One aggregate root per aggregate.** Other entities inside the
+   aggregate are accessed only via the root.
+2. **The root enforces invariants** across its children. Transactions
+   are per-aggregate.
+3. **Other aggregates reference by ID**, not by direct object reference.
+   `Order` holds `UserId`, not `User` — keeping the aggregate small.
+4. **Mutations return new aggregates** (immutable updates via `.copy()`).
+   Consistency is checked in the constructor.
+
+---
+
+## Making illegal states unrepresentable
+
+This is the core idea. Examples:
+
+### Instead of boolean flags
+
+```kotlin
+// ❌ Multiple valid states that shouldn't be
+data class Payment(
+    val amount: Money,
+    val chargedAt: Instant? = null,
+    val refundedAt: Instant? = null,
+    val failedAt: Instant? = null
+)
+// Both chargedAt and failedAt set at once? Undefined. Bug-prone.
+
+// ✅ Sealed hierarchy — one state at a time
+sealed interface PaymentState {
+    data object Pending : PaymentState
+    data class Charged(val chargedAt: Instant) : PaymentState
+    data class Refunded(val chargedAt: Instant, val refundedAt: Instant) : PaymentState
+    data class Failed(val failedAt: Instant, val reason: PaymentError) : PaymentState
+}
+
+data class Payment(val amount: Money, val state: PaymentState)
+```
+
+### Instead of nullable combinations
+
+```kotlin
+// ❌ Nullable fields let all combinations exist
+data class Session(
+    val user: User? = null,
+    val expiresAt: Instant? = null,
+    val accessToken: String? = null
+)
+// user=null, token=xyz? Makes no sense.
+
+// ✅ Sealed — either signed in (everything) or signed out (nothing)
+sealed interface Session {
+    data object SignedOut : Session
+    data class SignedIn(
+        val user: User,
+        val accessToken: AccessToken,
+        val expiresAt: Instant
+    ) : Session
+}
+```
+
+### Instead of Int ranges
+
+```kotlin
+// ❌ Any Int is accepted — 150%? negative?
+data class Discount(val percentOff: Int)
+
+// ✅ Constrained value class
+@JvmInline
+value class DiscountPercent(val raw: Int) {
+    init { require(raw in 0..100) }
+}
+
+data class Discount(val percentOff: DiscountPercent)
+```
+
+---
+
+## Domain events — things that happened
+
+Business logic often triggers cross-cutting effects: order placed →
+notify the user, update inventory, ship a fulfillment request. Model these
+as **domain events**:
+
+```kotlin
+sealed interface DomainEvent {
+    val occurredAt: Instant
+}
+
+sealed interface OrderEvent : DomainEvent {
+    val orderId: OrderId
+
+    data class Placed(override val orderId: OrderId, override val occurredAt: Instant, val userId: UserId, val total: Money) : OrderEvent
+    data class Cancelled(override val orderId: OrderId, override val occurredAt: Instant, val reason: String) : OrderEvent
+    data class Shipped(override val orderId: OrderId, override val occurredAt: Instant, val trackingNumber: String) : OrderEvent
+}
+
+// Use case emits events
+class PlaceOrderUseCase @Inject constructor(
+    private val orders: OrderRepository,
+    private val eventBus: DomainEventBus,
+    private val clock: Clock
+) {
+    suspend operator fun invoke(cart: Cart): Outcome<Order, OrderError> {
+        val order = Order.create(cart, clock.now())
+        orders.save(order)
+        eventBus.publish(OrderEvent.Placed(order.id, clock.now(), cart.userId, order.total))
+        return Outcome.Ok(order)
+    }
+}
+
+// Subscribers react
+@Singleton
+class OrderNotificationHandler @Inject constructor(
+    private val notifier: NotificationSender,
+    eventBus: DomainEventBus
+) {
+    init {
+        eventBus.subscribe<OrderEvent.Placed> { event ->
+            notifier.notify(event.userId, "Your order ${event.orderId.raw} is placed")
+        }
+    }
+}
+```
+
+Domain events decouple the core transaction from its side effects. The
+`PlaceOrderUseCase` doesn't need to know about every notification, sync,
+or analytics downstream.
+
+### In-process vs distributed
+
+- **In-process** event bus — a simple `MutableSharedFlow<DomainEvent>`
+  inside the app. Fine for a single-device app.
+- **Distributed** — publish to a message broker (Kafka, Google Cloud
+  Pub/Sub) so backend services can react. Typical for microservices.
+
+```kotlin
+@Singleton
+class InProcessEventBus @Inject constructor() : DomainEventBus {
+    private val _events = MutableSharedFlow<DomainEvent>(extraBufferCapacity = 64)
+    val events: SharedFlow<DomainEvent> = _events.asSharedFlow()
+
+    override suspend fun publish(event: DomainEvent) { _events.emit(event) }
+
+    override inline fun <reified T : DomainEvent> subscribe(crossinline handler: suspend (T) -> Unit): Job =
+        GlobalScope.launch {
+            events.filterIsInstance<T>().collect { handler(it) }
+        }
+}
+```
+
+---
+
+## Specification pattern — reusable rules
+
+When business rules compose in many ways, a **Specification** encapsulates
+one predicate that can be combined with others:
+
+```kotlin
+fun interface Specification<T> {
+    fun isSatisfiedBy(candidate: T): Boolean
+
+    infix fun and(other: Specification<T>) = Specification<T> { candidate ->
+        isSatisfiedBy(candidate) && other.isSatisfiedBy(candidate)
+    }
+    infix fun or(other: Specification<T>) = Specification<T> { candidate ->
+        isSatisfiedBy(candidate) || other.isSatisfiedBy(candidate)
+    }
+    operator fun not() = Specification<T> { !isSatisfiedBy(it) }
+}
+
+// Concrete specs
+val IsPremiumCustomer = Specification<Order> { it.userId in premiumUserIds }
+val IsLargeOrder = Specification<Order> { it.total >= Money.Dollars(500) }
+val IsInternational = Specification<Order> { it.shippingAddress.country != "US" }
+
+// Compose them
+val QualifiesForPriorityShipping = IsPremiumCustomer or IsLargeOrder
+val QualifiesForCustomsDeclaration = IsInternational and IsLargeOrder
+
+// Use
+if (QualifiesForPriorityShipping.isSatisfiedBy(order)) {
+    shipping.markPriority(order)
+}
+```
+
+The specification pattern is popular when rules are defined by
+non-engineers (business analysts, domain experts) — the composable
+predicate style matches how they think.
+
+---
+
+## Parsing vs validation — the Alexis King principle
+
+Don't validate. **Parse.**
+
+```kotlin
+// ❌ Validation — boolean + data; easy to skip
+fun isValidUserInput(input: UserInput): Boolean = ...
+fun processInput(input: UserInput) {
+    if (!isValidUserInput(input)) return
+    // ...but a future developer can forget this check
+}
+
+// ✅ Parsing — a new type that can only exist if valid
+data class ValidatedUserInput(val email: Email, val name: NonEmptyString)
+
+fun parse(input: RawInput): Outcome<ValidatedUserInput, List<ValidationError>> = ...
+
+fun processInput(validated: ValidatedUserInput) {
+    // Cannot be called unless `validated` was produced by parse()
+}
+```
+
+The type `ValidatedUserInput` **cannot exist** unless it went through
+`parse()`. No "forgot the check" bugs.
+
+---
+
+## Bounded contexts — different models for different features
+
+Large apps have multiple **bounded contexts**, each with its own domain
+model. A `User` in the auth context has different fields than a `User` in
+the support context. Don't force one "true" User into every module.
+
+```text
+:core:auth
+  domain/User.kt              (id, email, hashedPassword, lastLogin)
+
+:core:support
+  domain/Customer.kt          (id, email, tier, openTickets)
+
+:feature:profile
+  domain/Profile.kt           (id, displayName, avatar, bio)
+```
+
+Each context's `User`/`Customer`/`Profile` is the right shape for **that
+context**. Map between them at integration points:
+
+```kotlin
+fun AuthUser.toProfile(): Profile = Profile(
+    id = id,
+    displayName = email.raw.substringBefore("@"),
+    avatar = null,
+    bio = null
+)
+```
+
+---
+
+## Immutability all the way down
+
+Domain types should be **immutable** data classes. Mutations return new
+instances:
+
+```kotlin
+// Extension method on Order
+fun Order.withStatus(newStatus: OrderStatus): Order = copy(status = newStatus)
+
+// Multiple updates
+val updated = order
+    .withStatus(OrderStatus.Shipped)
+    .withTrackingNumber("1Z999...")
+    .withDeliveryEstimate(clock.now() + 3.days)
+```
+
+Immutability guarantees:
+- No shared mutable state across threads.
+- Free history — old instances still exist unchanged.
+- Deterministic `==` and `hashCode`.
+- Safe to cache, serialize, pass anywhere.
+
+For collections inside aggregates, use `kotlinx.collections.immutable`:
+
+```kotlin
+data class Cart(val items: PersistentList<CartItem>) {
+    fun add(item: CartItem): Cart = copy(items = items + item)
+    fun remove(itemId: CartItemId): Cart = copy(items = items.removeAll { it.id == itemId })
+}
+```
+
+---
+
+## Ubiquitous language
+
+DDD emphasizes **ubiquitous language** — the same words, with the same
+meanings, used by developers, designers, PMs, and stakeholders. If the
+business calls them "shoppers", don't code `class User`.
+
+```kotlin
+// Before — developer-speak
+class User(val id: String, val cart: List<Product>)
+
+// After — ubiquitous
+class Shopper(val id: ShopperId, val basket: Basket)
+```
+
+Sounds trivial; in practice, refactoring to ubiquitous language catches
+bugs and aligns conversations. Everyone knows what a "basket" is; nobody
+has to translate "user.cart.products[0]" into business terms on every
+meeting.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Weak domain models',
+    variant: 'old',
+    points: [
+      'Primitive obsession — String IDs, Long prices',
+      'Boolean flags for states (isActive, isPaid)',
+      'Validation scattered across the codebase',
+      'Giant domain classes with 20+ nullable fields',
+      'Anemic entities (fields but no behavior)',
+      'One User class for everything'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Strong domain models',
+    variant: 'new',
+    points: [
+      'Value classes for every ID, measurement, currency',
+      'Sealed hierarchies for exclusive states',
+      'Constructor invariants (init require)',
+      'Small aggregates with clear boundaries',
+      'Entities have methods that enforce rules',
+      'Bounded contexts — different models per feature'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Domain modeling rules">
+- **Value classes** (`@JvmInline`) for IDs, money, measurements — type safety, zero cost.
+- **Sealed hierarchies** for exclusive states — illegal states unrepresentable.
+- **Init `require()`** enforces invariants in the constructor.
+- **Aggregates** have one root, internal consistency, and reference other aggregates by ID.
+- **Domain events** decouple transactions from side effects.
+- **Parse, don't validate** — produce new types from raw input.
+- **Bounded contexts** — each feature owns its own domain model.
+- **Ubiquitous language** — code uses the same words the business does.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Eliminate primitives', description: 'Find every function taking String for an ID. Introduce a @JvmInline value class wrapper. Fix all call sites.' },
+  { title: 'Kill boolean flags', description: 'Find a data class with 3+ boolean flags. Convert to a sealed hierarchy. Observe how the exhaustive when replaces scattered ifs.' },
+  { title: 'Parse, don\'t validate', description: 'Pick a form input (email, phone, credit card). Write a `parse()` returning Outcome<T, E>. Remove all `isValidX()` functions.' },
+  { title: 'Define an aggregate', description: 'Identify an aggregate in your domain (Order, Cart, Profile). Mark the root. Move all mutations to methods that return a new aggregate.' },
+  { title: 'Publish a domain event', description: 'Introduce an InProcessEventBus. Publish OrderPlaced when an order succeeds. Subscribe an OrderNotificationHandler.' }
+]} />
+
+## Continue reading
+
+- **[Hexagonal / Ports & Adapters](./hexagonal-ports-adapters)** — where the domain sits architecturally
+- **[Error Handling](./error-handling)** — typed errors in domain logic
+- **[Kotlin Idiomatic Patterns](/docs/patterns/kotlin-idiomatic-patterns)** — sealed classes, value classes, DSLs

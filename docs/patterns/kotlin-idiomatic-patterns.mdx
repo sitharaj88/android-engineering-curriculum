@@ -1,0 +1,740 @@
+---
+id: kotlin-idiomatic-patterns
+title: Kotlin Idiomatic Patterns
+sidebar_label: Kotlin Idiomatic
+description: The Kotlin-specific patterns that replace classic GoF patterns — sealed ADTs, value classes, delegation, DSLs, contracts, extension-oriented programming, type-level programming.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Kotlin Idiomatic Patterns
+
+Many classic design patterns exist because the underlying language
+lacked first-class features for the problem. Kotlin eliminates much of
+that boilerplate. This chapter catalogs **Kotlin-specific patterns** —
+some are GoF replacements, some are new tools the language unlocks.
+
+## 1. Sealed classes as algebraic data types (ADTs)
+
+**Intent**: Model "one of N variants" as a type the compiler can verify
+exhaustively.
+
+```kotlin
+sealed interface HttpResult<out T> {
+    data class Ok<T>(val value: T, val headers: Map<String, String>) : HttpResult<T>
+    data class ClientError(val code: Int, val message: String) : HttpResult<Nothing>
+    data class ServerError(val code: Int, val body: String?) : HttpResult<Nothing>
+    data class NetworkFailure(val cause: Throwable) : HttpResult<Nothing>
+}
+
+// Exhaustive when — the compiler warns on new cases
+fun <T> HttpResult<T>.handle(): Message = when (this) {
+    is HttpResult.Ok -> Message("Success")
+    is HttpResult.ClientError -> Message("Bad request: $message")
+    is HttpResult.ServerError -> Message("Server down")
+    is HttpResult.NetworkFailure -> Message("No network")
+}
+```
+
+ADTs replace:
+- **State pattern** — states are sealed classes
+- **Visitor pattern** — exhaustive `when` on sealed types
+- **Command pattern** — sealed `Intent` hierarchies
+- **Error types** — sealed error hierarchies
+
+### Nested sealed hierarchies
+
+```kotlin
+sealed interface CheckoutError {
+    sealed interface Validation : CheckoutError {
+        data object EmptyCart : Validation
+        data object ZeroTotal : Validation
+    }
+    sealed interface Payment : CheckoutError {
+        data object Declined : Payment
+        data object InsufficientFunds : Payment
+        data class Fraud(val caseId: String) : Payment
+    }
+    sealed interface Network : CheckoutError {
+        data object Offline : Network
+        data class Timeout(val elapsedMs: Long) : Network
+    }
+}
+
+// Callers match at whatever specificity they need
+when (val err = outcome.error) {
+    is CheckoutError.Validation -> showFormError(err)
+    is CheckoutError.Payment.Fraud -> openSupportTicket(err.caseId)
+    is CheckoutError.Payment -> showPaymentError(err)
+    is CheckoutError.Network -> showRetry(err)
+}
+```
+
+---
+
+## 2. Value classes — zero-cost type safety
+
+**Intent**: Wrap a primitive for compile-time distinctness without runtime
+cost.
+
+```kotlin
+@JvmInline value class UserId(val raw: String)
+@JvmInline value class OrderId(val raw: String)
+@JvmInline value class Cents(val raw: Long) {
+    operator fun plus(other: Cents) = Cents(raw + other.raw)
+    operator fun times(n: Int) = Cents(raw * n)
+    val dollars: Double get() = raw / 100.0
+}
+
+@JvmInline
+value class Email private constructor(val raw: String) {
+    companion object {
+        fun parse(raw: String): Outcome<Email, EmailError> = when {
+            !EMAIL_REGEX.matches(raw.trim()) -> Outcome.Err(EmailError.Invalid)
+            else -> Outcome.Ok(Email(raw.trim().lowercase()))
+        }
+    }
+}
+```
+
+The compiler treats `UserId` and `OrderId` as different types; at runtime
+they're just the underlying String. No allocation, no boxing (usually —
+nullable value classes box).
+
+### What this replaces
+
+- **Typedef / alias pattern** — but with type safety, not just a rename
+- **Primitive obsession anti-pattern** — solves it at the type level
+- **Smart constructor** — parse in `Companion.parse`, private constructor
+
+---
+
+## 3. Delegation — `by` keyword
+
+### Interface delegation — composition over inheritance
+
+```kotlin
+interface Logger { fun log(level: Level, msg: String) }
+
+class TimestampedLogger(private val delegate: Logger, private val clock: Clock) : Logger by delegate {
+    override fun log(level: Level, msg: String) {
+        delegate.log(level, "[${clock.now()}] $msg")     // override one method
+    }
+}
+
+class UserService(logger: Logger, private val api: UserApi) : Logger by logger {
+    suspend fun createUser(req: CreateUserRequest) {
+        log(Level.INFO, "creating user ${req.email}")    // inherited via delegation
+        api.create(req)
+    }
+}
+```
+
+No "extends LoggerBase" — just delegate to an injected instance. Composition
+wins over inheritance automatically.
+
+### Property delegation
+
+```kotlin
+// Lazy — thread-safe, computed-once
+val config by lazy { loadHeavyConfig() }
+
+// Observable — callback on write
+var theme by Delegates.observable(Theme.Light) { _, old, new ->
+    analytics.track("theme_changed", mapOf("from" to old, "to" to new))
+}
+
+// Vetoable — allow/deny write
+var progress by Delegates.vetoable(0) { _, _, new -> new in 0..100 }
+
+// Map-backed — for dynamic properties
+class User(private val data: Map<String, Any?>) {
+    val name: String by data
+    val email: String by data
+    val age: Int by data
+}
+
+// Custom delegate — feature flags
+class FlagDelegate(
+    private val flags: FeatureFlags,
+    private val key: String,
+    private val default: Boolean
+) : ReadOnlyProperty<Any?, Boolean> {
+    override fun getValue(thisRef: Any?, property: KProperty<*>) =
+        flags.get(key) ?: default
+}
+
+fun FeatureFlags.flag(key: String, default: Boolean = false) =
+    FlagDelegate(this, key, default)
+
+class CheckoutViewModel @Inject constructor(flags: FeatureFlags) {
+    val isNewCheckoutEnabled: Boolean by flags.flag("new_checkout")
+}
+```
+
+### ViewModel delegates — Compose / Hilt
+
+```kotlin
+@Composable
+fun ProfileScreen(viewModel: ProfileViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()       // delegate
+    /* ... */
+}
+```
+
+The `by` keyword hides the `.value` unwrapping. Works for any `State<T>`.
+
+---
+
+## 4. Scope functions — expression-oriented code
+
+```kotlin
+// apply — configure and return this
+val intent = Intent(context, DetailActivity::class.java).apply {
+    putExtra("id", id)
+    putExtra("source", "deeplink")
+    flags = Intent.FLAG_ACTIVITY_CLEAR_TOP
+}
+
+// also — side effect, return this
+val user = repository.load(id).also { Log.d("User", "loaded: $it") }
+
+// let — transform if non-null
+val displayName: String? = user?.let { "${it.firstName} ${it.lastName}" }
+
+// run — compute and return
+val area = rectangle.run { width * height }
+
+// with — operate on an object
+with(canvas) {
+    drawCircle(center, radius, paint)
+    drawText("label", textX, textY, textPaint)
+}
+```
+
+| Function | Receiver | Returns         | When                                    |
+|----------|----------|-----------------|-----------------------------------------|
+| `apply`  | `this`   | the receiver    | Builder-style configuration             |
+| `also`   | `it`     | the receiver    | Side effects in a chain                 |
+| `let`    | `it`     | lambda result   | Null-safe transformations               |
+| `run`    | `this`   | lambda result   | Compute a value with receiver context   |
+| `with`   | `this`   | lambda result   | Operate on an existing object           |
+
+Scope functions replace local variables and temporary receivers — they
+keep the code expression-oriented.
+
+---
+
+## 5. Extension functions — non-invasive APIs
+
+### Adding behavior to types you don't own
+
+```kotlin
+fun String.truncate(max: Int, ellipsis: String = "…"): String =
+    if (length <= max) this else take(max - ellipsis.length) + ellipsis
+
+fun Double.toCurrency(locale: Locale = Locale.getDefault()): String =
+    NumberFormat.getCurrencyInstance(locale).format(this)
+
+fun <T> List<T>.second(): T = this[1]
+```
+
+### Extensions as domain methods
+
+```kotlin
+fun Cart.isEmpty() = items.isEmpty()
+fun Cart.total(): Money = items.sumOf { it.subtotal }
+fun Cart.applyDiscount(discount: Discount): Cart = copy(discount = discount)
+```
+
+These are domain methods — even though the data class is simple, extensions
+keep cohesion without forcing methods onto the class.
+
+### Member extensions — scoped behavior
+
+```kotlin
+class DateFormatter(private val zone: ZoneId) {
+    fun Instant.formatted(): String = /* uses zone */
+    fun format(moments: List<Instant>) = moments.map { it.formatted() }
+}
+```
+
+`Instant.formatted()` is only visible inside `DateFormatter`. Scoped
+extensions avoid polluting the global namespace.
+
+---
+
+## 6. DSL with receivers — declarative builders
+
+```kotlin
+@DslMarker annotation class UiDsl
+
+@UiDsl
+class NotificationBuilder {
+    var title: String = ""
+    var body: String = ""
+    var priority: Priority = Priority.Default
+    private val actions = mutableListOf<Action>()
+
+    fun action(init: ActionBuilder.() -> Unit) {
+        actions += ActionBuilder().apply(init).build()
+    }
+
+    fun build() = Notification(title, body, priority, actions.toList())
+}
+
+@UiDsl
+class ActionBuilder {
+    var label: String = ""
+    var intent: PendingIntent? = null
+    fun build() = Action(label, intent ?: error("intent is required"))
+}
+
+fun notification(init: NotificationBuilder.() -> Unit): Notification =
+    NotificationBuilder().apply(init).build()
+
+// Usage
+val notif = notification {
+    title = "Order shipped"
+    body = "Arriving Friday"
+    priority = Priority.High
+    action {
+        label = "Track"
+        intent = trackIntent
+    }
+    action {
+        label = "Dismiss"
+        intent = dismissIntent
+    }
+}
+```
+
+`@DslMarker` prevents accidentally accessing the outer builder from inside
+a nested one (like accessing `title` from inside the `action { }` block).
+
+Compose, Ktor, Jetpack Navigation, Gradle Kotlin DSL, and Exposed all use
+this pattern.
+
+---
+
+## 7. Higher-order functions
+
+### Function types replace Strategy
+
+```kotlin
+// Before — strategy interface
+interface Logger { fun log(msg: String) }
+
+// After — function type
+typealias Logger = (String) -> Unit
+
+val consoleLogger: Logger = { msg -> println(msg) }
+val fileLogger: Logger = { msg -> File("app.log").appendText(msg) }
+
+class UserService(private val log: Logger) {
+    fun signIn(email: String) {
+        log("signing in: $email")
+    }
+}
+```
+
+### Function composition
+
+```kotlin
+infix fun <A, B, C> ((B) -> C).compose(other: (A) -> B): (A) -> C = { a -> this(other(a)) }
+
+val shout: (String) -> String = { it.uppercase() + "!" }
+val exclaim: (String) -> String = { "$it!!" }
+
+val loud = shout compose exclaim
+println(loud("hello"))   // "HELLO!!!!" (exclaim first, then shout)
+```
+
+### Inline functions — cheap higher-order functions
+
+```kotlin
+inline fun measureTimeMillis(block: () -> Unit): Long {
+    val start = System.currentTimeMillis()
+    block()
+    return System.currentTimeMillis() - start
+}
+
+// Call site; compiler inlines the body, no lambda allocation
+val ms = measureTimeMillis {
+    heavyWork()
+}
+```
+
+`inline` eliminates the overhead of lambda allocation. Essential for hot
+paths.
+
+---
+
+## 8. `object` — singletons, companions, anonymous types
+
+### Singleton `object`
+
+```kotlin
+object PreferencesKeys {
+    val THEME = stringPreferencesKey("theme")
+    val LANGUAGE = stringPreferencesKey("language")
+}
+```
+
+### Companion `object`
+
+```kotlin
+class User private constructor(val id: UserId, val email: Email) {
+    companion object {
+        fun create(id: String, emailRaw: String): Outcome<User, UserError> {
+            val userId = UserId(id)
+            val email = Email.parse(emailRaw).valueOr { return Outcome.Err(UserError.InvalidEmail) }
+            return Outcome.Ok(User(userId, email))
+        }
+    }
+}
+```
+
+### Anonymous `object` — one-off instances
+
+```kotlin
+val comparator = object : Comparator<Product> {
+    override fun compare(a: Product, b: Product): Int = a.price.compareTo(b.price)
+}
+
+// Prefer SAM conversion where applicable
+val comparator2 = Comparator<Product> { a, b -> a.price.compareTo(b.price) }
+```
+
+---
+
+## 9. Null safety patterns
+
+### Elvis + early return
+
+```kotlin
+fun processUser(id: String?) {
+    val userId = id?.trim()?.takeIf { it.isNotEmpty() } ?: return
+    // userId is non-null here
+    load(userId)
+}
+```
+
+### Safe call chain
+
+```kotlin
+val city: String? = user?.address?.city?.takeIf { it.isNotBlank() }
+```
+
+### `requireNotNull` / `checkNotNull`
+
+```kotlin
+val token = requireNotNull(session.token) { "User must be signed in" }
+```
+
+Throws `IllegalArgumentException` or `IllegalStateException` with a
+message. For pre-conditions at public APIs.
+
+### `?.let { }` for non-null execution
+
+```kotlin
+user?.let { u ->
+    // only runs if user is non-null
+    analytics.setUser(u.id)
+    dataStore.save(u)
+}
+```
+
+---
+
+## 10. Contracts — tell the compiler about function effects
+
+**Intent**: Inform the compiler that a function has specific effects (e.g.,
+it always executes a lambda, or returning true proves a type).
+
+```kotlin
+@OptIn(ExperimentalContracts::class)
+inline fun <reified T> Any?.requireType(): T {
+    contract { returns() implies (this@requireType is T) }
+    return this as? T ?: error("not a ${T::class.simpleName}")
+}
+
+fun handleEvent(event: Any) {
+    event.requireType<ClickEvent>()
+    // compiler now smart-casts `event` to ClickEvent
+    println(event.coordinates)
+}
+```
+
+Built-in contracts enable smart casts after `isNullOrEmpty`, `isNotBlank`,
+etc.:
+
+```kotlin
+fun process(name: String?) {
+    if (name.isNullOrBlank()) return
+    // compiler knows name is non-null here
+    println(name.length)
+}
+```
+
+Writing your own contracts requires `@OptIn(ExperimentalContracts::class)`.
+Useful for DSLs, assertion libraries, and custom null-check helpers.
+
+---
+
+## 11. `run`, `also`, `apply` as builder patterns
+
+```kotlin
+// Builder pattern collapses into apply { }
+val request = Request.Builder().apply {
+    url("https://api.example.com/users")
+    header("Authorization", "Bearer $token")
+    header("Accept", "application/json")
+    get()
+}.build()
+
+// Multi-step result computation with run
+val result = File("input.json").run {
+    require(exists()) { "Missing: $this" }
+    readText()
+}.run {
+    json.decodeFromString<Config>(this)
+}
+```
+
+---
+
+## 12. Operator overloading
+
+```kotlin
+@JvmInline
+value class Money(val cents: Long) : Comparable<Money> {
+    operator fun plus(other: Money) = Money(cents + other.cents)
+    operator fun minus(other: Money) = Money(cents - other.cents)
+    operator fun times(n: Int) = Money(cents * n)
+    operator fun div(n: Int) = Money(cents / n)
+    operator fun unaryMinus() = Money(-cents)
+    override operator fun compareTo(other: Money): Int = cents.compareTo(other.cents)
+}
+
+val a = Money(1000)
+val b = Money(250)
+val total = a + b - Money(100)
+val doubled = total * 2
+if (doubled > Money(5000)) println("big")
+```
+
+Rule of thumb: overload operators only when the semantics match built-in
+usage. Don't overload `+` for something that isn't addition.
+
+---
+
+## 13. `typealias` for clarity
+
+```kotlin
+typealias UserId = String
+typealias NotificationHandler = suspend (Notification) -> Unit
+typealias JsonObject = Map<String, Any?>
+
+fun register(handler: NotificationHandler) { /* ... */ }
+```
+
+<Callout kind="warning" title="typealias vs value class">
+`typealias` is a pure rename — `UserId` and `String` are interchangeable,
+no safety. Use `@JvmInline value class` for type distinctness. Use
+`typealias` only for function types, long generics, or documentation.
+</Callout>
+
+---
+
+## 14. Destructuring
+
+```kotlin
+data class User(val id: String, val name: String, val email: String)
+
+val user = User("u1", "Aarav", "a@x.com")
+val (id, name, email) = user            // destructuring
+
+// In lambdas
+users.forEach { (id, name) -> println("$id: $name") }
+
+// Pairs / Maps
+map.forEach { (key, value) -> println("$key = $value") }
+```
+
+Works on any type with `componentN()` functions. `data class` and `Pair`
+have them by default.
+
+---
+
+## 15. `when` as expression + pattern matcher
+
+```kotlin
+val message = when (response.code) {
+    in 200..299 -> "Success"
+    in 300..399 -> "Redirected"
+    in 400..499 -> "Client error: ${response.code}"
+    in 500..599 -> "Server error: ${response.code}"
+    else -> "Unknown"
+}
+
+// Type dispatch
+fun describe(any: Any): String = when (any) {
+    is Int -> "int $any"
+    is String -> "string of length ${any.length}"
+    is List<*> -> "list of ${any.size}"
+    null -> "null"
+    else -> "something else"
+}
+
+// Guard conditions (Kotlin 2.1+)
+val category = when (user) {
+    is User.Admin if user.permissions.isEmpty() -> "Stale admin"
+    is User.Admin -> "Active admin"
+    is User.Customer -> "Customer"
+}
+```
+
+### `when` without a subject — replaces if-else chains
+
+```kotlin
+val state = when {
+    isLoading -> UiState.Loading
+    error != null -> UiState.Error(error)
+    data.isEmpty() -> UiState.Empty
+    else -> UiState.Content(data)
+}
+```
+
+---
+
+## 16. `inline class` + sealed + opaque error types
+
+Combining three idioms:
+
+```kotlin
+sealed interface ParseResult<out T> {
+    @JvmInline value class Ok<T>(val value: T) : ParseResult<T>
+    data class Err(val position: Int, val message: String) : ParseResult<Nothing>
+}
+
+fun parseIsoDate(s: String): ParseResult<LocalDate> = try {
+    ParseResult.Ok(LocalDate.parse(s))
+} catch (e: DateTimeParseException) {
+    ParseResult.Err(position = e.errorIndex, message = e.message ?: "invalid")
+}
+
+when (val r = parseIsoDate(input)) {
+    is ParseResult.Ok -> save(r.value)
+    is ParseResult.Err -> showInlineError(r.position, r.message)
+}
+```
+
+Value class for the Ok path = zero allocation on success. Typed error on
+the Err path = compiler-enforced handling.
+
+---
+
+## 17. `lazy` + `Lazy.initialized` — expensive one-time init
+
+```kotlin
+class MyApp : Application() {
+    val analytics: Analytics by lazy {
+        // Computed on first access; thread-safe
+        FirebaseAnalytics.getInstance(this).apply {
+            setUserId(/* ... */)
+        }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        // Kotlin doesn't expose isInitialized on `by lazy` directly,
+        // but you can check:
+        if ((::analytics.getDelegate() as Lazy<*>).isInitialized()) {
+            // analytics is initialized; safe to flush
+        }
+    }
+}
+```
+
+---
+
+## 18. K2 contracts + smart cast — modern null checks
+
+```kotlin
+data class User(val email: String?)
+
+fun process(user: User) {
+    if (user.email.isNullOrEmpty()) return
+    // Kotlin 2.0+ — smart casts user.email to String (non-null)
+    println(user.email.length)
+}
+```
+
+No need to `?.let { }` or `!!` — the compiler tracks nullability across
+contract-annotated functions like `isNullOrEmpty`.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Non-idiomatic Kotlin',
+    variant: 'old',
+    points: [
+      'Java-style getters/setters on every field',
+      'NullPointerException — using !!',
+      'Interface with one method (use function type)',
+      'Manual equals/hashCode/toString (use data class)',
+      'if/else chains instead of when',
+      'for (i in 0 until list.size) — prefer list.forEachIndexed or functional ops'
+    ]
+  }}
+  right={{
+    label: 'Idiomatic Kotlin',
+    title: 'Expression-oriented',
+    variant: 'new',
+    points: [
+      'val/var properties; data classes where possible',
+      'Null-safety via sealed types or ?./let',
+      '(T) -> R function types for single-method interfaces',
+      'data class auto-generates common methods',
+      'when as exhaustive expression',
+      'list.forEach { ... } or list.map { ... }'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Kotlin idioms">
+- **Sealed classes** replace State, Visitor, and error hierarchies with exhaustive `when`.
+- **Value classes** — zero-cost type safety for IDs, money, emails.
+- **Delegation** (`by`) — composition over inheritance for interfaces; observable/lazy/vetoable for properties.
+- **Scope functions** — `apply`, `also`, `let`, `run`, `with` for expression-oriented configuration.
+- **Extensions + extension-oriented programming** — add behavior without inheritance.
+- **DSLs with receivers + `@DslMarker`** — declarative builders.
+- **Function types** replace Strategy; **`inline`** eliminates allocation.
+- **Contracts** enable smart casts after custom null checks.
+- **`when`** as an expression is the single most powerful control structure — exhaustive over sealed types.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Replace an enum with sealed', description: 'Find an enum that has associated per-value data. Convert to a sealed hierarchy. Use exhaustive when to replace branch-on-enum if/elses.' },
+  { title: 'Add value classes', description: 'Find three primitive IDs in your code (UserId, OrderId, ProductId as String). Wrap in @JvmInline value classes and fix all call sites.' },
+  { title: 'Build a DSL', description: 'Pick a place where you currently use a builder class. Convert to a function with a receiver lambda and a @DslMarker annotation.' },
+  { title: 'Property delegation', description: 'Create a custom FlagDelegate that reads a boolean feature flag. Use it via `val isNewCheckout: Boolean by flags.flag("new_checkout")`.' },
+  { title: 'Extension scoping', description: 'Find a method on a class that only makes sense in one other class\'s context. Move it to a member extension of the containing class.' }
+]} />
+
+## Continue reading
+
+- **[Advanced Kotlin Patterns](/docs/kotlin-foundation/advanced-patterns)** — generics variance, reified, inline
+- **[Coroutines Deep Dive](/docs/kotlin-foundation/coroutines-deep-dive)** — structured concurrency idioms
+- **[Domain Modeling](/docs/architecture/domain-modeling)** — value classes and sealed types applied to DDD

@@ -1,0 +1,800 @@
+---
+id: behavioral-patterns
+title: Behavioral Patterns
+sidebar_label: Behavioral Patterns
+description: All ten GoF behavioral patterns with Kotlin/Android code — Chain of Responsibility, Command, Iterator, Mediator, Memento, Observer, State, Strategy, Template Method, Visitor.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Behavioral Patterns
+
+Behavioral patterns define **how objects interact and distribute
+responsibility**. They answer questions like "who handles this request?",
+"how do I swap algorithms?", "how do I save and restore state?", "how do I
+traverse a collection?". This chapter covers all ten GoF behavioral
+patterns with the Android APIs that use them.
+
+## 1. Chain of Responsibility — pass the request down the line
+
+**Intent**: Pass a request along a chain of handlers. Each handler
+decides to process or pass it on.
+
+### OkHttp Interceptor chain — the canonical example
+
+```kotlin
+val client = OkHttpClient.Builder()
+    .addInterceptor(AuthInterceptor())          // 1. adds Authorization header
+    .addInterceptor(LoggingInterceptor())       // 2. logs the request
+    .addInterceptor(CacheInterceptor())         // 3. returns cached response if fresh
+    .addInterceptor(RetryInterceptor())         // 4. retries on 5xx
+    .build()
+```
+
+Each interceptor can:
+- Pass through unchanged (`chain.proceed(chain.request())`)
+- Modify the request before passing
+- Short-circuit with its own response
+- Modify the response before returning
+
+```kotlin
+class CacheInterceptor @Inject constructor(
+    private val cache: ResponseCache
+) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (request.method == "GET") {
+            cache.get(request)?.let { cached ->
+                if (!cached.isStale) return cached.toResponse()    // short-circuit
+            }
+        }
+        val response = chain.proceed(request)
+        cache.store(request, response)
+        return response
+    }
+}
+```
+
+### Compose pointer input — another chain
+
+```kotlin
+Modifier
+    .pointerInput(Unit) { detectTapGestures(onTap = { /* ... */ }) }
+    .pointerInput(Unit) { detectDragGestures { _, drag -> /* ... */ } }
+```
+
+Pointer events flow through each handler; the first to consume it stops
+the chain.
+
+### Custom handler chain
+
+```kotlin
+interface Handler<T> {
+    fun handle(request: T, next: (T) -> Unit)
+}
+
+class ChainOfHandlers<T>(private val handlers: List<Handler<T>>) {
+    fun dispatch(request: T) {
+        val iterator = handlers.iterator()
+        fun proceed(req: T) {
+            if (iterator.hasNext()) iterator.next().handle(req) { proceed(it) }
+        }
+        proceed(request)
+    }
+}
+
+// Example — moderation pipeline
+class ProfanityHandler : Handler<String> {
+    override fun handle(request: String, next: (String) -> Unit) {
+        if (containsProfanity(request)) return        // stop here
+        next(request)
+    }
+}
+class LengthHandler : Handler<String> {
+    override fun handle(request: String, next: (String) -> Unit) {
+        if (request.length > 2_000) return
+        next(request)
+    }
+}
+class PostHandler(private val postRepo: PostRepository) : Handler<String> {
+    override fun handle(request: String, next: (String) -> Unit) {
+        postRepo.submit(request); next(request)
+    }
+}
+```
+
+<Callout kind="tip" title="Chain vs Pipeline">
+A **chain** allows handlers to short-circuit. A **pipeline** (Flow
+operators) always passes downstream. Pipelines also compose value
+transformations; chains pass a single payload.
+</Callout>
+
+---
+
+## 2. Command — encapsulate a request as an object
+
+**Intent**: Turn a request into a standalone object with all its
+parameters, enabling queuing, logging, undo, and delayed execution.
+
+### Use cases are commands
+
+```kotlin
+class PlaceOrderUseCase @Inject constructor(
+    private val cart: CartRepository,
+    private val payment: PaymentGateway,
+    private val orders: OrderRepository
+) {
+    suspend operator fun invoke(paymentMethod: PaymentMethod): Outcome<OrderId, OrderError> {
+        val items = cart.current()
+        val receipt = payment.charge(items.total, paymentMethod)
+        orders.save(Order.from(items, receipt))
+        cart.clear()
+        return Outcome.Ok(OrderId(receipt.orderId))
+    }
+}
+```
+
+Every use case **is** a command — invocable, testable, queueable, and
+composable.
+
+### WorkManager requests — delayed commands
+
+```kotlin
+val syncRequest = OneTimeWorkRequestBuilder<SyncWorker>()
+    .setInitialDelay(10, TimeUnit.MINUTES)
+    .setConstraints(
+        Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+    )
+    .setInputData(workDataOf("userId" to userId))
+    .build()
+
+WorkManager.getInstance(context).enqueue(syncRequest)
+```
+
+`OneTimeWorkRequest` is a command object — parameters captured, enqueued,
+executed later (possibly after process death).
+
+### Undo with command + memento
+
+```kotlin
+interface Command {
+    fun execute()
+    fun undo()
+}
+
+class DeleteMessageCommand(
+    private val messageId: MessageId,
+    private val dao: MessageDao
+) : Command {
+    private var deletedMessage: MessageEntity? = null
+
+    override fun execute() {
+        deletedMessage = dao.getById(messageId.raw)
+        dao.delete(messageId.raw)
+    }
+
+    override fun undo() {
+        deletedMessage?.let(dao::insert)
+    }
+}
+
+class CommandHistory {
+    private val history = ArrayDeque<Command>()
+    private val redoStack = ArrayDeque<Command>()
+
+    fun execute(command: Command) {
+        command.execute()
+        history.addLast(command)
+        redoStack.clear()
+    }
+
+    fun undo() {
+        history.removeLastOrNull()?.let {
+            it.undo()
+            redoStack.addLast(it)
+        }
+    }
+
+    fun redo() {
+        redoStack.removeLastOrNull()?.let {
+            it.execute()
+            history.addLast(it)
+        }
+    }
+}
+```
+
+### Intent as command
+
+`android.content.Intent` is literally a command — "do this action with
+these parameters" captured as a serializable object that can cross process
+boundaries.
+
+---
+
+## 3. Iterator — traverse a collection without exposing its shape
+
+**Intent**: Provide a way to access elements of an aggregate object
+sequentially without exposing its underlying representation.
+
+### Kotlin `Iterator<T>` and `Sequence<T>`
+
+```kotlin
+// Iterator — external iteration
+val list = listOf(1, 2, 3, 4, 5)
+val iter = list.iterator()
+while (iter.hasNext()) { println(iter.next()) }
+
+// Sequence — lazy internal iteration
+val seq = sequence {
+    yield(1)
+    yield(2)
+    yieldAll(listOf(3, 4, 5))
+}
+seq.forEach(::println)
+```
+
+### Flow — async iterator
+
+`Flow<T>` is a suspending iterator — each element is produced
+asynchronously:
+
+```kotlin
+fun messages(conversationId: String): Flow<Message> = flow {
+    var cursor: String? = null
+    do {
+        val page = api.page(conversationId, cursor)
+        page.messages.forEach { emit(it) }     // emit one at a time
+        cursor = page.nextCursor
+    } while (cursor != null)
+}
+
+// Consumer
+messages("c1").collect { message ->
+    println(message)
+}
+```
+
+### Paging 3 `PagingSource` — paginated iterator
+
+```kotlin
+class MessagePagingSource(
+    private val api: MessageApi,
+    private val conversationId: String
+) : PagingSource<String, Message>() {
+
+    override suspend fun load(params: LoadParams<String>): LoadResult<String, Message> = try {
+        val page = api.page(conversationId, cursor = params.key, limit = params.loadSize)
+        LoadResult.Page(
+            data = page.messages,
+            prevKey = page.prevCursor,
+            nextKey = page.nextCursor
+        )
+    } catch (e: IOException) {
+        LoadResult.Error(e)
+    }
+
+    override fun getRefreshKey(state: PagingState<String, Message>): String? =
+        state.anchorPosition?.let { state.closestPageToPosition(it)?.prevKey }
+}
+```
+
+Paging handles the iteration protocol (load next page, load previous, handle
+errors). You provide the "load N items from cursor" logic.
+
+---
+
+## 4. Mediator — centralize complex communication
+
+**Intent**: Define an object that encapsulates how a set of objects
+interact, preventing explicit references between them.
+
+### The problem
+
+Without a mediator, N components talking to each other produces N² edges:
+
+```text
+TextField ←→ Button
+    ↕  ╲   ╱  ↕
+    ↕   ╳   ↕      ← tangled
+    ↕  ╱   ╲  ↕
+Checkbox ←→ ErrorView
+```
+
+With a mediator (ViewModel):
+
+```text
+  TextField     Button    Checkbox    ErrorView
+       ↘         ↓           ↓          ↙
+                ViewModel (mediator)
+```
+
+### ViewModel as mediator
+
+```kotlin
+@HiltViewModel
+class LoginViewModel @Inject constructor(
+    private val authRepo: AuthRepository
+) : ViewModel() {
+
+    private val _state = MutableStateFlow(LoginUiState())
+    val state: StateFlow<LoginUiState> = _state.asStateFlow()
+
+    fun onIntent(intent: LoginIntent) {
+        when (intent) {
+            is LoginIntent.EmailChanged -> _state.update {
+                it.copy(email = intent.value, emailError = null, canSubmit = validate(intent.value, it.password))
+            }
+            is LoginIntent.PasswordChanged -> _state.update {
+                it.copy(password = intent.value, passwordError = null, canSubmit = validate(it.email, intent.value))
+            }
+            is LoginIntent.Submit -> submit()
+        }
+    }
+    /* ... */
+}
+```
+
+The TextField emits intents; the ViewModel updates state; the ErrorView
+and Button observe state. Components don't know about each other.
+
+### Navigation Controller as mediator
+
+The `NavController` mediates between screens. Each screen says "I want to
+go to X"; the controller handles back stack, transition, argument delivery.
+Screens don't directly instantiate one another.
+
+---
+
+## 5. Memento — save/restore without violating encapsulation
+
+**Intent**: Capture an object's internal state so it can be restored
+later, without exposing its internals.
+
+### `SavedStateHandle` — Android's memento for ViewModels
+
+```kotlin
+@HiltViewModel
+class EditorViewModel @Inject constructor(
+    private val savedState: SavedStateHandle
+) : ViewModel() {
+
+    // These StateFlows persist across process death via savedState
+    val draftTitle: StateFlow<String> = savedState.getStateFlow("title", "")
+    val draftBody: StateFlow<String> = savedState.getStateFlow("body", "")
+
+    fun updateTitle(title: String) { savedState["title"] = title }
+    fun updateBody(body: String) { savedState["body"] = body }
+}
+```
+
+`SavedStateHandle` is literally a memento — the ViewModel stores its
+state into it; the platform restores it after process death.
+
+### `Bundle` — activity state memento
+
+```kotlin
+class PlayerActivity : AppCompatActivity() {
+    private var currentPosition: Long = 0
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putLong("position", currentPosition)    // capture memento
+    }
+
+    override fun onRestoreInstanceState(savedInstanceState: Bundle) {
+        super.onRestoreInstanceState(savedInstanceState)
+        currentPosition = savedInstanceState.getLong("position", 0L)     // restore memento
+    }
+}
+```
+
+### `rememberSaveable` — Compose's memento
+
+```kotlin
+@Composable
+fun DraftEditor() {
+    var title by rememberSaveable { mutableStateOf("") }
+    var body by rememberSaveable { mutableStateOf("") }
+    /* ... */
+}
+```
+
+`rememberSaveable` packages the state into a `Bundle` (memento) and
+restores it when the composable re-enters composition.
+
+### Custom `Saver` — memento protocol
+
+```kotlin
+data class DraftSnapshot(val title: String, val body: String, val tags: List<String>)
+
+val DraftSnapshotSaver: Saver<DraftSnapshot, List<Any>> = Saver(
+    save = { snap -> listOf(snap.title, snap.body, snap.tags) },   // capture
+    restore = { list ->                                             // restore
+        DraftSnapshot(
+            title = list[0] as String,
+            body = list[1] as String,
+            tags = list[2] as List<String>
+        )
+    }
+)
+```
+
+---
+
+## 6. Observer — publish/subscribe
+
+**Intent**: Define a one-to-many dependency so when one object changes,
+all its dependents are notified.
+
+### `StateFlow` / `SharedFlow` — the modern form
+
+```kotlin
+class CartRepository {
+    private val _items = MutableStateFlow<List<CartItem>>(emptyList())
+    val items: StateFlow<List<CartItem>> = _items.asStateFlow()       // subject
+
+    fun add(item: CartItem) {
+        _items.update { it + item }                                    // notify observers
+    }
+}
+
+// Observers
+@Composable
+fun CartBadge(cartRepo: CartRepository) {
+    val items by cartRepo.items.collectAsStateWithLifecycle()
+    BadgedBox(badge = { Badge { Text("${items.size}") } }) { /* ... */ }
+}
+
+@Composable
+fun CartTotal(cartRepo: CartRepository) {
+    val items by cartRepo.items.collectAsStateWithLifecycle()
+    Text("Total: ${items.sumOf { it.priceCents }}")
+}
+```
+
+Both composables observe the same subject independently.
+
+### Compose `State<T>` — observer for recomposition
+
+Every `State<T>` read inside a composable registers that composable as
+an observer. When the state writes, the observer recomposes. This is the
+observer pattern baked into the Compose runtime.
+
+### LiveData (legacy) — observer with lifecycle awareness
+
+```kotlin
+class UserViewModel : ViewModel() {
+    private val _user = MutableLiveData<User>()
+    val user: LiveData<User> = _user
+}
+
+// In an Activity
+viewModel.user.observe(this) { user ->
+    nameView.text = user.name
+}
+```
+
+Modern code uses `StateFlow`. `collectAsStateWithLifecycle` provides the
+same lifecycle-aware collection.
+
+---
+
+## 7. State — encode behavior in state objects
+
+**Intent**: Allow an object to alter its behavior when its internal state
+changes. The object appears to change its class.
+
+### Sealed state machines
+
+```kotlin
+sealed interface Connection {
+    data object Disconnected : Connection
+    data object Connecting : Connection
+    data class Connected(val socket: WebSocket) : Connection
+    data class Reconnecting(val attempt: Int, val nextTryMs: Long) : Connection
+}
+
+class ChatClient {
+    private var state: Connection = Connection.Disconnected
+
+    suspend fun send(message: String) = when (val s = state) {
+        Connection.Disconnected -> throw IllegalStateException("Not connected")
+        Connection.Connecting -> throw IllegalStateException("Still connecting")
+        is Connection.Connected -> s.socket.send(message)
+        is Connection.Reconnecting -> queue(message)
+    }
+}
+```
+
+Behavior varies entirely by the state class. Adding a new state requires
+the compiler to warn about every `when` — impossible to forget a case.
+
+### UI state machines — see [MVI chapter](/docs/architecture-patterns/mvi-state-machines)
+
+The checkout example from MVI is a pure State pattern. Each phase
+(`Ready`, `Submitting`, `Failed`, `Confirmed`) changes both what the UI
+shows and what intents it accepts.
+
+---
+
+## 8. Strategy — interchangeable algorithms
+
+**Intent**: Define a family of algorithms, encapsulate each, and make them
+interchangeable.
+
+### Sorting strategies
+
+```kotlin
+sealed interface ProductSort {
+    fun sort(products: List<Product>): List<Product>
+
+    data object PriceAscending : ProductSort {
+        override fun sort(p: List<Product>) = p.sortedBy { it.price.cents }
+    }
+    data object PriceDescending : ProductSort {
+        override fun sort(p: List<Product>) = p.sortedByDescending { it.price.cents }
+    }
+    data object NewestFirst : ProductSort {
+        override fun sort(p: List<Product>) = p.sortedByDescending { it.createdAt }
+    }
+    data object BestRated : ProductSort {
+        override fun sort(p: List<Product>) = p.sortedByDescending { it.rating }
+    }
+}
+
+@HiltViewModel
+class CatalogViewModel @Inject constructor(
+    repo: ProductRepository
+) : ViewModel() {
+    private val _sort = MutableStateFlow<ProductSort>(ProductSort.NewestFirst)
+
+    val products: StateFlow<List<Product>> = combine(repo.observeAll(), _sort) { products, sort ->
+        sort.sort(products)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    fun onSortChanged(sort: ProductSort) { _sort.value = sort }
+}
+```
+
+### Compose `AnimationSpec` — strategy
+
+```kotlin
+animateDpAsState(
+    targetValue = size,
+    animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),  // strategy
+    label = "size"
+)
+// Swap spring() for tween(300), keyframes { ... }, or snap()
+```
+
+Each `AnimationSpec` implementation is a strategy for how to interpolate.
+
+### Function types as strategies
+
+Kotlin often replaces strategy classes with function types:
+
+```kotlin
+// Before — strategy interface + classes
+interface PriceFormatter { fun format(cents: Long): String }
+
+// After — function type
+typealias PriceFormatter = (Long) -> String
+
+val usdFormatter: PriceFormatter = { cents -> "$${cents / 100}.${cents % 100}" }
+val eurFormatter: PriceFormatter = { cents -> "€${cents / 100},${cents % 100}" }
+
+class ProductRow(private val format: PriceFormatter) { /* ... */ }
+```
+
+---
+
+## 9. Template Method — fixed skeleton with varied steps
+
+**Intent**: Define the skeleton of an algorithm in a method, deferring
+some steps to subclasses.
+
+### `CoroutineWorker` — template method
+
+```kotlin
+abstract class CoroutineWorker(/* ... */) {
+    // Template method — framework calls this and orchestrates lifecycle
+    suspend fun startWork(): Result {
+        try {
+            return doWork()        // the "vary" step
+        } catch (t: Throwable) {
+            return Result.failure()
+        } finally {
+            // cleanup
+        }
+    }
+
+    // Subclass implements this
+    abstract suspend fun doWork(): Result
+}
+
+// Your worker fills in the template
+class SyncWorker(...) : CoroutineWorker(...) {
+    override suspend fun doWork(): Result {
+        return try {
+            sync()
+            Result.success()
+        } catch (e: IOException) {
+            Result.retry()
+        }
+    }
+}
+```
+
+### `AppCompatActivity` / `ComponentActivity` — template method
+
+Lifecycle methods (`onCreate`, `onStart`, `onResume`, etc.) are template
+method steps. The framework drives the flow; you override specific steps.
+
+### `RecyclerView.Adapter` — template method + factory method
+
+`onCreateViewHolder`, `onBindViewHolder`, `getItemCount` — steps you fill in.
+The framework orchestrates layout, recycling, and scrolling.
+
+### The Kotlin alternative — higher-order functions
+
+When the "skeleton" is small, prefer higher-order functions over class
+inheritance:
+
+```kotlin
+suspend fun <T> withRetry(
+    attempts: Int = 3,
+    initialDelay: Duration = 1.seconds,
+    block: suspend (attempt: Int) -> T
+): T {
+    var lastError: Throwable? = null
+    repeat(attempts) { i ->
+        try {
+            return block(i + 1)
+        } catch (e: IOException) {
+            lastError = e
+            delay(initialDelay * (1L shl i))   // exponential backoff
+        }
+    }
+    throw lastError!!
+}
+
+// Usage — caller fills in the "what," helper handles the "how"
+val user = withRetry { attempt ->
+    println("attempt $attempt")
+    api.getUser(id)
+}
+```
+
+This is often cleaner than a `BaseRetryingApiCall` abstract class.
+
+---
+
+## 10. Visitor — operation on a structure without changing it
+
+**Intent**: Represent an operation to be performed on the elements of an
+object structure. Visitor lets you define a new operation without changing
+the classes of the elements.
+
+### The classic visitor
+
+```kotlin
+sealed interface Expr {
+    data class Num(val value: Double) : Expr
+    data class Add(val left: Expr, val right: Expr) : Expr
+    data class Mul(val left: Expr, val right: Expr) : Expr
+}
+
+// Visitor — a new operation on the Expr tree
+interface ExprVisitor<R> {
+    fun visit(num: Expr.Num): R
+    fun visit(add: Expr.Add): R
+    fun visit(mul: Expr.Mul): R
+}
+
+fun <R> Expr.accept(visitor: ExprVisitor<R>): R = when (this) {
+    is Expr.Num -> visitor.visit(this)
+    is Expr.Add -> visitor.visit(this)
+    is Expr.Mul -> visitor.visit(this)
+}
+
+// Concrete visitors
+class Evaluator : ExprVisitor<Double> {
+    override fun visit(num: Expr.Num) = num.value
+    override fun visit(add: Expr.Add) = add.left.accept(this) + add.right.accept(this)
+    override fun visit(mul: Expr.Mul) = mul.left.accept(this) * mul.right.accept(this)
+}
+
+class Printer : ExprVisitor<String> {
+    override fun visit(num: Expr.Num) = num.value.toString()
+    override fun visit(add: Expr.Add) = "(${add.left.accept(this)} + ${add.right.accept(this)})"
+    override fun visit(mul: Expr.Mul) = "(${mul.left.accept(this)} * ${mul.right.accept(this)})"
+}
+
+val expr = Expr.Add(Expr.Num(2.0), Expr.Mul(Expr.Num(3.0), Expr.Num(4.0)))
+println(expr.accept(Evaluator()))     // 14.0
+println(expr.accept(Printer()))        // (2.0 + (3.0 * 4.0))
+```
+
+### Sealed `when` — the idiomatic Kotlin alternative
+
+In Kotlin, exhaustive `when` on a sealed type **is** the visitor:
+
+```kotlin
+fun Expr.evaluate(): Double = when (this) {
+    is Expr.Num -> value
+    is Expr.Add -> left.evaluate() + right.evaluate()
+    is Expr.Mul -> left.evaluate() * right.evaluate()
+}
+
+fun Expr.pretty(): String = when (this) {
+    is Expr.Num -> value.toString()
+    is Expr.Add -> "(${left.pretty()} + ${right.pretty()})"
+    is Expr.Mul -> "(${left.pretty()} * ${right.pretty()})"
+}
+```
+
+Adding a new operation (e.g., `simplify()`) is a new extension function.
+Adding a new node type (e.g., `Div`) forces every `when` to handle it —
+the compiler **guarantees** you update every visitor.
+
+This is strictly better than the classic visitor in Kotlin.
+
+### When classic Visitor still wins
+
+- **Across module boundaries** — when you can't edit the sealed type
+  because it's in another module
+- **Plugin architectures** — third parties define new visitors without
+  modifying the core
+
+For most Android code, prefer sealed + exhaustive `when`.
+
+---
+
+## Behavioral family at a glance
+
+| Pattern                | Kotlin-friendly form                       | Android examples                               |
+|------------------------|--------------------------------------------|------------------------------------------------|
+| Chain of Responsibility| OkHttp interceptors; pointer input         | Interceptor chain, pointerInput                |
+| Command                | Use cases; WorkRequest                     | Intent, use cases, WorkManager                 |
+| Iterator               | Iterator / Sequence / Flow / PagingSource  | List iterators, Paging 3                       |
+| Mediator               | ViewModel; NavController                    | MVVM / MVI, Navigation component               |
+| Memento                | SavedStateHandle, rememberSaveable, Saver  | ViewModel state, Bundle, activity state        |
+| Observer               | StateFlow / SharedFlow; Compose State      | UI state observation, LiveData                 |
+| State                  | Sealed state machines                       | Connection states, MVI phases                  |
+| Strategy               | Sealed objects; function types             | AnimationSpec, Sort orders                     |
+| Template Method        | Abstract base classes; HOF with lambdas    | CoroutineWorker, Activity lifecycle            |
+| Visitor                | Sealed + exhaustive when                    | Any sealed type + when                         |
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Behavioral pattern rules">
+- **Chain of Responsibility** is the interceptor pattern — every request filter in Android is one.
+- **Command** is the use case and the Intent — capture-and-dispatch.
+- **Iterator** is now `Flow` and `PagingSource` — async iteration as a first-class type.
+- **Mediator** is the ViewModel — components talk through it, not to each other.
+- **Memento** is `SavedStateHandle` + `rememberSaveable` + `Saver`.
+- **Observer** is `StateFlow`/`SharedFlow` + Compose `State`.
+- **State** + **Strategy** + **Visitor** often collapse into **sealed classes + `when`**.
+- **Template Method** — prefer higher-order functions to abstract classes when possible.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Write an interceptor chain', description: 'Add a custom OkHttp interceptor that logs a correlation ID header. Test that it composes cleanly with Auth and Cache interceptors.' },
+  { title: 'Build a command + memento undo stack', description: 'Implement a DeleteMessageCommand with execute/undo. Wire a CommandHistory that supports undo and redo in a Compose UI.' },
+  { title: 'State machine with sealed + when', description: 'Model a file download (Idle, Downloading, Paused, Done, Failed) as a sealed interface. Write a @Composable that exhaustively renders each state.' },
+  { title: 'Strategy via function types', description: 'Find a place in your code that accepts a Formatter interface with one method. Replace with a function type (Long) -> String.' },
+  { title: 'Visitor via extension functions', description: 'Define a sealed Expr AST. Implement evaluate() and pretty() as extension functions. Add a new Div case and watch the compiler list every when you need to update.' }
+]} />
+
+## Continue reading
+
+- **[Concurrency Patterns](./concurrency-patterns)** — async-specific behavioral patterns
+- **[Data Patterns](./data-patterns)** — repository, cache, unit-of-work
+- **[Kotlin Idiomatic Patterns](./kotlin-idiomatic-patterns)** — sealed classes, delegation, contracts

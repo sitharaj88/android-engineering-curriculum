@@ -1,0 +1,562 @@
+---
+id: error-handling
+title: Error Handling
+sidebar_label: Error Handling
+description: Typed errors in Android — Result<T>, sealed error hierarchies, Either/Outcome, Arrow's Raise DSL, Resource<T> for UI, error boundaries, and propagation across layers.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Error Handling
+
+Exceptions were designed for "exceptional" conditions. In practice, most
+errors aren't exceptional — network down, input invalid, payment declined.
+Treating them as exceptions (throw, catch far away, lose context) is how
+bugs hide. This chapter covers **typed errors** — the technique used by
+every serious Kotlin codebase to make errors compile-time obligations.
+
+<Callout kind="tip" title="The core shift">
+Instead of **"a function returns T or throws"**, use **"a function returns
+a type that expresses both success and failure"**. The compiler now forces
+every caller to handle both cases — no missed catches, no propagation
+mistakes.
+</Callout>
+
+## The problem with exceptions
+
+```kotlin
+// Signature lies — says "returns User", may throw anything
+suspend fun fetchUser(id: String): User
+
+// Caller doesn't know what can go wrong
+viewModelScope.launch {
+    val user = fetchUser(id)   // might throw IOException? HttpException? AuthError?
+    // Now what?
+}
+```
+
+You write a `try/catch`:
+
+```kotlin
+viewModelScope.launch {
+    try {
+        val user = fetchUser(id)
+        _state.update { it.copy(user = user) }
+    } catch (e: IOException) {
+        _state.update { it.copy(error = "No connection") }
+    } catch (e: HttpException) when (e.code()) {
+        401 -> router.signOut()
+        else -> _state.update { it.copy(error = "Server error") }
+    } catch (e: Throwable) {
+        _state.update { it.copy(error = "Unknown error") }
+    }
+}
+```
+
+**Problems**:
+- Compiler doesn't enforce the catches — a new error type added later silently propagates.
+- Domain errors (PaymentDeclined) mix with framework errors (IOException).
+- Business logic interleaves with plumbing; logic gets lost.
+- `catch (Throwable)` swallows `CancellationException` — breaks coroutine cancellation.
+
+---
+
+## Level 1 — Kotlin's `Result<T>`
+
+The Kotlin stdlib ships a minimal typed-error type:
+
+```kotlin
+@Suppress("ResultUnwrap")
+suspend fun fetchUser(id: String): Result<User> = runCatching {
+    api.getUser(id).toDomain()
+}
+
+viewModelScope.launch {
+    fetchUser(id)
+        .onSuccess { user -> _state.update { it.copy(user = user) } }
+        .onFailure { e -> _state.update { it.copy(error = e.message) } }
+}
+```
+
+Pros: simple, zero dependencies, composes with `.map`, `.flatMap`, `.fold`.
+
+Cons: the error side is `Throwable` — you can't express typed domain
+errors like "PaymentDeclined" or "InvalidEmail" without casting.
+
+<Callout kind="warning" title="Kotlin's Result has a gotcha">
+`runCatching { ... }` catches `CancellationException`, which breaks
+coroutine cancellation. Use this helper instead:
+
+```kotlin
+inline fun <R> suspendRunCatching(block: () -> R): Result<R> = try {
+    Result.success(block())
+} catch (c: CancellationException) {
+    throw c
+} catch (t: Throwable) {
+    Result.failure(t)
+}
+```
+
+Or the `suspendRunCatching` extension some codebases define globally.
+</Callout>
+
+---
+
+## Level 2 — Typed domain errors via sealed hierarchies
+
+For real domain logic, define an error algebra:
+
+```kotlin
+sealed interface LoginError {
+    data object InvalidEmail : LoginError
+    data object WrongPassword : LoginError
+    data class RateLimited(val retryAfter: Duration) : LoginError
+    data class Network(val cause: Throwable) : LoginError
+    data object Unknown : LoginError
+}
+
+// The function returns a Result where the error side is typed
+sealed interface LoginOutcome {
+    data class Ok(val session: Session) : LoginOutcome
+    data class Err(val error: LoginError) : LoginOutcome
+}
+
+suspend fun login(email: String, password: String): LoginOutcome = try {
+    val session = api.login(LoginRequest(email, password)).toSession()
+    LoginOutcome.Ok(session)
+} catch (e: CancellationException) {
+    throw e
+} catch (e: HttpException) when (e.code()) {
+    401 -> LoginOutcome.Err(LoginError.WrongPassword)
+    422 -> LoginOutcome.Err(LoginError.InvalidEmail)
+    429 -> LoginOutcome.Err(LoginError.RateLimited(retryAfter = e.retryAfter()))
+    else -> LoginOutcome.Err(LoginError.Unknown)
+} catch (e: IOException) {
+    LoginOutcome.Err(LoginError.Network(e))
+} catch (e: Throwable) {
+    LoginOutcome.Err(LoginError.Unknown)
+}
+```
+
+Now the caller **cannot forget** to handle a case — the `when` is
+exhaustive:
+
+```kotlin
+when (val outcome = login(email, password)) {
+    is LoginOutcome.Ok -> router.navigateToHome()
+    is LoginOutcome.Err -> when (val err = outcome.error) {
+        LoginError.InvalidEmail -> _state.update { it.copy(emailError = "Invalid email") }
+        LoginError.WrongPassword -> _state.update { it.copy(passwordError = "Wrong password") }
+        is LoginError.RateLimited -> _state.update { it.copy(toast = "Try in ${err.retryAfter}") }
+        is LoginError.Network -> _state.update { it.copy(toast = "No internet") }
+        LoginError.Unknown -> _state.update { it.copy(toast = "Something went wrong") }
+    }
+}
+```
+
+Adding `LoginError.AccountLocked` later produces **compile errors** in
+every consumer that doesn't handle it. This is how a codebase stays honest
+about failure modes.
+
+---
+
+## Level 3 — Either / Outcome with `map` and `flatMap`
+
+For pipelines that chain fallible operations, a generic `Either<L, R>` or
+`Outcome<T, E>` helps:
+
+```kotlin
+sealed interface Outcome<out T, out E> {
+    data class Ok<T>(val value: T) : Outcome<T, Nothing>
+    data class Err<E>(val error: E) : Outcome<Nothing, E>
+}
+
+inline fun <T, E, R> Outcome<T, E>.map(f: (T) -> R): Outcome<R, E> = when (this) {
+    is Outcome.Ok -> Outcome.Ok(f(value))
+    is Outcome.Err -> this
+}
+
+inline fun <T, E, R> Outcome<T, E>.flatMap(f: (T) -> Outcome<R, E>): Outcome<R, E> = when (this) {
+    is Outcome.Ok -> f(value)
+    is Outcome.Err -> this
+}
+
+inline fun <T, E, R> Outcome<T, E>.fold(onOk: (T) -> R, onErr: (E) -> R): R = when (this) {
+    is Outcome.Ok -> onOk(value)
+    is Outcome.Err -> onErr(error)
+}
+
+inline fun <T, E, E2> Outcome<T, E>.mapError(f: (E) -> E2): Outcome<T, E2> = when (this) {
+    is Outcome.Ok -> this
+    is Outcome.Err -> Outcome.Err(f(error))
+}
+```
+
+Now compose fallible steps without nested try/catch:
+
+```kotlin
+suspend fun checkout(cart: Cart): Outcome<Order, CheckoutError> =
+    validate(cart)
+        .flatMap { validCart -> charge(validCart) }
+        .flatMap { payment -> createOrder(cart, payment) }
+        .flatMap { order -> saveOrder(order) }
+```
+
+If any step returns `Err`, the rest short-circuit. Compare to the same
+logic with exceptions and nested try/catches.
+
+---
+
+## Level 4 — Arrow's Either and Raise DSL
+
+**Arrow** is Kotlin's functional library of record. It ships `Either<L, R>`
+and a `raise` DSL that makes typed-error code look like plain imperative
+code.
+
+```kotlin
+// Add Arrow
+implementation("io.arrow-kt:arrow-core:1.2.4")
+```
+
+```kotlin
+import arrow.core.raise.either
+import arrow.core.raise.ensure
+import arrow.core.raise.Raise
+
+suspend fun checkout(cart: Cart): Either<CheckoutError, Order> = either {
+    val validCart = validate(cart).bind()               // short-circuits on Err
+    val payment = charge(validCart).bind()
+    val order = createOrder(cart, payment).bind()
+    saveOrder(order).bind()
+    order
+}
+
+// A suspend function using raise directly
+context(Raise<CheckoutError>)
+suspend fun validate(cart: Cart): Cart {
+    ensure(cart.items.isNotEmpty()) { CheckoutError.EmptyCart }
+    ensure(cart.total > Money.Zero) { CheckoutError.ZeroTotal }
+    return cart
+}
+```
+
+Arrow's `either { ... }` DSL looks like direct-style code but the `.bind()`
+calls short-circuit on `Err`. This is the most ergonomic typed-error
+experience in Kotlin today.
+
+---
+
+## Resource / UiState variants
+
+The UI doesn't just show success or error — it shows **loading** too. A
+three-state wrapper is common:
+
+```kotlin
+sealed interface Resource<out T> {
+    data object Loading : Resource<Nothing>
+    data class Success<T>(val data: T) : Resource<T>
+    data class Error(val message: String, val cause: Throwable? = null) : Resource<Nothing>
+}
+```
+
+Repositories can stream a Resource:
+
+```kotlin
+fun productResource(id: String): Flow<Resource<Product>> = flow {
+    emit(Resource.Loading)
+    runCatching { api.getProduct(id).toDomain() }
+        .onSuccess { emit(Resource.Success(it)) }
+        .onFailure { emit(Resource.Error(it.message ?: "Unknown", it)) }
+}
+```
+
+UI handles all three exhaustively:
+
+```kotlin
+@Composable
+fun ProductView(resource: Resource<Product>) {
+    when (resource) {
+        Resource.Loading -> LoadingIndicator()
+        is Resource.Success -> ProductDetails(resource.data)
+        is Resource.Error -> ErrorBanner(resource.message)
+    }
+}
+```
+
+<Callout kind="tip" title="Resource vs UiState">
+Use `Resource<T>` when a repository/use case wants to represent its own
+lifecycle. Use a `UiState` data class at the ViewModel level, which may
+combine **multiple** Resources (product + reviews + inventory, say).
+</Callout>
+
+---
+
+## Error hierarchies — organizing by domain
+
+For apps with many features, structure errors per-module:
+
+```kotlin
+// :feature:checkout
+sealed interface CheckoutError {
+    data object EmptyCart : CheckoutError
+    data object ZeroTotal : CheckoutError
+    data class InvalidAddress(val reason: String) : CheckoutError
+
+    sealed interface PaymentFailure : CheckoutError {
+        data object CardDeclined : PaymentFailure
+        data object InsufficientFunds : PaymentFailure
+        data object ExpiredCard : PaymentFailure
+        data class Fraud(val caseId: String) : PaymentFailure
+    }
+
+    sealed interface NetworkFailure : CheckoutError {
+        data object NoConnection : NetworkFailure
+        data object ServerUnreachable : NetworkFailure
+        data class Timeout(val afterMs: Long) : NetworkFailure
+    }
+}
+```
+
+Nested sealed interfaces group related failures. Callers can pattern-match
+at whatever specificity they need:
+
+```kotlin
+when (val err = outcome.error) {
+    is CheckoutError.PaymentFailure -> showPaymentError(err)      // broad
+    is CheckoutError.NetworkFailure.Timeout -> retry()           // specific
+    else -> showGenericError()
+}
+```
+
+---
+
+## Mapping errors across layers
+
+Errors from one layer (HTTP codes) shouldn't leak into another (UI). Map
+at boundaries:
+
+```text
+Network layer       →   HttpException(401)
+                        ↓ mapped in data layer
+Data/Domain layer   →   AuthError.Unauthorized
+                        ↓ mapped in presentation layer
+UI layer            →   UiMessage("Please sign in again")
+```
+
+```kotlin
+// Data layer — translates HTTP to domain errors
+class UserRepositoryImpl(private val api: UserApi) : UserRepository {
+    override suspend fun fetch(id: UserId): Outcome<User, UserError> = try {
+        Outcome.Ok(api.getUser(id.raw).toDomain())
+    } catch (e: CancellationException) { throw e
+    } catch (e: HttpException) when (e.code()) {
+        404 -> Outcome.Err(UserError.NotFound)
+        401 -> Outcome.Err(UserError.Unauthorized)
+        else -> Outcome.Err(UserError.Unknown(e))
+    } catch (e: IOException) {
+        Outcome.Err(UserError.Network(e))
+    }
+}
+
+// Presentation layer — maps domain errors to user-facing messages
+fun UserError.toUiMessage(): String = when (this) {
+    UserError.NotFound -> "User not found"
+    UserError.Unauthorized -> "Please sign in again"
+    is UserError.Network -> "Check your connection"
+    is UserError.Unknown -> "Something went wrong"
+}
+```
+
+---
+
+## Errors in Flow
+
+### `catch` operator
+
+```kotlin
+fun userFlow(id: UserId): Flow<User> = api.watchUser(id)
+    .map { it.toDomain() }
+    .catch { e ->
+        Firebase.crashlytics.recordException(e)
+        emit(User.Anonymous)     // fallback, or rethrow
+    }
+```
+
+`catch` handles exceptions from **upstream** operators. It does not catch
+exceptions from **downstream** collectors — that's the separation of
+concerns.
+
+### `retry` and `retryWhen`
+
+```kotlin
+fun userFlow(id: UserId): Flow<User> = flow {
+    emit(api.fetch(id))
+}
+    .retry(retries = 3) { cause -> cause is IOException }
+    .retryWhen { cause, attempt ->
+        if (cause is IOException && attempt < 3) {
+            delay((1L shl attempt.toInt()) * 1000L)
+            true
+        } else false
+    }
+```
+
+Exponential backoff with jitter is in the [Concurrency Patterns](/docs/patterns/concurrency-patterns) chapter.
+
+---
+
+## Error boundaries in Compose
+
+Compose doesn't have React-style error boundaries by default. Wrap risky
+composables yourself:
+
+```kotlin
+@Composable
+fun ErrorBoundary(
+    fallback: @Composable (Throwable) -> Unit = { DefaultErrorFallback(it) },
+    content: @Composable () -> Unit
+) {
+    val coroutineScope = rememberCoroutineScope()
+    var error by remember { mutableStateOf<Throwable?>(null) }
+
+    val composition = currentComposer.recomposeScope
+    if (error != null) {
+        fallback(error!!)
+        return
+    }
+    try {
+        content()
+    } catch (t: CancellationException) { throw t
+    } catch (t: Throwable) {
+        LaunchedEffect(t) {
+            Firebase.crashlytics.recordException(t)
+            error = t
+        }
+    }
+}
+
+@Composable
+fun DefaultErrorFallback(t: Throwable) {
+    Column(Modifier.padding(16.dp)) {
+        Text("Something went wrong", style = MaterialTheme.typography.titleMedium)
+        Text(t.message ?: "", style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+// Usage
+ErrorBoundary {
+    ComplexScreen()
+}
+```
+
+**Use sparingly.** Typed-error plumbing at the ViewModel layer handles
+business errors. Error boundaries are for truly unexpected failures
+(bugs), giving a graceful fallback instead of a crash.
+
+---
+
+## Never swallow cancellation
+
+The single most common error-handling bug in coroutine code:
+
+```kotlin
+// ❌ Swallows CancellationException — breaks structured concurrency
+viewModelScope.launch {
+    try {
+        doWork()
+    } catch (e: Exception) {
+        _state.update { it.copy(error = e.message) }
+    }
+}
+
+// ✅ Re-throw cancellation; handle everything else
+viewModelScope.launch {
+    try {
+        doWork()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        _state.update { it.copy(error = e.message) }
+    }
+}
+```
+
+If the `ViewModel` is cleared mid-call, cancellation must propagate. If
+you swallow it, you're running after the scope is dead.
+
+---
+
+## When to still use exceptions
+
+Not every error belongs in a typed wrapper. Keep exceptions for:
+
+- **Programmer errors** — `require()`, `check()`, `IllegalStateException`. These shouldn't recover; they should crash the debug build.
+- **Cancellation** — always.
+- **Truly unrecoverable conditions** — OOM, StackOverflow. No point wrapping.
+- **Boundary I/O that can't produce a typed error** — e.g., passing through to a library that expects exceptions.
+
+Use typed errors for **business errors** the app must handle differently
+based on the kind (payment declined ≠ network down ≠ invalid input).
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'What causes bugs',
+    variant: 'old',
+    points: [
+      'catch (e: Exception) { e.printStackTrace() }',
+      'catch (Throwable) swallowing CancellationException',
+      'Returning null to mean "error"',
+      'Exposing HttpException to the UI layer',
+      'Single Error message: String — erases context',
+      'Manual rethrow and lose stack trace'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production-grade errors',
+    variant: 'new',
+    points: [
+      'Typed sealed error hierarchy per feature',
+      'Always rethrow CancellationException',
+      'Outcome<T, E> or Either<E, T> for explicit branches',
+      'Map HTTP codes to domain errors in :data',
+      'Preserve original Throwable as `cause` for diagnostics',
+      'throw e or exception.addSuppressed() for context'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Error handling rules">
+- **Exceptions** for programmer errors and cancellation; **typed errors** for business logic.
+- **Sealed hierarchies** give you compiler-enforced exhaustiveness.
+- **`Outcome<T, E>`** or **Arrow's `Either`** for composable pipelines.
+- **Map errors at layer boundaries** — HTTP codes never reach the UI.
+- **Always re-throw CancellationException**.
+- **Resource&lt;T&gt;** (Loading/Success/Error) for the UI layer.
+- **Error boundaries in Compose** for unexpected crashes — last resort, not primary.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Define a domain error hierarchy', description: 'Pick one feature (login, checkout, upload). Write a sealed interface with 5+ named error cases. Use it in the use case return type.' },
+  { title: 'Replace try/catch with Outcome', description: 'Find a repository method that throws. Return Outcome<T, E> instead. Update callers to pattern-match exhaustively.' },
+  { title: 'Adopt Arrow\'s Either', description: 'Add Arrow to one module. Rewrite a 3-step pipeline as either { step1().bind(); step2().bind(); step3().bind() }.' },
+  { title: 'Map HTTP to domain', description: 'Move every catch (HttpException) out of ViewModels and into the data layer. ViewModel sees only typed domain errors.' },
+  { title: 'Compose error boundary', description: 'Wrap one risky screen in an ErrorBoundary that logs to Crashlytics and shows a retry button.' }
+]} />
+
+## Continue reading
+
+- **[Domain Modeling](./domain-modeling)** — errors as part of the domain
+- **[Kotlin Idiomatic Patterns](/docs/patterns/kotlin-idiomatic-patterns)** — sealed ADTs, value classes
+- **[Concurrency Patterns](/docs/patterns/concurrency-patterns)** — retry, circuit breaker, debounce

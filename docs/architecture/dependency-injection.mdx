@@ -1,0 +1,608 @@
+---
+id: dependency-injection
+title: Dependency Injection Deep Dive
+sidebar_label: Dependency Injection
+description: DI vs Service Locator, Hilt component hierarchy, scopes, qualifiers, assisted injection, multi-binding, testing overrides, and patterns for enterprise Android.
+---
+
+import { Callout, ComparisonCard, StepList, Diagram, HiltGraphDiagram } from '@site/src/components/Doc';
+
+# Dependency Injection Deep Dive
+
+DI isn't a library — it's the principle that objects receive their
+collaborators instead of constructing them. This chapter covers the full
+DI landscape on Android: the theory, Hilt's component graph, scopes,
+qualifiers, assisted injection, multi-binding, testing overrides, and the
+patterns that separate "DI works" from "DI scales."
+
+## DI in two sentences
+
+> **Don't create your dependencies. Receive them.**
+>
+> A class that receives its dependencies can be tested with fakes, reused
+> in different contexts, and composed freely. A class that constructs them
+> is permanently married to them.
+
+```kotlin
+// ❌ Bad — class couples itself to its collaborators
+class UserRepository {
+    private val api = Retrofit.Builder().baseUrl(URL).build().create(UserApi::class.java)
+    private val dao = Room.databaseBuilder(...).build().userDao()
+    // Impossible to test without a real network and database.
+}
+
+// ✅ Good — collaborators injected; fakes swap trivially
+class UserRepository(
+    private val api: UserApi,
+    private val dao: UserDao,
+    @IoDispatcher private val io: CoroutineDispatcher
+) { /* ... */ }
+```
+
+---
+
+## DI vs Service Locator
+
+Both supply dependencies, but the direction of control differs:
+
+<ComparisonCard
+  left={{
+    label: 'Service Locator',
+    title: 'Class asks for dependencies',
+    variant: 'old',
+    points: [
+      'class UserRepo { val api = Locator.get<UserApi>() }',
+      'Hidden dependencies — must read code to know',
+      'Harder to test (override Locator state)',
+      'Runtime failures if binding missing',
+      'No compile-time graph validation'
+    ]
+  }}
+  right={{
+    label: 'Dependency Injection',
+    title: 'Dependencies given to class',
+    variant: 'new',
+    points: [
+      'class UserRepo @Inject constructor(val api: UserApi)',
+      'Dependencies visible in constructor signature',
+      'Tests pass different constructor args',
+      'Compile-time validation (Hilt catches missing bindings)',
+      'Cleaner, more honest contracts'
+    ]
+  }}
+/>
+
+Koin and some other libraries embrace Service Locator. They're lighter
+and easier to learn, but sacrifice compile-time checks. For enterprise
+apps, **prefer Hilt** — the compiler verifies the graph at build time, not
+at runtime when a user is mid-flow.
+
+---
+
+## The Hilt component hierarchy
+
+<Diagram title="Hilt component graph" caption="Scopes stacked. Each component inherits its parent's bindings.">
+  <HiltGraphDiagram />
+</Diagram>
+
+```text
+SingletonComponent              @Singleton         — app-wide
+    │
+    ├── ActivityRetainedComponent  @ActivityRetainedScoped  — survives rotation
+    │     │
+    │     ├── ViewModelComponent   @ViewModelScoped         — per ViewModel
+    │     │
+    │     └── ActivityComponent    @ActivityScoped          — per Activity
+    │           │
+    │           ├── FragmentComponent  @FragmentScoped      — per Fragment
+    │           │     └── ViewComponent  @ViewScoped
+    │           │
+    │           └── ViewComponent  @ViewScoped              — per View
+    │
+    └── ServiceComponent           @ServiceScoped           — per Service
+```
+
+Each component represents a **lifetime**. A `@Singleton`-scoped binding
+survives as long as the app process. A `@ViewModelScoped` binding lives
+as long as the ViewModel.
+
+### Picking the right scope
+
+| Scope                        | Example bindings                                             |
+|------------------------------|--------------------------------------------------------------|
+| `@Singleton`                 | Retrofit, OkHttpClient, Room database, AuthRepository       |
+| `@ActivityRetainedScoped`    | Session-level caches that survive rotation                   |
+| `@ViewModelScoped`           | Feature-specific caches, ViewModel-owned state stores        |
+| `@ActivityScoped`            | Widgets tied to one Activity (rare; usually not needed)     |
+| `@FragmentScoped`            | Fragment-specific interactors                                |
+| `@ServiceScoped`             | Background service collaborators                             |
+
+**Default to `@Singleton`.** Only scope narrower when you have a concrete
+reason (e.g., you want two ViewModels to each get their own instance of
+something).
+
+---
+
+## Providing bindings
+
+### Constructor injection (the default)
+
+```kotlin
+class UserRepository @Inject constructor(
+    private val api: UserApi,
+    private val dao: UserDao
+) { /* ... */ }
+```
+
+Hilt figures it out. No module needed. This is 80% of your bindings.
+
+### `@Provides` — for types you don't own
+
+Use when the class comes from a library:
+
+```kotlin
+@Module @InstallIn(SingletonComponent::class)
+object NetworkModule {
+
+    @Provides @Singleton
+    fun provideOkHttpClient(): OkHttpClient = OkHttpClient.Builder()
+        .addInterceptor(HttpLoggingInterceptor())
+        .build()
+
+    @Provides @Singleton
+    fun provideRetrofit(client: OkHttpClient): Retrofit = Retrofit.Builder()
+        .baseUrl("https://api.example.com/")
+        .client(client)
+        .addConverterFactory(MoshiConverterFactory.create())
+        .build()
+
+    @Provides @Singleton
+    fun provideUserApi(retrofit: Retrofit): UserApi = retrofit.create()
+}
+```
+
+### `@Binds` — bind interface to implementation
+
+Shorter and more efficient than `@Provides` for interface binding:
+
+```kotlin
+@Module @InstallIn(SingletonComponent::class)
+abstract class RepositoryModule {
+
+    @Binds @Singleton
+    abstract fun bindUserRepository(impl: UserRepositoryImpl): UserRepository
+
+    @Binds @Singleton
+    abstract fun bindPaymentGateway(impl: StripePaymentGateway): PaymentGateway
+}
+```
+
+`@Binds` generates less code than `@Provides`. Use it whenever you just
+return a constructor-injected impl as its interface.
+
+---
+
+## Qualifiers — multiple bindings for the same type
+
+When you need two instances of the same type, define qualifiers:
+
+```kotlin
+@Qualifier @Retention(AnnotationRetention.BINARY) annotation class IoDispatcher
+@Qualifier @Retention(AnnotationRetention.BINARY) annotation class DefaultDispatcher
+@Qualifier @Retention(AnnotationRetention.BINARY) annotation class MainDispatcher
+@Qualifier @Retention(AnnotationRetention.BINARY) annotation class MainImmediateDispatcher
+
+@Module @InstallIn(SingletonComponent::class)
+object DispatchersModule {
+    @Provides @IoDispatcher             fun io(): CoroutineDispatcher = Dispatchers.IO
+    @Provides @DefaultDispatcher        fun default(): CoroutineDispatcher = Dispatchers.Default
+    @Provides @MainDispatcher           fun main(): CoroutineDispatcher = Dispatchers.Main
+    @Provides @MainImmediateDispatcher  fun mainImmediate(): CoroutineDispatcher = Dispatchers.Main.immediate
+}
+
+class MediaRepository @Inject constructor(
+    @IoDispatcher private val io: CoroutineDispatcher,
+    @DefaultDispatcher private val cpu: CoroutineDispatcher
+) {
+    suspend fun read(path: String): ByteArray = withContext(io) { File(path).readBytes() }
+    suspend fun hash(bytes: ByteArray): String = withContext(cpu) { sha256(bytes) }
+}
+```
+
+Another common use — two `OkHttpClient` instances (one with logging for
+debug, one pristine for metrics):
+
+```kotlin
+@Qualifier annotation class LoggingClient
+@Qualifier annotation class MetricsClient
+
+@Provides @Singleton @LoggingClient
+fun provideLoggingClient(): OkHttpClient = OkHttpClient.Builder()
+    .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BODY })
+    .build()
+
+@Provides @Singleton @MetricsClient
+fun provideMetricsClient(): OkHttpClient = OkHttpClient.Builder()
+    .addInterceptor(MetricsInterceptor())
+    .build()
+```
+
+---
+
+## Assisted injection — mixing injected and runtime args
+
+Some classes need both injected collaborators and runtime parameters.
+Classic example: a repository constructed per-user.
+
+```kotlin
+class DraftEditorInteractor @AssistedInject constructor(
+    @Assisted private val draftId: String,          // runtime
+    private val draftRepo: DraftRepository,         // injected
+    private val autosaveManager: AutosaveManager    // injected
+) {
+    suspend fun save(text: String) { /* ... */ }
+
+    @AssistedFactory
+    interface Factory {
+        fun create(draftId: String): DraftEditorInteractor
+    }
+}
+
+// Usage
+@HiltViewModel
+class EditorViewModel @Inject constructor(
+    interactorFactory: DraftEditorInteractor.Factory,
+    savedState: SavedStateHandle
+) : ViewModel() {
+    private val interactor = interactorFactory.create(savedState["draftId"]!!)
+}
+```
+
+`@AssistedInject` + `@AssistedFactory` generate a factory that takes only
+the runtime args. Hilt wires the rest.
+
+---
+
+## Multibindings — sets and maps of dependencies
+
+### `@IntoSet` — collect into a Set
+
+Useful for plugins, initializers, analytics listeners:
+
+```kotlin
+interface AppInitializer {
+    fun initialize()
+}
+
+@Singleton class CrashlyticsInitializer @Inject constructor(
+    @ApplicationContext private val ctx: Context
+) : AppInitializer {
+    override fun initialize() {
+        Firebase.crashlytics.setCrashlyticsCollectionEnabled(!BuildConfig.DEBUG)
+    }
+}
+
+@Singleton class AnalyticsInitializer @Inject constructor(
+    @ApplicationContext private val ctx: Context
+) : AppInitializer {
+    override fun initialize() { /* ... */ }
+}
+
+@Module @InstallIn(SingletonComponent::class)
+abstract class InitializerModule {
+    @Binds @IntoSet abstract fun bindCrashlytics(i: CrashlyticsInitializer): AppInitializer
+    @Binds @IntoSet abstract fun bindAnalytics(i: AnalyticsInitializer): AppInitializer
+}
+
+// Consumer
+@HiltAndroidApp
+class MyApp : Application() {
+    @Inject lateinit var initializers: Set<@JvmSuppressWildcards AppInitializer>
+
+    override fun onCreate() {
+        super.onCreate()
+        initializers.forEach { it.initialize() }
+    }
+}
+```
+
+Adding a new initializer is a one-line `@Binds`. No central registry to
+edit.
+
+### `@IntoMap` + `@ClassKey` — keyed multi-binding
+
+```kotlin
+interface WorkerFactory<T : ListenableWorker> {
+    fun create(context: Context, params: WorkerParameters): T
+}
+
+@Module @InstallIn(SingletonComponent::class)
+abstract class WorkerModule {
+    @Binds @IntoMap
+    @ClassKey(SyncWorker::class)
+    abstract fun bindSync(f: SyncWorkerFactory): WorkerFactory<*>
+
+    @Binds @IntoMap
+    @ClassKey(NotificationWorker::class)
+    abstract fun bindNotif(f: NotificationWorkerFactory): WorkerFactory<*>
+}
+
+@Singleton class HiltWorkerFactory @Inject constructor(
+    private val factories: Map<Class<out ListenableWorker>, @JvmSuppressWildcards Provider<WorkerFactory<*>>>
+) : WorkerFactory() { /* ... */ }
+```
+
+WorkManager's multi-worker factory is built like this. Pattern appears
+anywhere you need "dispatch by type."
+
+---
+
+## Hilt + ViewModel
+
+```kotlin
+@HiltViewModel
+class ProfileViewModel @Inject constructor(
+    private val userRepo: UserRepository,
+    savedState: SavedStateHandle
+) : ViewModel() {
+
+    private val userId: String = checkNotNull(savedState["userId"])
+    /* ... */
+}
+
+// In a Composable
+@Composable
+fun ProfileRoute() {
+    val viewModel: ProfileViewModel = hiltViewModel()
+    /* ... */
+}
+```
+
+`@HiltViewModel` wires the ViewModel into the ViewModelComponent. The
+`hiltViewModel()` Compose helper scopes it to the nearest `NavBackStackEntry`
+or Activity.
+
+### ViewModels scoped to a nav graph
+
+```kotlin
+@Composable
+fun ProfileRoot(navController: NavController) {
+    // Scoped to the ProfileGraph nav destination
+    val viewModel: ProfileSharedViewModel = hiltViewModel(
+        viewModelStoreOwner = navController.getBackStackEntry<ProfileGraph>()
+    )
+}
+```
+
+Multiple screens inside the same nav graph share the ViewModel. See
+[Navigation Masterclass](/docs/jetpack-compose/navigation).
+
+---
+
+## Hilt + Workers
+
+```kotlin
+@HiltWorker
+class SyncWorker @AssistedInject constructor(
+    @Assisted context: Context,
+    @Assisted params: WorkerParameters,
+    private val repo: ProductRepository
+) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
+        runCatching { repo.sync() }.onFailure { return Result.retry() }
+        return Result.success()
+    }
+}
+
+// Wire in Application
+@HiltAndroidApp
+class MyApp : Application(), Configuration.Provider {
+    @Inject lateinit var workerFactory: HiltWorkerFactory
+
+    override val workManagerConfiguration: Configuration
+        get() = Configuration.Builder()
+            .setWorkerFactory(workerFactory)
+            .build()
+}
+```
+
+---
+
+## Testing — overriding bindings
+
+### `@TestInstallIn` — replace a module in tests
+
+```kotlin
+@Module
+@TestInstallIn(
+    components = [SingletonComponent::class],
+    replaces = [NetworkModule::class]
+)
+object FakeNetworkModule {
+    @Provides @Singleton
+    fun provideUserApi(): UserApi = FakeUserApi()
+}
+```
+
+In instrumented tests, `FakeNetworkModule` replaces `NetworkModule`
+automatically. No manual wiring.
+
+### `@BindValue` — per-test overrides
+
+```kotlin
+@HiltAndroidTest
+class ProfileScreenTest {
+    @get:Rule(order = 0) val hiltRule = HiltAndroidRule(this)
+    @get:Rule(order = 1) val composeRule = createAndroidComposeRule<HiltTestActivity>()
+
+    @BindValue @JvmField val userRepo: UserRepository = mockk()
+
+    @Test fun shows_user_name() {
+        coEvery { userRepo.fetch(any()) } returns User("u1", "Aarav")
+        composeRule.setContent { ProfileScreen() }
+        composeRule.onNodeWithText("Aarav").assertIsDisplayed()
+    }
+}
+```
+
+`@BindValue` overrides a binding for the duration of the test class.
+
+### Fakes over mocks
+
+For domain-level tests, **prefer fakes over mocks**:
+
+```kotlin
+class FakeUserRepository : UserRepository {
+    private val users = mutableMapOf<UserId, User>()
+    fun seed(user: User) { users[user.id] = user }
+    override suspend fun fetch(id: UserId): User = users[id] ?: error("not seeded")
+}
+
+@Test fun `use case combines user with orders`() = runTest {
+    val users = FakeUserRepository().apply { seed(sampleUser) }
+    val orders = FakeOrderRepository().apply { seed(sampleOrder) }
+    val useCase = GetUserWithOrdersUseCase(users, orders)
+
+    val result = useCase(sampleUser.id)
+
+    assertEquals(sampleUser, result.user)
+    assertEquals(1, result.orders.size)
+}
+```
+
+Fakes read like what they replace. Mocks encode call expectations into
+your test — coupling it to implementation details.
+
+---
+
+## Entry points — DI in contexts Hilt doesn't own
+
+When you need DI inside a `ContentProvider`, a `BroadcastReceiver` outside
+the normal lifecycle, or third-party callback:
+
+```kotlin
+@EntryPoint
+@InstallIn(SingletonComponent::class)
+interface AnalyticsEntryPoint {
+    fun analytics(): Analytics
+}
+
+class LegacyBroadcastReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val analytics = EntryPointAccessors.fromApplication<AnalyticsEntryPoint>(context).analytics()
+        analytics.logBroadcastReceived(intent.action ?: "")
+    }
+}
+```
+
+Entry points give you ad-hoc access to the graph from places Hilt can't
+inject into directly.
+
+---
+
+## The hybrid: DI across feature modules
+
+In multi-module projects, each feature module declares its own Hilt
+modules. The `:app` module aggregates them:
+
+```kotlin
+// :feature:profile — provides its own bindings
+@Module @InstallIn(SingletonComponent::class)
+abstract class ProfileModule {
+    @Binds @Singleton abstract fun bindProfileApi(impl: ProfileApiImpl): ProfileApi
+}
+
+// :feature:feed — uses ProfileApi without knowing the impl
+class FeedViewModel @Inject constructor(
+    private val profileApi: ProfileApi
+) : ViewModel()
+
+// :app — just declares dependencies on both modules
+implementation(projects.feature.profile)
+implementation(projects.feature.feed)
+```
+
+See [Modularization at Scale](/docs/modularization/overview) for the full
+multi-module DI story.
+
+---
+
+## Common DI anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'What breaks at scale',
+    variant: 'old',
+    points: [
+      'new-ing up dependencies inside classes',
+      'Passing Context everywhere; using it as a locator',
+      'Singletons for request-scoped data (leak)',
+      'Over-scoping — everything @Singleton',
+      'Circular deps (A→B→A) — Hilt will fail',
+      'Hard-coding Dispatchers.IO (can\'t test)'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production-grade DI',
+    variant: 'new',
+    points: [
+      '@Inject constructor every concrete class you own',
+      'Inject @ApplicationContext sparingly; prefer typed collaborators',
+      'Scope request-scoped data to ViewModelComponent or ActivityRetained',
+      'Default to @Singleton only for stateless / app-wide',
+      'Break cycles with provider or lazy injection',
+      'Inject @IoDispatcher etc so tests can swap TestDispatcher'
+    ]
+  }}
+/>
+
+---
+
+## Dagger vs Hilt vs Koin — the landscape
+
+| | Dagger 2 | Hilt | Koin | Kodein |
+|-|----------|------|------|--------|
+| Kind | Compile-time DI | Compile-time DI (Dagger for Android) | Service Locator (runtime) | Service Locator (runtime) |
+| Graph validation | Compile-time | Compile-time | Runtime | Runtime |
+| Android integration | Manual | Automatic | Automatic | Automatic |
+| Learning curve | Steep | Moderate | Gentle | Gentle |
+| Compile-time cost | High | High | Zero | Zero |
+| Runtime cost | Zero | Zero | Reflection | Reflection |
+| Best for | Large multi-module projects (pre-Hilt) | Any modern Android app | Small apps; KMP | Small apps |
+
+**Recommendation for new Android projects**: Hilt. It's the Google-
+recommended choice, backed by Dagger's compile-time verification, with
+Android-specific components pre-wired.
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="DI rules">
+- **Constructor inject by default**; use `@Provides` only for library types.
+- **`@Binds` over `@Provides`** for interface-to-impl bindings.
+- **Qualifiers** when you need multiple instances of the same type.
+- **`@AssistedInject`** for classes that mix injected + runtime args.
+- **Multibindings** (`@IntoSet`, `@IntoMap`) for plugins, initializers, workers.
+- **Scope narrowly by exception** — default to `@Singleton`.
+- **`@TestInstallIn` / `@BindValue`** for testing; prefer fakes over mocks.
+- **Compile-time verification** is non-negotiable for enterprise apps.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Audit your Application class', description: 'Find any new-ing up of Retrofit, Room, OkHttp, etc. Move to a @Module with @Provides + @Singleton.' },
+  { title: 'Add dispatcher qualifiers', description: 'Create @IoDispatcher / @DefaultDispatcher / @MainDispatcher. Replace every direct Dispatchers.X reference in repositories and use cases.' },
+  { title: 'Build an AppInitializer multibinding', description: 'Create an AppInitializer interface, two @IntoSet bindings, and a HiltAndroidApp that runs them all on startup.' },
+  { title: 'Write a Hilt test', description: 'Use @HiltAndroidTest + @BindValue to replace a UserRepository with a fake in a Compose UI test.' },
+  { title: 'Assisted factory', description: 'Take an interactor that needs a runtime ID + injected deps. Refactor to @AssistedInject with a factory.' }
+]} />
+
+## Continue reading
+
+- **[Hexagonal / Ports & Adapters](./hexagonal-ports-adapters)** — the architecture DI enables
+- **[Unidirectional Data Flow](./unidirectional-data-flow)** — state holders wired with Hilt
+- **[Error Handling](./error-handling)** — typed errors in the injected pipeline

@@ -1,0 +1,687 @@
+---
+id: data-patterns
+title: Data Patterns
+sidebar_label: Data Patterns
+description: Data-layer patterns for production Android — Single Source of Truth, NetworkBoundResource, Cache-Aside, Write-Through, Unit of Work, Identity Map, Optimistic UI.
+---
+
+import { Callout, StepList, ComparisonCard, Diagram, NetworkingDiagram } from '@site/src/components/Doc';
+
+# Data Patterns
+
+Data patterns answer: **where does data live, how does it get there, and
+how does it stay consistent?** These are the patterns you implement inside
+the `:data` module — the ones that determine whether your app feels
+instant or sluggish, whether it works offline, and whether two tabs show
+the same thing.
+
+## 1. Single Source of Truth (SSoT)
+
+**Intent**: For every piece of state, exactly one authoritative location
+owns it. Everything else observes.
+
+### The rule
+
+```text
+      Network ────► Cache (Room) ────► ViewModel ────► UI
+                     ↑
+                  TRUTH
+```
+
+The UI **never** reads directly from network. The ViewModel **never**
+reads from network. Writing is the reverse path — the UI tells the
+ViewModel, which tells the repository, which writes to Room, which
+emits a Flow that the ViewModel observes.
+
+```kotlin
+class ProductRepositoryImpl @Inject constructor(
+    private val api: ProductApi,
+    private val dao: ProductDao,
+    @IoDispatcher private val io: CoroutineDispatcher
+) : ProductRepository {
+
+    // UI observes Room — the SSoT
+    override fun observe(id: String): Flow<Product> = dao.observeById(id)
+        .map { it.toDomain() }
+        .flowOn(io)
+
+    // Refresh: network → Room. UI re-renders automatically via the Flow.
+    override suspend fun refresh(id: String) = withContext(io) {
+        val dto = api.fetch(id)
+        dao.upsert(dto.toEntity())
+    }
+}
+```
+
+### Why this matters
+
+- **Two screens stay in sync** — update from one, the other re-renders.
+- **Offline works** — Room is populated; network failures don't blank the UI.
+- **Tests are simple** — seed Room; the UI renders the seeded data.
+- **No stale caches** — Room is the truth; invalidation is explicit.
+
+### Derived state is also SSoT
+
+```kotlin
+// Derive cart count from cart items — don't store it separately
+val cartCount: Flow<Int> = cartDao.observeAll().map { it.size }
+```
+
+Never store `cartItems` AND `cartCount` — one derives from the other, or
+they'll go out of sync.
+
+---
+
+## 2. Repository Pattern
+
+**Intent**: A single object that abstracts the **source** of data from
+the rest of the app. Callers don't know if data comes from network, disk,
+memory, or a test fake.
+
+### Repository is not a DAO
+
+A common confusion — the DAO maps to a **table**; the repository maps to a
+**concept in the domain**. One repository can aggregate multiple DAOs,
+APIs, and in-memory sources:
+
+```kotlin
+class OrderRepositoryImpl @Inject constructor(
+    private val api: OrderApi,
+    private val orderDao: OrderDao,
+    private val productDao: ProductDao,      // joins with product details
+    private val userRepo: UserRepository,    // joins with customer info
+    private val outbox: OutboxDao,
+    private val workManager: WorkManager,
+    @IoDispatcher private val io: CoroutineDispatcher
+) : OrderRepository {
+
+    override fun observe(orderId: OrderId): Flow<Order> = combine(
+        orderDao.observe(orderId.raw),
+        productDao.observeAll()
+    ) { orderEntity, products ->
+        orderEntity?.toDomain(products.associateBy { it.id }) ?: error("Order not found")
+    }
+    /* ... */
+}
+```
+
+The ViewModel just calls `repository.observe(orderId)` — all the plumbing
+is hidden.
+
+### Interface in domain, impl in data
+
+```text
+:domain
+  OrderRepository.kt        -- interface
+:data
+  OrderRepositoryImpl.kt    -- implementation (Retrofit, Room, etc.)
+```
+
+Binding via Hilt:
+
+```kotlin
+@Module @InstallIn(SingletonComponent::class)
+abstract class RepositoryModule {
+    @Binds @Singleton
+    abstract fun bindOrderRepository(impl: OrderRepositoryImpl): OrderRepository
+}
+```
+
+See [Hexagonal / Ports & Adapters](/docs/architecture/hexagonal-ports-adapters)
+for the architectural context.
+
+---
+
+## 3. NetworkBoundResource — classic cache + refresh
+
+**Intent**: For a resource backed by both cache and network, return cache
+immediately, then refresh from network in the background.
+
+<Diagram title="NetworkBoundResource flow" caption="Emit cached data, fetch from network, save to cache, re-emit from cache.">
+  <NetworkingDiagram />
+</Diagram>
+
+```kotlin
+inline fun <ResultType, RequestType> networkBoundResource(
+    crossinline query: () -> Flow<ResultType>,
+    crossinline fetch: suspend () -> RequestType,
+    crossinline saveFetchResult: suspend (RequestType) -> Unit,
+    crossinline shouldFetch: (ResultType) -> Boolean = { true }
+) = flow<Resource<ResultType>> {
+    emit(Resource.Loading)
+    val data = query().first()
+
+    val flow = if (shouldFetch(data)) {
+        emit(Resource.Loading)    // explicit loading
+        try {
+            saveFetchResult(fetch())
+            query().map { Resource.Success(it) }
+        } catch (t: Throwable) {
+            query().map { Resource.Error(t, it) }
+        }
+    } else {
+        query().map { Resource.Success(it) }
+    }
+
+    emitAll(flow)
+}
+
+sealed interface Resource<out T> {
+    data object Loading : Resource<Nothing>
+    data class Success<T>(val data: T) : Resource<T>
+    data class Error(val cause: Throwable, val cached: Any? = null) : Resource<Nothing>
+}
+```
+
+### Usage
+
+```kotlin
+fun productResource(id: String): Flow<Resource<Product>> = networkBoundResource(
+    query = { dao.observeById(id).map { it.toDomain() } },
+    fetch = { api.fetch(id) },
+    saveFetchResult = { dto -> dao.upsert(dto.toEntity()) },
+    shouldFetch = { cached -> isStale(cached) }
+)
+```
+
+The caller sees `Loading`, then cached data, then (eventually) fresh data.
+The UI can render intermediate states without ever being empty.
+
+<Callout kind="tip" title="The modern alternative">
+Paging 3 with `RemoteMediator` implements this pattern end-to-end for
+paginated lists. For single items, `networkBoundResource` is still the
+cleanest abstraction.
+</Callout>
+
+---
+
+## 4. Cache-Aside
+
+**Intent**: App reads from cache. On miss, reads from source-of-truth
+(backend), stores in cache, returns value.
+
+```kotlin
+class UserRepository @Inject constructor(
+    private val cache: UserCache,
+    private val api: UserApi
+) {
+    suspend fun get(id: UserId): User = cache.get(id) ?: run {
+        val fresh = api.fetch(id.raw).toDomain()
+        cache.put(id, fresh)
+        fresh
+    }
+}
+```
+
+### When cache-aside beats write-through
+
+- Read-heavy workloads (news feed, catalog)
+- Data rarely changes from the app's perspective
+- Eventual consistency is acceptable
+
+### When it hurts
+
+- Write-heavy workloads (chat, collaborative editing)
+- Strict consistency required (banking)
+
+---
+
+## 5. Write-Through Cache
+
+**Intent**: Writes go to cache AND backend synchronously. Reads hit cache.
+
+```kotlin
+class SettingsRepository @Inject constructor(
+    private val cache: SettingsDao,
+    private val api: SettingsApi
+) {
+    suspend fun update(setting: Setting) {
+        api.update(setting.toDto())            // write to backend first
+        cache.upsert(setting.toEntity())       // then cache
+        // If API fails, cache is untouched — stays in sync
+    }
+}
+```
+
+Trade-off: every write blocks on the network. For user settings, fine. For
+chat messages, too slow — use the offline-first / outbox pattern.
+
+---
+
+## 6. Write-Behind (Outbox)
+
+**Intent**: Writes go to cache immediately. Backend sync happens async.
+UI doesn't wait.
+
+See [Offline-First Architecture](/docs/architecture-patterns/offline-first)
+for the complete pattern.
+
+```kotlin
+suspend fun send(message: String) {
+    val local = MessageEntity(id = Uuid.random().toString(), body = message, status = SENDING)
+    dao.insert(local)                          // immediate write
+    outbox.enqueue(OutboxItem.SendMessage(local.id))
+    workManager.enqueueUniqueWork(OUTBOX_WORK, /* ... */)
+}
+// WorkManager processes the outbox in the background, retries on failure
+```
+
+The UI sees the message instantly. Sync happens later. Idempotency keys
+(the client-generated ID) make retries safe.
+
+---
+
+## 7. Optimistic UI
+
+**Intent**: Show the expected result immediately, then reconcile with the
+actual server response.
+
+```kotlin
+suspend fun likePost(postId: PostId): Outcome<Unit, LikeError> {
+    val original = postDao.getById(postId.raw)
+
+    // Optimistic — apply the change immediately
+    postDao.updateLiked(postId.raw, liked = true, likeCount = original.likeCount + 1)
+
+    return try {
+        api.like(postId.raw)
+        Outcome.Ok(Unit)
+    } catch (c: CancellationException) { throw c
+    } catch (t: Throwable) {
+        // Rollback
+        postDao.updateLiked(postId.raw, liked = original.liked, likeCount = original.likeCount)
+        Outcome.Err(LikeError.Network(t))
+    }
+}
+```
+
+The UI sees the like happen instantly; if the server rejects, the cache
+reverts and the UI re-renders. Users feel an instant app; the occasional
+revert is rare.
+
+### Conflict resolution
+
+If the server came back with updated counts (someone else also liked),
+merge carefully:
+
+```kotlin
+val serverResponse = api.like(postId.raw)
+postDao.update(
+    id = postId.raw,
+    liked = true,
+    likeCount = serverResponse.likeCount      // authoritative value from server
+)
+```
+
+---
+
+## 8. Unit of Work
+
+**Intent**: Group multiple reads/writes into a single logical transaction.
+
+### Room's `@Transaction` + `withTransaction`
+
+```kotlin
+suspend fun placeOrder(cart: Cart): Order = database.withTransaction {
+    val order = OrderEntity.from(cart)
+    orderDao.insert(order)
+    cart.items.forEach { item ->
+        orderItemDao.insert(OrderItemEntity.from(order.id, item))
+        inventoryDao.decrement(item.productId, item.quantity)
+    }
+    cartDao.clear(cart.id)
+    order.toDomain()
+}
+```
+
+If any step throws, Room rolls the whole thing back. No half-placed orders.
+
+### Across heterogeneous stores
+
+Room handles its own atomicity. Crossing to network in the same "unit" is
+harder — use the **saga** pattern (compensating actions) for multi-store
+transactions:
+
+```kotlin
+suspend fun bookTrip(flight: Flight, hotel: Hotel, car: Car): Outcome<Booking, BookingError> {
+    val flightRes = flightApi.book(flight)
+    if (flightRes is Outcome.Err) return Outcome.Err(BookingError.FlightFailed)
+
+    val hotelRes = hotelApi.book(hotel)
+    if (hotelRes is Outcome.Err) {
+        flightApi.cancel(flightRes.value.id)       // compensating action
+        return Outcome.Err(BookingError.HotelFailed)
+    }
+
+    val carRes = carApi.book(car)
+    if (carRes is Outcome.Err) {
+        flightApi.cancel(flightRes.value.id)
+        hotelApi.cancel(hotelRes.value.id)
+        return Outcome.Err(BookingError.CarFailed)
+    }
+
+    return Outcome.Ok(Booking(flightRes.value, hotelRes.value, carRes.value))
+}
+```
+
+Each successful step has a compensating action (cancel) that fires if a
+later step fails.
+
+---
+
+## 9. Identity Map
+
+**Intent**: Ensure that an object is loaded only once per unit of work. A
+second request for the same entity returns the same instance.
+
+Room handles this automatically via its primary-key tracking. For in-memory
+caches, you can implement it:
+
+```kotlin
+class InMemoryUserRepository @Inject constructor(
+    private val api: UserApi,
+    private val scope: CoroutineScope
+) : UserRepository {
+
+    private val cache = mutableMapOf<UserId, Deferred<User>>()
+    private val mutex = Mutex()
+
+    override suspend fun get(id: UserId): User = mutex.withLock {
+        cache.getOrPut(id) {
+            scope.async { api.fetch(id.raw).toDomain() }
+        }
+    }.await()
+}
+```
+
+Two simultaneous calls for the same `UserId` share one in-flight request.
+Without the identity map, you'd do two network calls and possibly get two
+slightly different `User` objects.
+
+---
+
+## 10. Stale-While-Revalidate
+
+**Intent**: Always show cached data, even if stale. Refresh in the
+background so the next read is fresh.
+
+```kotlin
+fun observe(id: String): Flow<Product> = flow {
+    val cached = dao.getById(id)
+    if (cached != null) emit(cached.toDomain())
+
+    // Launch background refresh whether cache was present or not
+    scope.launch {
+        runCatching { api.fetch(id) }.onSuccess { dao.upsert(it.toEntity()) }
+    }
+
+    // Subsequent emissions come from the DAO's Flow
+    emitAll(dao.observeById(id).map { it?.toDomain() ?: return@map })
+}
+```
+
+The UI renders instantly from cache. The refresh arrives shortly after and
+updates the view. Network failures don't break the UI.
+
+---
+
+## 11. Read-Through Cache
+
+**Intent**: Cache lookups go through a loader that transparently fetches
+from source on miss.
+
+```kotlin
+class ReadThroughCache<K, V>(
+    private val loader: suspend (K) -> V,
+    private val maxSize: Int = 100,
+    private val expireAfter: Duration = 5.minutes
+) {
+    private data class Entry<V>(val value: V, val loadedAt: Instant)
+    private val cache = LinkedHashMap<K, Entry<V>>(maxSize, 0.75f, true)
+    private val mutex = Mutex()
+
+    suspend fun get(key: K): V = mutex.withLock { cache[key] }?.let { entry ->
+        if (Instant.now() - entry.loadedAt < expireAfter) entry.value else null
+    } ?: run {
+        val value = loader(key)
+        mutex.withLock {
+            if (cache.size >= maxSize) cache.entries.iterator().next().let { cache.remove(it.key) }
+            cache[key] = Entry(value, Instant.now())
+        }
+        value
+    }
+}
+
+// Usage
+val productCache = ReadThroughCache<String, Product>(
+    loader = { id -> api.fetch(id).toDomain() }
+)
+val product = productCache.get("p1")
+```
+
+Caller doesn't know about the cache. If the entry is fresh, cache hit. If
+expired or missing, it loads.
+
+---
+
+## 12. Event Sourcing
+
+**Intent**: Persist every state change as an event; reconstruct state by
+replaying events.
+
+```kotlin
+sealed interface AccountEvent {
+    val accountId: String
+    val timestamp: Instant
+
+    data class Created(override val accountId: String, override val timestamp: Instant, val initialBalance: Money) : AccountEvent
+    data class Deposited(override val accountId: String, override val timestamp: Instant, val amount: Money) : AccountEvent
+    data class Withdrawn(override val accountId: String, override val timestamp: Instant, val amount: Money) : AccountEvent
+    data class Closed(override val accountId: String, override val timestamp: Instant) : AccountEvent
+}
+
+data class AccountState(
+    val balance: Money = Money.Zero,
+    val isClosed: Boolean = false
+)
+
+fun replay(events: List<AccountEvent>): AccountState = events.fold(AccountState()) { state, event ->
+    when (event) {
+        is AccountEvent.Created -> state.copy(balance = event.initialBalance)
+        is AccountEvent.Deposited -> state.copy(balance = state.balance + event.amount)
+        is AccountEvent.Withdrawn -> state.copy(balance = state.balance - event.amount)
+        is AccountEvent.Closed -> state.copy(isClosed = true)
+    }
+}
+```
+
+Use cases:
+- Auditability — every change preserved
+- Time-travel debugging — replay to any point
+- Complex undo/redo — events are the history
+
+Overkill for most apps. Use when regulatory or domain requirements demand
+full history.
+
+---
+
+## 13. CQRS — Command-Query Responsibility Segregation
+
+**Intent**: Separate the model that reads data from the model that writes.
+
+### Lightweight CQRS — separate reads from writes
+
+```kotlin
+interface OrderCommandRepository {
+    suspend fun place(order: Order): Outcome<OrderId, OrderError>
+    suspend fun cancel(id: OrderId): Outcome<Unit, OrderError>
+}
+
+interface OrderQueryRepository {
+    fun observeActive(userId: UserId): Flow<List<OrderSummary>>
+    fun observeDetail(id: OrderId): Flow<OrderDetail>
+}
+```
+
+Reads and writes can use different data models. Writes validate heavily;
+reads are denormalized for fast rendering.
+
+### When CQRS shines
+
+- High-traffic feeds where read and write rates differ dramatically
+- Complex write rules but simple read projections
+- Multi-model backends (SQL for writes, materialized views for reads)
+
+Most Android apps don't need formal CQRS. The principle (don't force one
+model for both) is still useful.
+
+---
+
+## 14. Pagination (cursor-based)
+
+```kotlin
+data class Page<T>(
+    val items: List<T>,
+    val nextCursor: String?
+)
+
+@HiltWorker
+class SyncWorker @AssistedInject constructor(/* ... */) : CoroutineWorker(ctx, params) {
+    override suspend fun doWork(): Result {
+        var cursor: String? = syncCursorStore.get()
+        do {
+            val page = api.page(cursor)
+            db.withTransaction {
+                db.messageDao().upsertAll(page.items.map { it.toEntity() })
+            }
+            cursor = page.nextCursor
+            syncCursorStore.set(cursor)
+        } while (cursor != null)
+        return Result.success()
+    }
+}
+```
+
+**Cursor-based** beats page-number-based for:
+- Infinite scroll (always fetch "after X")
+- Real-time feeds (prepend new, append old)
+- Stable positions when items are inserted/removed mid-list
+
+Paging 3 + `RemoteMediator` implements this natively. See
+[Lists & Lazy Layouts](/docs/jetpack-compose/lists-lazy-layouts).
+
+---
+
+## 15. Polling vs Push
+
+### Polling
+
+```kotlin
+fun observeOrderStatus(id: OrderId): Flow<OrderStatus> = flow {
+    while (currentCoroutineContext().isActive) {
+        val status = api.getStatus(id.raw)
+        emit(status.toDomain())
+        if (status.isTerminal) break
+        delay(5.seconds)
+    }
+}
+```
+
+### Push (WebSocket or SSE)
+
+```kotlin
+fun observeOrderStatus(id: OrderId): Flow<OrderStatus> = callbackFlow {
+    val subscription = ws.subscribe("/orders/$id") { event ->
+        trySend(event.toDomain())
+    }
+    awaitClose { subscription.close() }
+}
+```
+
+**Rule**: poll if changes are rare or delay is tolerable. Push if real-time
+matters (chat, live tracking). See
+[GraphQL/WebSocket/gRPC](/docs/networking-api/graphql-websocket-grpc).
+
+---
+
+## 16. Data Mapper / DTO Pattern
+
+```kotlin
+// DTO — whatever shape the wire uses
+data class UserDto(
+    val id: String,
+    val name: String?,
+    @Json(name = "email_address") val emailAddress: String?,
+    @Json(name = "created_at_ms") val createdAtMs: Long?
+)
+
+// Entity — whatever shape Room stores
+@Entity(tableName = "users")
+data class UserEntity(
+    @PrimaryKey val id: String,
+    val name: String,
+    val email: String,
+    val createdAt: Long,
+    val fetchedAt: Long
+)
+
+// Domain — whatever shape the business uses
+data class User(
+    val id: UserId,
+    val name: NonEmptyString,
+    val email: Email,
+    val createdAt: Instant
+)
+
+// Adapters
+fun UserDto.toEntity(now: Long = System.currentTimeMillis()) = UserEntity(
+    id = id,
+    name = name ?: error("Missing name"),
+    email = emailAddress ?: error("Missing email"),
+    createdAt = createdAtMs ?: error("Missing createdAt"),
+    fetchedAt = now
+)
+
+fun UserEntity.toDomain() = User(
+    id = UserId(id),
+    name = NonEmptyString(name),
+    email = Email.parse(email).valueOr { error(it) },
+    createdAt = Instant.ofEpochMilli(createdAt)
+)
+```
+
+Each layer owns its shape. Changes at one boundary (API field rename)
+don't ripple through the whole app. See
+[Structural Patterns: Adapter](./structural-patterns).
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Data pattern rules">
+- **Single Source of Truth** — Room is the truth; network is a sync mechanism.
+- **Repository** abstracts the source; one per domain concept, not per table.
+- **NetworkBoundResource** for cache + refresh with explicit Loading/Success/Error.
+- **Cache-Aside** for read-heavy; **Write-Through** for small synchronous writes; **Write-Behind (Outbox)** for offline-first.
+- **Optimistic UI** with rollback on failure — instant-feel apps.
+- **Unit of Work** via Room transactions; **saga with compensating actions** across stores.
+- **Identity Map** prevents duplicate in-flight fetches; Room does this automatically.
+- **Cursor-based pagination** beats page numbers for feeds.
+- **DTO / Entity / Domain** — three shapes, three layers, adapters between.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'SSoT refactor', description: 'Find a ViewModel that reads directly from Retrofit. Refactor so it reads from Room, and Retrofit writes to Room in the background.' },
+  { title: 'NetworkBoundResource', description: 'Implement a networkBoundResource helper. Use it for a Product detail screen that shows cached data first, then refreshes.' },
+  { title: 'Optimistic like', description: 'Build a like button that updates the cache immediately. On server failure, revert the cache and show a toast.' },
+  { title: 'Outbox + WorkManager', description: 'Implement the outbox pattern for sending messages. Verify that messages show as "sending" in offline mode and flush when the network returns.' },
+  { title: 'Unit of work', description: 'Wrap a multi-step write (save order + decrement inventory + clear cart) in database.withTransaction { }. Test that a mid-step failure rolls back all writes.' }
+]} />
+
+## Continue reading
+
+- **[Offline-First Architecture](/docs/architecture-patterns/offline-first)** — the full offline playbook
+- **[Unidirectional Data Flow](/docs/architecture/unidirectional-data-flow)** — how the UI consumes data patterns
+- **[Concurrency Patterns](./concurrency-patterns)** — retry, debounce, circuit breaker for data layers

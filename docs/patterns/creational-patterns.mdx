@@ -1,0 +1,492 @@
+---
+id: creational-patterns
+title: Creational Patterns
+sidebar_label: Creational Patterns
+description: Every GoF creational pattern with Android/Kotlin code — Singleton, Factory Method, Abstract Factory, Builder, Prototype, Object Pool.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Creational Patterns
+
+Creational patterns answer: **who creates this object, and how?** In
+Kotlin, many classic creational patterns collapse into idiomatic language
+features (`object`, data classes, named arguments) — but the named
+patterns still matter for communication and for cases where the idiom
+doesn't fit.
+
+## 1. Singleton — exactly one instance
+
+**Intent**: Ensure a class has one instance and give a global point of
+access.
+
+### Kotlin `object` — built-in singleton
+
+```kotlin
+object Logger {
+    private val timestamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+    fun d(tag: String, message: String) {
+        Log.d(tag, "${timestamp.format(Date())} $message")
+    }
+}
+
+// Usage
+Logger.d("App", "started")
+```
+
+`object` is thread-safe, lazily initialized on first access, and has a
+single instance per classloader. The idiom replaces Java's double-checked-
+locking boilerplate.
+
+### Hilt-managed singleton — the recommended form for DI
+
+```kotlin
+@Singleton
+class AuthSession @Inject constructor(
+    private val dataStore: DataStore<Preferences>
+) {
+    private val _state = MutableStateFlow<Session>(Session.SignedOut)
+    val state: StateFlow<Session> = _state.asStateFlow()
+    /* ... */
+}
+```
+
+Prefer this over `object` for anything you might want to:
+- Swap in tests (inject a fake)
+- Observe lifecycle (Hilt tears down on test isolation)
+- Inject collaborators
+
+<Callout kind="warning" title="Singleton trade-offs">
+Singletons are easy to use and **hard to test**. An `object` with hidden
+state is effectively a global — and globals destroy test isolation. DI-
+managed singletons fix this by letting tests provide different instances.
+</Callout>
+
+### When Singleton is the right choice
+
+- Stateless utilities (loggers, formatters, id generators)
+- Expensive-to-create shared resources (OkHttpClient, Retrofit, Room DB)
+- App-wide session / config / feature-flag state
+
+### When it isn't
+
+- Anything that holds per-user or per-screen state
+- Business logic that should be testable in isolation
+- "Because it's convenient" — convenience is a code smell
+
+---
+
+## 2. Factory Method — defer construction to a method
+
+**Intent**: Define an interface for creating objects but let subclasses
+or implementations decide which concrete class to instantiate.
+
+### Classic form
+
+```kotlin
+interface PaymentProcessor {
+    suspend fun charge(amount: Cents): PaymentResult
+
+    // Factory method — subclasses produce the specific processor
+    abstract class Provider {
+        abstract fun create(config: PaymentConfig): PaymentProcessor
+    }
+}
+
+class StripeProcessor(private val config: PaymentConfig) : PaymentProcessor {
+    override suspend fun charge(amount: Cents) = /* ... */
+
+    class Provider : PaymentProcessor.Provider() {
+        override fun create(config: PaymentConfig) = StripeProcessor(config)
+    }
+}
+```
+
+### Kotlin-idiomatic form — companion `operator fun invoke`
+
+```kotlin
+interface PaymentProcessor {
+    suspend fun charge(amount: Cents): PaymentResult
+
+    companion object {
+        operator fun invoke(config: PaymentConfig): PaymentProcessor = when (config.provider) {
+            PaymentProvider.Stripe -> StripeProcessor(config)
+            PaymentProvider.Square -> SquareProcessor(config)
+            PaymentProvider.PayPal -> PayPalProcessor(config)
+        }
+    }
+}
+
+// Callers use the interface directly
+val processor = PaymentProcessor(config)   // looks like a constructor; it's a factory
+```
+
+### Android examples
+
+- `Fragment.newInstance(args)` — factory method for Fragment + args
+- `ViewModelProvider.Factory.create(T::class)` — obsolete; replaced by Hilt
+- `Intent.Builder` (some APIs) — builder-style factory
+- `OkHttpClient.newCall(request)` — factory for `Call`
+
+---
+
+## 3. Abstract Factory — family of related objects
+
+**Intent**: Provide an interface for creating families of related or
+dependent objects without specifying their concrete classes.
+
+### The shape
+
+```kotlin
+// Abstract factory — produces a family of related things
+interface DatabaseFactory {
+    fun createConnection(): DbConnection
+    fun createMigrationRunner(): MigrationRunner
+    fun createBackupService(): BackupService
+}
+
+// Concrete factory — Postgres family
+class PostgresFactory(private val config: DbConfig) : DatabaseFactory {
+    override fun createConnection() = PostgresConnection(config)
+    override fun createMigrationRunner() = FlywayMigrationRunner(createConnection())
+    override fun createBackupService() = PgDumpBackupService(config)
+}
+
+// Concrete factory — SQLite family (for testing / dev)
+class SqliteFactory : DatabaseFactory {
+    override fun createConnection() = SqliteConnection(":memory:")
+    override fun createMigrationRunner() = SqlScriptRunner(createConnection())
+    override fun createBackupService() = SqliteFileBackup()
+}
+```
+
+### Real-world Android — `TransportFactory`
+
+Firebase Datatransport library uses an abstract factory:
+
+```kotlin
+val factory: TransportFactory = TransportRuntime.getInstance()
+    .newFactory(CCTDestination.INSTANCE)
+
+val analyticsTransport: Transport<AnalyticsEvent> =
+    factory.getTransport("ANALYTICS", AnalyticsEvent::class.java, AnalyticsEventEncoder())
+
+val crashTransport: Transport<CrashEvent> =
+    factory.getTransport("CRASH", CrashEvent::class.java, CrashEventEncoder())
+```
+
+One factory produces a family of `Transport` instances wired to the same
+backend.
+
+### Hilt as abstract factory
+
+Hilt components are abstract factories in disguise. The `SingletonComponent`
+produces a family of app-wide objects; the `ViewModelComponent` produces
+a family of per-ViewModel objects. Installing the same module in different
+components produces different "families."
+
+```kotlin
+@Module @InstallIn(SingletonComponent::class)
+object ProdNetworkModule { /* OkHttp with cert pinning */ }
+
+@Module @InstallIn(SingletonComponent::class)
+@TestInstallIn(replaces = [ProdNetworkModule::class], components = [SingletonComponent::class])
+object FakeNetworkModule { /* OkHttp with MockWebServer */ }
+```
+
+---
+
+## 4. Builder — step-by-step construction
+
+**Intent**: Separate the construction of a complex object from its
+representation so the same construction process can create different
+representations.
+
+### Java-style builder (still common in Android libraries)
+
+```kotlin
+val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+    .setSmallIcon(R.drawable.ic_notif)
+    .setContentTitle("Order shipped")
+    .setContentText("Arriving Friday")
+    .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+    .setCategory(NotificationCompat.CATEGORY_STATUS)
+    .setAutoCancel(true)
+    .addAction(R.drawable.ic_track, "Track", trackPendingIntent)
+    .build()
+```
+
+Every Jetpack library ships builders: `Retrofit.Builder`, `OkHttpClient.Builder`,
+`Room.databaseBuilder`, `WorkManager.Configuration.Builder`, etc. You'll
+write hundreds.
+
+### Kotlin-idiomatic — named arguments + defaults
+
+For classes you own, Kotlin's named arguments often make builders
+unnecessary:
+
+```kotlin
+data class NotificationSpec(
+    val channel: String,
+    val title: String,
+    val body: String,
+    val priority: Int = NotificationCompat.PRIORITY_DEFAULT,
+    val category: String? = null,
+    val autoCancel: Boolean = true,
+    val actions: List<Action> = emptyList()
+)
+
+// Callers pick exactly what they need
+val spec = NotificationSpec(
+    channel = CHANNEL_ID,
+    title = "Order shipped",
+    body = "Arriving Friday",
+    actions = listOf(Action("Track", trackIntent))
+)
+```
+
+### Kotlin DSL builder — best of both worlds
+
+When construction has nesting or branching, a DSL with function receivers
+is elegant:
+
+```kotlin
+fun notification(init: NotificationSpec.Builder.() -> Unit): NotificationSpec =
+    NotificationSpec.Builder().apply(init).build()
+
+class NotificationSpec.Builder {
+    var channel: String = ""
+    var title: String = ""
+    var body: String = ""
+    var priority = NotificationCompat.PRIORITY_DEFAULT
+    private val actions = mutableListOf<Action>()
+
+    fun action(label: String, intent: PendingIntent) {
+        actions += Action(label, intent)
+    }
+
+    fun build() = NotificationSpec(channel, title, body, priority, actions = actions.toList())
+}
+
+// Usage
+val spec = notification {
+    channel = CHANNEL_ID
+    title = "Order shipped"
+    body = "Arriving Friday"
+    priority = NotificationCompat.PRIORITY_HIGH
+    action("Track", trackIntent)
+    action("Cancel", cancelIntent)
+}
+```
+
+This is how Ktor, Exposed, and Jetpack Compose configure their APIs.
+
+---
+
+## 5. Prototype — clone existing objects
+
+**Intent**: Specify the kinds of objects to create using a prototypical
+instance, and create new objects by copying this prototype.
+
+### Data class `copy()` — Kotlin's built-in prototype
+
+```kotlin
+data class AppConfig(
+    val apiBaseUrl: String,
+    val timeout: Duration,
+    val retryCount: Int,
+    val debugLogging: Boolean
+)
+
+val productionConfig = AppConfig(
+    apiBaseUrl = "https://api.example.com",
+    timeout = 30.seconds,
+    retryCount = 3,
+    debugLogging = false
+)
+
+// Clone with one change — the prototype pattern
+val stagingConfig = productionConfig.copy(apiBaseUrl = "https://staging.api.example.com")
+
+// Clone with multiple changes
+val debugConfig = productionConfig.copy(
+    apiBaseUrl = "https://localhost:8080",
+    timeout = 60.seconds,
+    debugLogging = true
+)
+```
+
+The `copy()` method generated by `data class` **is** the prototype
+pattern — make a new instance from an existing one, changing only the
+fields you need.
+
+### Deep copy vs shallow copy
+
+`copy()` is **shallow** — nested mutable collections stay shared:
+
+```kotlin
+data class Cart(val items: MutableList<CartItem>)
+
+val original = Cart(mutableListOf(CartItem("apple")))
+val clone = original.copy()
+
+clone.items.add(CartItem("banana"))
+println(original.items)   // [apple, banana] — original changed!
+```
+
+For true prototype semantics, use **immutable** collections:
+
+```kotlin
+data class Cart(val items: ImmutableList<CartItem>)
+
+val clone = original.copy(items = original.items + CartItem("banana"))
+// original.items is unchanged
+```
+
+See [Domain Modeling](/docs/architecture/domain-modeling) for the
+immutability deep dive.
+
+### When prototype matters
+
+- Cloning expensive-to-build objects (pre-configured Retrofit, seeded DBs)
+- Creating variant configurations from a base (production → staging → dev)
+- Snapshot state for undo/redo
+- Pre-populated test fixtures
+
+---
+
+## 6. Object Pool — reuse expensive instances
+
+**Intent**: Use a pool of ready-to-use objects instead of creating and
+destroying them on demand.
+
+### Why you'd want one
+
+Some objects are expensive to construct:
+
+- `Bitmap` allocation at high resolution
+- OkHttp connections (already pooled, but the pattern applies)
+- Database prepared statements
+- Complex reflection-based parsers
+- Compose `RecyclerView.RecycledViewPool` (actual pool!)
+
+### A simple bitmap pool
+
+```kotlin
+class BitmapPool(private val maxSize: Int) {
+    private val available = ArrayDeque<Bitmap>(maxSize)
+    private val lock = Any()
+
+    fun acquire(width: Int, height: Int, config: Bitmap.Config): Bitmap {
+        synchronized(lock) {
+            val iter = available.iterator()
+            while (iter.hasNext()) {
+                val bmp = iter.next()
+                if (bmp.width == width && bmp.height == height && bmp.config == config) {
+                    iter.remove()
+                    return bmp
+                }
+            }
+        }
+        return Bitmap.createBitmap(width, height, config)
+    }
+
+    fun release(bitmap: Bitmap) {
+        synchronized(lock) {
+            if (available.size < maxSize && !bitmap.isRecycled) {
+                bitmap.eraseColor(Color.TRANSPARENT)
+                available.addLast(bitmap)
+            } else {
+                bitmap.recycle()
+            }
+        }
+    }
+}
+
+// Usage
+class FrameRenderer(private val pool: BitmapPool) {
+    fun render(width: Int, height: Int): Bitmap {
+        val bitmap = pool.acquire(width, height, Bitmap.Config.ARGB_8888)
+        try {
+            // draw into the bitmap
+            return bitmap
+        } catch (t: Throwable) {
+            pool.release(bitmap)
+            throw t
+        }
+    }
+}
+```
+
+### Built-in Android pools
+
+- **Glide/Coil** — automatic bitmap pooling for image loading
+- **RecyclerView.RecycledViewPool** — ViewHolder reuse across adapters
+- **Pools.SimplePool / SynchronizedPool** — `androidx.core.util` primitives
+- **OkHttp ConnectionPool** — HTTP/2 connection reuse
+
+```kotlin
+// androidx.core.util.Pools
+class MessageEventPool {
+    private val pool = Pools.SynchronizedPool<MessageEvent>(32)
+
+    fun acquire(): MessageEvent = pool.acquire() ?: MessageEvent()
+
+    fun release(event: MessageEvent) {
+        event.reset()
+        pool.release(event)
+    }
+}
+```
+
+### When object pooling hurts
+
+- Short-lived objects — JVM GC handles them faster than a pool's overhead
+- Under-contention — lock contention becomes a bottleneck
+- Memory-constrained devices — cached instances compete with useful state
+- Debug complexity — use-after-release bugs are hard to find
+
+**Rule of thumb**: measure first. If allocation shows up in CPU profiles
+or you see GC pauses, consider pooling. Otherwise, let the GC do its job.
+
+---
+
+## The creational family at a glance
+
+| Pattern           | Kotlin-idiomatic replacement          | When the classic pattern still wins |
+|-------------------|---------------------------------------|--------------------------------------|
+| Singleton         | `object` + Hilt `@Singleton`          | Rarely needed in classic form        |
+| Factory Method    | `companion.operator fun invoke`       | Polymorphic factory hierarchies      |
+| Abstract Factory  | Hilt modules + component hierarchy    | When you need runtime-switchable families |
+| Builder           | Named args + defaults, or DSL         | Legacy Java APIs, complex nesting    |
+| Prototype         | `data class.copy()`                   | Already the idiom                    |
+| Object Pool       | `Pools.*` / `RecycledViewPool`        | Profile-driven; rarely manual        |
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Creational pattern rules">
+- **`object`** is Kotlin's built-in singleton; prefer **Hilt `@Singleton`** for testable app-wide instances.
+- **Factory Method** — `companion.operator fun invoke` looks like a constructor but picks implementations.
+- **Abstract Factory** is usually just a Hilt module + component choice today.
+- **Builder** still rules for legacy Java libs; use **named args** or **DSL** for types you own.
+- **Prototype** = `data class.copy()`. Use immutable collections for true clone semantics.
+- **Object Pool** when profiling shows allocation pressure; let GC work by default.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Convert a Java-style builder', description: 'Find a hand-rolled builder class in your code. Replace with a data class + named args, or a Kotlin DSL with a function receiver.' },
+  { title: 'Write an abstract factory in Hilt', description: 'Design a NetworkModule for prod and a replacing module for integration tests. Both produce Retrofit + OkHttp but with different interceptors.' },
+  { title: 'Prototype a config', description: 'Define a BaseAppConfig and derive ProductionConfig, StagingConfig, DebugConfig via .copy() overrides.' },
+  { title: 'Pool an expensive object', description: 'Profile a screen with allocation tracking. If you find frequent allocations of a fixed-size object (ByteBuffer, Bitmap), wrap it in a Pools.SynchronizedPool.' }
+]} />
+
+## Continue reading
+
+- **[Structural Patterns](./structural-patterns)** — composing objects
+- **[Behavioral Patterns](./behavioral-patterns)** — distributing responsibility
+- **[Kotlin Idiomatic Patterns](./kotlin-idiomatic-patterns)** — language features that replace patterns

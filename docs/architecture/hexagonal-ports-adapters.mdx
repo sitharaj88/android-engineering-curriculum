@@ -1,0 +1,484 @@
+---
+id: hexagonal-ports-adapters
+title: Hexagonal Architecture (Ports & Adapters)
+sidebar_label: Hexagonal / Ports & Adapters
+description: Alistair Cockburn's Hexagonal architecture applied to Android. Ports (interfaces), adapters (implementations), isolating the domain from frameworks and I/O.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Hexagonal Architecture (Ports & Adapters)
+
+Hexagonal architecture — also called **Ports & Adapters** — was introduced
+by Alistair Cockburn in 2005. It predates Clean Architecture but solves the
+same problem with a different visualization: the domain sits in the middle,
+surrounded by **ports** (interfaces it defines) that the outside world
+plugs into via **adapters**.
+
+<Callout kind="tip" title="Hexagonal vs Clean — are they different?">
+In practice, **no**. Hexagonal's ports + adapters are Clean's interfaces +
+implementations. The hexagon shape is a visualization; Clean's concentric
+circles are another. Pick the diagram you like. The substance is identical:
+**the domain depends on nothing; everything depends on the domain's
+contracts**.
+</Callout>
+
+## The hexagon
+
+```text
+                    ┌─────────────────────────┐
+                    │    Primary adapters     │     driving side
+                    │  (UI, REST controllers, │     — what CALLS the domain
+                    │   tests, CLI)           │
+                    └───────────┬─────────────┘
+                                │  via primary ports (use cases)
+                                ▼
+      ┌───────────────────────────────────────────────────┐
+      │                                                    │
+      │                  DOMAIN                            │
+      │   - Entities (Pure Kotlin, no Android, no I/O)     │
+      │   - Use cases / application services                │
+      │   - Ports (interfaces the domain needs)             │
+      │                                                    │
+      └─────────┬──────────────────────────────┬───────────┘
+                │                              │
+                ▼ via secondary ports          ▼
+      ┌──────────────────┐              ┌──────────────────┐
+      │ Secondary        │              │ Secondary        │     driven side
+      │ adapters:        │              │ adapters:        │     — what the domain CALLS
+      │ Room, Retrofit,  │              │ FCM, DataStore,  │
+      │ FileSystem       │              │ Crashlytics      │
+      └──────────────────┘              └──────────────────┘
+```
+
+Two types of adapters:
+
+- **Primary (driving)** — initiate calls INTO the domain. UI, tests,
+  background workers, a REST server. They consume **primary ports** (use
+  cases, application services).
+- **Secondary (driven)** — the domain calls THEM. Databases, networks,
+  external services, message buses. They implement **secondary ports**
+  (repository interfaces, notification senders, etc.) defined by the
+  domain.
+
+---
+
+## A concrete example — checkout flow
+
+Let's design a checkout use case following hexagonal discipline.
+
+### Step 1 — Define the domain, ports, entities
+
+```kotlin
+// :domain module — zero Android imports
+
+// ── Entities (pure business types)
+data class Cart(val items: List<CartItem>, val total: Money)
+data class Order(val id: OrderId, val items: List<CartItem>, val total: Money, val placedAt: Instant)
+@JvmInline value class OrderId(val raw: String)
+
+// ── Secondary ports — the domain DEMANDS these from the outside
+interface CartRepository {
+    suspend fun current(): Cart
+    suspend fun clear()
+}
+
+interface OrderRepository {
+    suspend fun save(order: Order)
+}
+
+interface PaymentGateway {
+    suspend fun charge(amount: Money, method: PaymentMethod): PaymentReceipt
+}
+
+interface NotificationSender {
+    suspend fun notify(userId: UserId, message: String)
+}
+
+// ── Primary port — the app's capability, exposed to primary adapters
+class PlaceOrderUseCase @Inject constructor(
+    private val cart: CartRepository,                  // secondary ports...
+    private val orders: OrderRepository,
+    private val payment: PaymentGateway,
+    private val notifier: NotificationSender,
+    private val clock: Clock                            // even time is abstracted
+) {
+    suspend operator fun invoke(
+        userId: UserId,
+        paymentMethod: PaymentMethod
+    ): Result<OrderId> = runCatching {
+        val current = cart.current()
+        require(current.items.isNotEmpty()) { "Cart is empty" }
+
+        val receipt = payment.charge(current.total, paymentMethod)
+        val order = Order(
+            id = OrderId(receipt.orderId),
+            items = current.items,
+            total = current.total,
+            placedAt = clock.now()
+        )
+        orders.save(order)
+        cart.clear()
+        notifier.notify(userId, "Order ${order.id.raw} placed")
+        order.id
+    }
+}
+```
+
+Notice the domain has:
+- **No** `import android.*`
+- **No** `import retrofit2.*`
+- **No** `import androidx.room.*`
+- **No** direct `System.currentTimeMillis()` — it uses `Clock`
+
+It's pure Kotlin. It compiles on JVM, iOS (KMP), and any JUnit classpath.
+
+### Step 2 — Secondary adapters implement the ports
+
+```kotlin
+// :data module — implementations of the ports
+
+class RoomCartRepository @Inject constructor(
+    private val dao: CartDao
+) : CartRepository {
+    override suspend fun current(): Cart = dao.get().toDomain()
+    override suspend fun clear() = dao.clear()
+}
+
+class RetrofitPaymentGateway @Inject constructor(
+    private val api: PaymentApi
+) : PaymentGateway {
+    override suspend fun charge(amount: Money, method: PaymentMethod): PaymentReceipt =
+        api.charge(ChargeRequest(amount.cents, method.toDto())).toDomain()
+}
+
+class FcmNotificationSender @Inject constructor(
+    private val messaging: FirebaseMessaging,
+    private val userTokenRepo: UserTokenRepository
+) : NotificationSender {
+    override suspend fun notify(userId: UserId, message: String) {
+        val token = userTokenRepo.get(userId) ?: return
+        messaging.sendToToken(token, message)
+    }
+}
+
+// Hilt binds ports to adapters
+@Module @InstallIn(SingletonComponent::class)
+abstract class AdaptersModule {
+    @Binds abstract fun bindCartRepository(impl: RoomCartRepository): CartRepository
+    @Binds abstract fun bindPaymentGateway(impl: RetrofitPaymentGateway): PaymentGateway
+    @Binds abstract fun bindNotificationSender(impl: FcmNotificationSender): NotificationSender
+}
+```
+
+### Step 3 — Primary adapters call the use case
+
+```kotlin
+// :feature:checkout — the UI is a primary adapter
+@HiltViewModel
+class CheckoutViewModel @Inject constructor(
+    private val placeOrder: PlaceOrderUseCase,
+    private val authRepo: AuthRepository
+) : ViewModel() {
+
+    fun onSubmit(method: PaymentMethod) = viewModelScope.launch {
+        val user = authRepo.currentUser() ?: return@launch
+        placeOrder(user.id, method)
+            .onSuccess { id -> _events.send(NavigateToConfirmation(id.raw)) }
+            .onFailure { e -> _state.update { it.copy(error = e.message) } }
+    }
+}
+```
+
+```kotlin
+// A scheduled background worker is ALSO a primary adapter
+@HiltWorker
+class NightlyOrderRetryWorker @AssistedInject constructor(
+    @Assisted ctx: Context,
+    @Assisted params: WorkerParameters,
+    private val pendingOrders: PendingOrdersRepository,
+    private val placeOrder: PlaceOrderUseCase
+) : CoroutineWorker(ctx, params) {
+    override suspend fun doWork(): Result {
+        pendingOrders.list().forEach { pending ->
+            placeOrder(pending.userId, pending.paymentMethod)
+        }
+        return Result.success()
+    }
+}
+```
+
+Same use case, different primary adapters (UI vs background worker). The
+domain doesn't care who's calling.
+
+---
+
+## The testing superpower
+
+Because ports are interfaces, tests swap real adapters for fakes:
+
+```kotlin
+class PlaceOrderUseCaseTest {
+
+    // In-memory fakes — no Android, no network
+    private val cart = FakeCartRepository()
+    private val orders = FakeOrderRepository()
+    private val payment = FakePaymentGateway()
+    private val notifier = FakeNotificationSender()
+    private val clock = FixedClock(Instant.parse("2025-01-01T00:00:00Z"))
+
+    private val placeOrder = PlaceOrderUseCase(cart, orders, payment, notifier, clock)
+
+    @Test fun `empty cart fails`() = runTest {
+        cart.set(Cart(emptyList(), Money.Zero))
+
+        val result = placeOrder(userId = UserId("u1"), paymentMethod = sampleCard)
+
+        assertTrue(result.isFailure)
+    }
+
+    @Test fun `successful checkout saves order, clears cart, notifies`() = runTest {
+        cart.set(sampleCart)
+        payment.respondWith(PaymentReceipt(orderId = "o1"))
+
+        val result = placeOrder(UserId("u1"), sampleCard)
+
+        assertTrue(result.isSuccess)
+        assertTrue(orders.all().any { it.id.raw == "o1" })
+        assertEquals(Cart.Empty, cart.get())
+        assertTrue(notifier.sent.any { it.first == UserId("u1") })
+    }
+
+    @Test fun `payment failure rolls back cart and order`() = runTest {
+        cart.set(sampleCart)
+        payment.failWith(IOException("network"))
+
+        val result = placeOrder(UserId("u1"), sampleCard)
+
+        assertTrue(result.isFailure)
+        assertFalse(orders.all().isNotEmpty())             // no order saved
+        assertNotEquals(Cart.Empty, cart.get())             // cart preserved
+    }
+}
+```
+
+No `Robolectric`. No `MockK` strictly required (though often convenient).
+No emulator. Tests run in tens of milliseconds.
+
+---
+
+## Port granularity — how small or large
+
+Ports should express **what the domain wants**, not **what the backend
+ships**. A common mistake is making `RetrofitUserApi` the port — you've
+just leaked REST semantics into the domain.
+
+<ComparisonCard
+  left={{
+    label: 'Leaky port',
+    title: 'HTTP-shaped port',
+    variant: 'old',
+    points: [
+      'interface UserApi { suspend fun getUser(@Path("id") id: String): UserDto }',
+      'Domain has to know what UserDto fields look like',
+      'Changing backends means changing domain code',
+      'DTOs leak into use cases',
+      'Cannot unit-test without HTTP stubs'
+    ]
+  }}
+  right={{
+    label: 'Domain-shaped port',
+    title: 'Capability port',
+    variant: 'new',
+    points: [
+      'interface UserRepository { suspend fun fetch(id: UserId): User }',
+      'Domain knows only User (domain entity)',
+      'Backend swap happens entirely in :data',
+      'DTOs live in :data, mapped to User',
+      'Trivial fakes for unit tests'
+    ]
+  }}
+/>
+
+**Rule of thumb**: if switching from REST to GraphQL would change a port's
+signature, the port is too low-level. Refactor until the port describes
+capability, not transport.
+
+---
+
+## Symmetric ports — the two hexagon halves
+
+### Secondary (driven) ports — domain → outside
+
+These are the majority of ports. The domain needs data, storage, or
+messaging:
+
+```kotlin
+interface UserRepository
+interface PaymentGateway
+interface NotificationSender
+interface Clock
+interface AnalyticsRecorder
+interface FeatureFlagReader
+interface CrashReporter
+```
+
+Each implementation is a secondary adapter.
+
+### Primary (driving) ports — outside → domain
+
+Use cases (application services) are primary ports:
+
+```kotlin
+class PlaceOrderUseCase(/* deps */)
+class CancelOrderUseCase(/* deps */)
+class GetOrderHistoryUseCase(/* deps */)
+```
+
+UI, background workers, CLI tools, test frameworks are primary adapters
+that invoke these.
+
+### Ports are always defined in the domain
+
+```text
+:domain
+  ├── ports/                        <-- both primary and secondary
+  │   ├── UserRepository.kt         (secondary)
+  │   ├── PaymentGateway.kt         (secondary)
+  │   └── ...
+  ├── usecase/                      <-- primary ports
+  │   ├── PlaceOrderUseCase.kt
+  │   └── ...
+  └── entity/
+      └── User.kt
+```
+
+Ports never live in `:data` or `:feature:*`. That would invert the
+dependency.
+
+---
+
+## Adapter patterns
+
+### Composite adapter — several sources behind one port
+
+```kotlin
+class CompositeUserRepository @Inject constructor(
+    private val network: NetworkUserSource,
+    private val cache: RoomUserCache,
+    @IoDispatcher private val io: CoroutineDispatcher
+) : UserRepository {
+
+    override fun observe(id: UserId): Flow<User> = cache.observe(id)
+        .onStart {
+            withContext(io) { runCatching { network.fetch(id) }.onSuccess(cache::save) }
+        }
+
+    override suspend fun refresh(id: UserId) = withContext(io) {
+        cache.save(network.fetch(id))
+    }
+}
+```
+
+Domain sees one `UserRepository`. Behind it, the adapter orchestrates a
+network source and a cache (single-source-of-truth pattern — see
+[Offline-First](/docs/architecture-patterns/offline-first)).
+
+### Null-object adapter — disabled feature
+
+```kotlin
+object NoOpAnalytics : AnalyticsRecorder {
+    override suspend fun record(event: Event) { /* do nothing */ }
+}
+
+// Bind in a flavor or when feature flag is off
+@Provides @Singleton
+fun provideAnalytics(flags: FeatureFlags, realImpl: FirebaseAnalyticsRecorder): AnalyticsRecorder =
+    if (flags.analyticsEnabled) realImpl else NoOpAnalytics
+```
+
+The domain calls the port unchanged; the adapter decides to do nothing.
+Compare to wrapping every analytics call in `if (enabled) { ... }`.
+
+### Decorating adapter — cross-cutting behavior
+
+```kotlin
+class LoggingPaymentGateway(
+    private val delegate: PaymentGateway,
+    private val logger: Logger
+) : PaymentGateway {
+    override suspend fun charge(amount: Money, method: PaymentMethod): PaymentReceipt {
+        logger.info("charging $amount via $method")
+        return try {
+            delegate.charge(amount, method).also { logger.info("ok: ${it.orderId}") }
+        } catch (t: Throwable) {
+            logger.error("failed: ${t.message}"); throw t
+        }
+    }
+}
+```
+
+Log, trace, retry, cache — all as decorators of the real adapter. The
+domain never changes.
+
+---
+
+## Comparing Hexagonal, Clean, and Onion
+
+| | Hexagonal (Cockburn, 2005) | Clean (Martin, 2012) | Onion (Palermo, 2008) |
+|-|----------------------------|----------------------|------------------------|
+| Diagram | Hexagon with primary (top) + secondary (bottom) adapters | Concentric circles (entities → use cases → adapters → frameworks) | Concentric circles (domain → domain services → application → infrastructure) |
+| Layer count | 2 (domain + adapters) | 4+ | 4 |
+| Named ports? | Yes, core concept | Informally (interfaces) | Yes, also called "dependency inversion" |
+| Dependency rule | Inward | Inward | Inward |
+| Practical difference | Same. Pick whichever diagram helps your team discuss. | | |
+
+All three enforce: **the domain depends on nothing external**.
+
+---
+
+## When Hexagonal is overkill
+
+<Callout kind="warning" title="Be honest about scope">
+- A 4-screen app does not need ports for every I/O call. Direct Retrofit
+  + Room in the ViewModel is fine.
+- If there will NEVER be a second implementation of a port, the interface
+  is boilerplate. Don't pre-create it.
+- If the domain logic is a single `if` statement, skipping the domain
+  layer is pragmatic.
+
+Hexagonal pays off when (1) the domain has non-trivial rules, (2) you
+expect to swap adapters (different backends, KMP targets), or (3) testing
+the domain without infrastructure is a recurring need.
+</Callout>
+
+For production apps of 10+ screens with real business logic, Hexagonal/
+Clean is worth every bit of effort.
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Hexagonal in one paragraph">
+The **domain** is pure Kotlin with **entities**, **use cases**, and
+**ports** (interfaces). **Primary adapters** (UI, workers) call use cases.
+**Secondary adapters** (Room, Retrofit, FCM) implement secondary ports.
+Ports describe domain capability, not transport. Testing swaps real
+adapters for fakes. The domain depends on nothing.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Identify your ports', description: 'Pick one feature. List every external system the domain uses (DB, network, clock, notifications). Write a port interface for each.' },
+  { title: 'Refactor to use Clock', description: 'Find every System.currentTimeMillis() in your use cases. Introduce an interface Clock { fun now(): Instant } and inject it. Now time-dependent tests are deterministic.' },
+  { title: 'Add a LoggingAdapter decorator', description: 'Pick a secondary port. Wrap its implementation with a LoggingXAdapter that logs every call + result. Bind via Hilt flavor or flag.' },
+  { title: 'Swap an adapter', description: 'Replace one Retrofit-backed adapter with an in-memory fake in a debug build. Prove the rest of the app doesn\'t change.' }
+]} />
+
+## Continue reading
+
+- **[Clean Architecture](./clean-architecture)** — the layered variant
+- **[Unidirectional Data Flow](./unidirectional-data-flow)** — how UI interacts with use cases
+- **[Dependency Injection](./dependency-injection)** — wiring ports to adapters with Hilt
+- **[Domain Modeling](./domain-modeling)** — entities, value objects, aggregates
