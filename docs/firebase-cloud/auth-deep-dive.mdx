@@ -1,0 +1,670 @@
+---
+id: auth-deep-dive
+title: Firebase Auth Deep Dive
+sidebar_label: Firebase Auth
+description: Firebase Authentication — email, Google, Phone, passkeys, anonymous, MFA, custom claims, session management, account linking, and secure sign-out.
+---
+
+import { Callout, ComparisonCard, StepList, Diagram, AuthFlowDiagram } from '@site/src/components/Doc';
+
+# Firebase Auth Deep Dive
+
+Firebase Auth is the most common auth stack on Android because it handles
+the hard parts — token refresh, phone verification, social providers,
+multi-factor, revocation — with an API that fits the platform. This
+chapter covers every provider, session management, and the security
+posture you need for a production app.
+
+## The shape of auth
+
+<Diagram title="Firebase Auth flow" caption="Client signs in → gets ID token → backend verifies → session established.">
+  <AuthFlowDiagram />
+</Diagram>
+
+```text
+┌───────────────────────────────────────────────────────────────────┐
+│  Client (Android)                                                 │
+│    1. Sign in via provider (email / Google / phone / passkey)    │
+│    2. Receive FirebaseUser + ID token                             │
+│    3. Send ID token to your backend                               │
+│                                                                   │
+│  Backend                                                          │
+│    4. Verify ID token via Firebase Admin SDK                      │
+│    5. Mint your own session cookie / JWT (optional)               │
+│                                                                   │
+│  Firestore / Cloud Storage / Functions                           │
+│    Auto-applies Security Rules using request.auth                │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+firebase-bom        = "33.7.0"
+credentials         = "1.5.0-rc01"
+google-id           = "1.1.1"
+
+firebase-bom              = { module = "com.google.firebase:firebase-bom", version.ref = "firebase-bom" }
+firebase-auth             = { module = "com.google.firebase:firebase-auth-ktx" }
+firebase-auth-credentials = { module = "com.google.firebase:firebase-auth" }
+play-services-auth        = { module = "com.google.android.gms:play-services-auth", version = "21.3.0" }
+credentials               = { module = "androidx.credentials:credentials", version.ref = "credentials" }
+credentials-play          = { module = "androidx.credentials:credentials-play-services-auth", version.ref = "credentials" }
+google-id                 = { module = "com.google.android.libraries.identity.googleid:googleid", version.ref = "google-id" }
+```
+
+```kotlin
+// build.gradle.kts (app)
+plugins {
+    id("com.google.gms.google-services")
+    id("com.google.firebase.crashlytics")
+}
+
+dependencies {
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.auth)
+    implementation(libs.credentials)
+    implementation(libs.credentials.play)
+    implementation(libs.google.id)
+}
+```
+
+```kotlin
+// Initialize via App Startup for performance
+@Singleton
+class FirebaseBootstrap @Inject constructor() {
+    val auth: FirebaseAuth = Firebase.auth.apply {
+        useAppLanguage()                                   // localize error messages
+    }
+}
+```
+
+---
+
+## Email / password
+
+```kotlin
+class EmailAuthProvider @Inject constructor(
+    private val auth: FirebaseAuth
+) {
+    suspend fun signUp(email: String, password: String): Outcome<AuthUser, AuthError> = try {
+        val result = auth.createUserWithEmailAndPassword(email, password).await()
+        result.user?.sendEmailVerification()?.await()
+        Outcome.Ok(result.user!!.toDomain())
+    } catch (e: FirebaseAuthWeakPasswordException) {
+        Outcome.Err(AuthError.WeakPassword(e.reason ?: "Password too weak"))
+    } catch (e: FirebaseAuthInvalidCredentialsException) {
+        Outcome.Err(AuthError.InvalidCredentials)
+    } catch (e: FirebaseAuthUserCollisionException) {
+        Outcome.Err(AuthError.EmailAlreadyInUse)
+    } catch (e: Exception) {
+        Outcome.Err(AuthError.Unknown(e))
+    }
+
+    suspend fun signIn(email: String, password: String): Outcome<AuthUser, AuthError> = try {
+        val result = auth.signInWithEmailAndPassword(email, password).await()
+        Outcome.Ok(result.user!!.toDomain())
+    } catch (e: FirebaseAuthInvalidUserException) {
+        Outcome.Err(AuthError.UserNotFound)
+    } catch (e: FirebaseAuthInvalidCredentialsException) {
+        Outcome.Err(AuthError.WrongPassword)
+    } catch (e: FirebaseAuthMultiFactorException) {
+        Outcome.Err(AuthError.MfaRequired(e.resolver))
+    } catch (e: Exception) {
+        Outcome.Err(AuthError.Unknown(e))
+    }
+
+    suspend fun sendPasswordReset(email: String): Outcome<Unit, AuthError> = try {
+        auth.sendPasswordResetEmail(email).await()
+        Outcome.Ok(Unit)
+    } catch (e: Exception) {
+        Outcome.Err(AuthError.Unknown(e))
+    }
+}
+```
+
+### Password policies
+
+Configure strength requirements in the Firebase Console (Authentication →
+Settings → Password policy). Client-side, pre-validate before calling:
+
+```kotlin
+fun validatePassword(pw: String): PasswordValidation {
+    val issues = buildList {
+        if (pw.length < 8) add("At least 8 characters")
+        if (!pw.any(Char::isDigit)) add("At least one digit")
+        if (!pw.any(Char::isUpperCase)) add("At least one uppercase")
+        if (!pw.any { !it.isLetterOrDigit() }) add("At least one symbol")
+    }
+    return if (issues.isEmpty()) PasswordValidation.Strong else PasswordValidation.Weak(issues)
+}
+```
+
+### Email enumeration protection
+
+Enable **email enumeration protection** in the Firebase Console so
+`signInWithEmailAndPassword` returns `INVALID_LOGIN_CREDENTIALS` whether
+the email exists or is wrong — preventing attackers from probing which
+emails have accounts.
+
+---
+
+## Google sign-in (modern Credential Manager API)
+
+`GoogleSignIn` via Play Services is **deprecated**. Use the Credential
+Manager API:
+
+```kotlin
+class GoogleAuthProvider @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val auth: FirebaseAuth
+) {
+    private val credentialManager = CredentialManager.create(context)
+
+    suspend fun signIn(activity: Activity): Outcome<AuthUser, AuthError> {
+        val googleIdOption = GetGoogleIdOption.Builder()
+            .setFilterByAuthorizedAccounts(false)
+            .setServerClientId(BuildConfig.WEB_CLIENT_ID)
+            .setAutoSelectEnabled(true)
+            .setNonce(generateNonce())
+            .build()
+
+        val request = GetCredentialRequest.Builder()
+            .addCredentialOption(googleIdOption)
+            .build()
+
+        return try {
+            val result = credentialManager.getCredential(activity, request)
+            val credential = result.credential as? CustomCredential
+                ?: return Outcome.Err(AuthError.Unknown(IllegalStateException("Unexpected credential")))
+
+            if (credential.type != GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
+                return Outcome.Err(AuthError.Unknown(IllegalStateException("Not a Google credential")))
+            }
+
+            val googleCredential = GoogleIdTokenCredential.createFrom(credential.data)
+            val firebaseCredential = GoogleAuthProvider.getCredential(googleCredential.idToken, null)
+            val authResult = auth.signInWithCredential(firebaseCredential).await()
+            Outcome.Ok(authResult.user!!.toDomain())
+        } catch (e: GetCredentialCancellationException) {
+            Outcome.Err(AuthError.Cancelled)
+        } catch (e: NoCredentialException) {
+            Outcome.Err(AuthError.NoGoogleAccount)
+        } catch (e: Exception) {
+            Outcome.Err(AuthError.Unknown(e))
+        }
+    }
+
+    private fun generateNonce(): String = ByteArray(32).apply { SecureRandom().nextBytes(this) }.toHex()
+}
+```
+
+<Callout kind="tip" title="WEB_CLIENT_ID, not Android client ID">
+The server client ID is the one marked "Web application" in Google Cloud
+Console OAuth 2.0 credentials. The Android client ID is different and
+won't work with Firebase. Misconfiguring this is the #1 reason
+"Google sign-in succeeds but Firebase rejects the token".
+</Callout>
+
+---
+
+## Passkeys (WebAuthn) — the passwordless future
+
+Android 14+ supports passkeys natively via Credential Manager:
+
+```kotlin
+suspend fun signInWithPasskey(activity: Activity): Outcome<AuthUser, AuthError> {
+    // Your backend generates a WebAuthn challenge
+    val challenge = api.createAuthChallenge()
+
+    val passkeyOption = GetPublicKeyCredentialOption(
+        requestJson = challenge.toJson()
+    )
+
+    val request = GetCredentialRequest.Builder()
+        .addCredentialOption(passkeyOption)
+        .build()
+
+    return try {
+        val result = credentialManager.getCredential(activity, request)
+        val credential = result.credential as PublicKeyCredential
+        val authResponse = api.verifyPasskey(credential.authenticationResponseJson)
+
+        // Sign in via custom token
+        val authResult = auth.signInWithCustomToken(authResponse.firebaseToken).await()
+        Outcome.Ok(authResult.user!!.toDomain())
+    } catch (e: Exception) {
+        Outcome.Err(AuthError.Unknown(e))
+    }
+}
+```
+
+Firebase doesn't natively issue passkeys but integrates via **custom
+tokens** — your backend does the WebAuthn dance, mints a custom token,
+the client signs in with it.
+
+---
+
+## Phone authentication
+
+```kotlin
+class PhoneAuthProvider @Inject constructor(
+    private val auth: FirebaseAuth
+) {
+    private var verificationId: String? = null
+    private var resendToken: PhoneAuthProvider.ForceResendingToken? = null
+
+    suspend fun sendCode(
+        activity: Activity,
+        phoneNumber: String
+    ): Outcome<Unit, AuthError> = suspendCancellableCoroutine { cont ->
+        val callback = object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
+            override fun onVerificationCompleted(credential: PhoneAuthCredential) {
+                // Auto-verified — sign in immediately
+                cont.resume(Outcome.Ok(Unit)) { }
+                signInWithCredentialBlocking(credential)
+            }
+            override fun onVerificationFailed(e: FirebaseException) {
+                cont.resume(Outcome.Err(AuthError.Unknown(e))) { }
+            }
+            override fun onCodeSent(verId: String, token: PhoneAuthProvider.ForceResendingToken) {
+                verificationId = verId
+                resendToken = token
+                cont.resume(Outcome.Ok(Unit)) { }
+            }
+        }
+
+        val options = PhoneAuthOptions.newBuilder(auth)
+            .setPhoneNumber(phoneNumber)
+            .setTimeout(60, TimeUnit.SECONDS)
+            .setActivity(activity)
+            .setCallbacks(callback)
+            .build()
+
+        PhoneAuthProvider.verifyPhoneNumber(options)
+    }
+
+    suspend fun verifyCode(smsCode: String): Outcome<AuthUser, AuthError> = try {
+        val verId = verificationId ?: return Outcome.Err(AuthError.NoCodeSent)
+        val credential = PhoneAuthProvider.getCredential(verId, smsCode)
+        val result = auth.signInWithCredential(credential).await()
+        Outcome.Ok(result.user!!.toDomain())
+    } catch (e: FirebaseAuthInvalidCredentialsException) {
+        Outcome.Err(AuthError.WrongCode)
+    } catch (e: Exception) {
+        Outcome.Err(AuthError.Unknown(e))
+    }
+}
+```
+
+### SMS retrieval (auto-fill OTP)
+
+```kotlin
+// Include in onStart/onStop
+val smsRetriever = SmsRetriever.getClient(context)
+smsRetriever.startSmsRetriever()
+
+// BroadcastReceiver catches the incoming SMS
+class OtpReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+        if (intent?.action != SmsRetriever.SMS_RETRIEVED_ACTION) return
+        val extras = intent.extras ?: return
+        val status = extras[SmsRetriever.EXTRA_STATUS] as? Status ?: return
+        if (status.statusCode != CommonStatusCodes.SUCCESS) return
+
+        val message = extras[SmsRetriever.EXTRA_SMS_MESSAGE] as? String ?: return
+        val otp = Regex("\\b\\d{6}\\b").find(message)?.value
+        // Fill the OTP field automatically
+    }
+}
+```
+
+Your backend must include an 11-character hash (derived from the app's
+signing certificate) in the SMS for Google Play Services to route it to
+your app.
+
+---
+
+## Anonymous authentication
+
+```kotlin
+suspend fun signInAnonymously(): Outcome<AuthUser, AuthError> = try {
+    val result = auth.signInAnonymously().await()
+    Outcome.Ok(result.user!!.toDomain())
+} catch (e: Exception) {
+    Outcome.Err(AuthError.Unknown(e))
+}
+```
+
+Use anonymous auth to give new users a ready-to-use account. When they
+later sign in with a permanent provider, **link** instead of creating a
+new account so their data carries over.
+
+---
+
+## Account linking
+
+```kotlin
+suspend fun linkWithEmail(email: String, password: String): Outcome<AuthUser, AuthError> = try {
+    val user = auth.currentUser ?: return Outcome.Err(AuthError.NotSignedIn)
+    val credential = EmailAuthProvider.getCredential(email, password)
+    val result = user.linkWithCredential(credential).await()
+    Outcome.Ok(result.user!!.toDomain())
+} catch (e: FirebaseAuthUserCollisionException) {
+    Outcome.Err(AuthError.EmailAlreadyInUse)
+} catch (e: Exception) {
+    Outcome.Err(AuthError.Unknown(e))
+}
+```
+
+This preserves the same UID — all the user's data, Firestore docs, custom
+claims stay attached. The alternative (sign in → separate account →
+manual data migration) is a nightmare.
+
+---
+
+## Multi-Factor Authentication (MFA)
+
+Enable SMS-based MFA in the Firebase Console, then on the client:
+
+```kotlin
+// Enroll
+suspend fun enrollMfa(phoneNumber: String): Outcome<Unit, AuthError> {
+    val user = auth.currentUser ?: return Outcome.Err(AuthError.NotSignedIn)
+    val session = user.multiFactor.session.await()
+
+    val options = PhoneAuthOptions.newBuilder()
+        .setPhoneNumber(phoneNumber)
+        .setTimeout(60, TimeUnit.SECONDS)
+        .setActivity(activity)
+        .setMultiFactorSession(session)
+        .setCallbacks(/* callbacks to receive verificationId */)
+        .build()
+
+    PhoneAuthProvider.verifyPhoneNumber(options)
+    // After SMS verified, call:
+    val credential = PhoneAuthProvider.getCredential(verId, smsCode)
+    val assertion = PhoneMultiFactorGenerator.getAssertion(credential)
+    user.multiFactor.enroll(assertion, "Personal phone").await()
+    return Outcome.Ok(Unit)
+}
+
+// Sign-in with MFA resolver
+suspend fun completeMfaSignIn(
+    resolver: MultiFactorResolver,
+    smsCode: String,
+    verificationId: String
+): Outcome<AuthUser, AuthError> = try {
+    val credential = PhoneAuthProvider.getCredential(verificationId, smsCode)
+    val assertion = PhoneMultiFactorGenerator.getAssertion(credential)
+    val result = resolver.resolveSignIn(assertion).await()
+    Outcome.Ok(result.user!!.toDomain())
+} catch (e: Exception) {
+    Outcome.Err(AuthError.WrongCode)
+}
+```
+
+Firebase also supports **TOTP** (Google Authenticator-style) for users who
+don't want SMS.
+
+---
+
+## Session management
+
+### Observing auth state
+
+```kotlin
+@Singleton
+class AuthSession @Inject constructor(private val auth: FirebaseAuth) {
+
+    val userFlow: StateFlow<AuthUser?> = callbackFlow {
+        val listener = FirebaseAuth.AuthStateListener { a ->
+            trySend(a.currentUser?.toDomain())
+        }
+        auth.addAuthStateListener(listener)
+        awaitClose { auth.removeAuthStateListener(listener) }
+    }.stateIn(
+        scope = ProcessLifecycleOwner.get().lifecycleScope,
+        started = SharingStarted.Eagerly,
+        initialValue = auth.currentUser?.toDomain()
+    )
+
+    suspend fun signOut() = withContext(Dispatchers.IO) {
+        auth.signOut()
+        // Also revoke Google credential if signed in via Google
+        CredentialManager.create(context).clearCredentialState(ClearCredentialStateRequest())
+    }
+}
+```
+
+### Getting a fresh ID token
+
+```kotlin
+suspend fun backendCall(): Response {
+    val user = auth.currentUser ?: throw NotSignedInException()
+    val idToken = user.getIdToken(false).await().token!!    // cached if < 55 min old
+
+    return api.fetchProtected(authHeader = "Bearer $idToken")
+}
+
+suspend fun forceRefreshIdToken(): String {
+    val user = auth.currentUser ?: throw NotSignedInException()
+    return user.getIdToken(true).await().token!!            // force refresh
+}
+```
+
+Tokens expire after 1 hour. `getIdToken(false)` returns the cached token
+if still valid. Force refresh after sensitive actions (password change,
+privilege elevation).
+
+### Auto-attaching the token via OkHttp
+
+```kotlin
+class FirebaseAuthInterceptor @Inject constructor(
+    private val auth: FirebaseAuth
+) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val user = auth.currentUser ?: return chain.proceed(chain.request())
+
+        val token = runBlocking { user.getIdToken(false).await().token }
+            ?: return chain.proceed(chain.request())
+
+        val authed = chain.request().newBuilder()
+            .header("Authorization", "Bearer $token")
+            .build()
+
+        val response = chain.proceed(authed)
+
+        // Token expired? Force refresh and retry once.
+        if (response.code == 401) {
+            response.close()
+            val fresh = runBlocking { user.getIdToken(true).await().token }
+            if (fresh != null) {
+                val retry = chain.request().newBuilder()
+                    .header("Authorization", "Bearer $fresh")
+                    .build()
+                return chain.proceed(retry)
+            }
+        }
+        return response
+    }
+}
+```
+
+---
+
+## Custom claims — roles and permissions
+
+Firebase stores arbitrary key-value metadata on each user. Set them from
+a privileged backend:
+
+```javascript
+// Cloud Function
+await admin.auth().setCustomUserClaims(uid, {
+  role: 'admin',
+  tier: 'premium',
+  orgId: 'org_abc'
+});
+```
+
+```kotlin
+// Read from client
+suspend fun getUserClaims(): Map<String, Any> {
+    val user = auth.currentUser ?: return emptyMap()
+    val tokenResult = user.getIdToken(false).await()
+    return tokenResult.claims
+}
+
+val isAdmin = getUserClaims()["role"] == "admin"
+```
+
+**Never** trust client-side claim values for security — always re-verify
+on the backend. Client-side claim checks are for UX (hide admin menu),
+not authorization.
+
+---
+
+## Security Rules — the enforcement layer
+
+Client sign-in is step 1. Server enforcement is step 2. Example Firestore
+rule using custom claims:
+
+```
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    match /admin/{doc} {
+      allow read, write: if request.auth.token.role == 'admin';
+    }
+    match /users/{userId}/{restOfPath=**} {
+      allow read, write: if request.auth.uid == userId;
+    }
+  }
+}
+```
+
+See the [Firestore deep dive](./firestore-deep-dive) for the full rules
+language.
+
+---
+
+## Delete account — comply with user rights
+
+```kotlin
+suspend fun deleteAccount(password: String): Outcome<Unit, AuthError> {
+    val user = auth.currentUser ?: return Outcome.Err(AuthError.NotSignedIn)
+    val email = user.email ?: return Outcome.Err(AuthError.InvalidState)
+
+    // Re-authenticate (Firebase requires recent auth for destructive ops)
+    val credential = EmailAuthProvider.getCredential(email, password)
+    try {
+        user.reauthenticate(credential).await()
+    } catch (e: Exception) {
+        return Outcome.Err(AuthError.WrongPassword)
+    }
+
+    // Delete Firestore data first — Cloud Function triggered on delete
+    // is best, but client-driven cleanup is needed as a fallback
+    firestore.collection("users").document(user.uid).delete().await()
+
+    return try {
+        user.delete().await()
+        Outcome.Ok(Unit)
+    } catch (e: Exception) {
+        Outcome.Err(AuthError.Unknown(e))
+    }
+}
+```
+
+GDPR Article 17 ("right to erasure") and Google Play's Data Safety
+declaration require an in-app delete-account flow for any app that lets
+users create accounts.
+
+---
+
+## Testing auth code
+
+Use the **Firebase Local Emulator Suite**:
+
+```kotlin
+// build.gradle.kts (debug only)
+debugImplementation("com.google.firebase:firebase-auth:25.3.0")
+
+// App initialization
+if (BuildConfig.DEBUG) {
+    Firebase.auth.useEmulator("10.0.2.2", 9099)
+    Firebase.firestore.useEmulator("10.0.2.2", 8080)
+}
+```
+
+```bash
+# Start the emulators
+firebase emulators:start --only auth,firestore
+```
+
+Your integration tests can create users, set custom claims, and verify
+Firestore rules — all without touching production.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Auth mistakes',
+    variant: 'old',
+    points: [
+      'Trusting client-side role checks for authorization',
+      'Caching ID tokens beyond their 1-hour lifetime',
+      'Using deprecated GoogleSignInClient API',
+      'No email enumeration protection',
+      'Creating a new account instead of linking anonymous',
+      'No re-authentication before destructive ops'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production auth',
+    variant: 'new',
+    points: [
+      'Always verify tokens server-side; claims are UX only',
+      'getIdToken(false) for cached; getIdToken(true) to refresh',
+      'Credential Manager API for Google sign-in',
+      'Enable email enumeration protection in Console',
+      'linkWithCredential to upgrade anonymous users',
+      'reauthenticate() before delete-account / email change'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Firebase Auth rules">
+- **Credential Manager API** is the modern way for Google sign-in and passkeys.
+- **Anonymous → link** preserves data across sign-up flows.
+- **Custom claims** for role/tier metadata; enforce server-side, not client-side.
+- **Re-authenticate** before sensitive actions (delete, email change, MFA enroll).
+- **Firebase Auth Interceptor** for OkHttp auto-attaches ID tokens with refresh-on-401.
+- **Emulator suite** for integration tests — matches production rules and providers.
+- **Delete account** flow is mandatory under GDPR and Play policy.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Credential Manager sign-in', description: 'Replace any legacy GoogleSignInClient code with Credential Manager + Google ID credential option.' },
+  { title: 'Auth interceptor', description: 'Write a FirebaseAuthInterceptor that attaches the ID token and force-refreshes on 401. Verify with a protected endpoint.' },
+  { title: 'Phone auth with SMS retrieval', description: 'Implement phone OTP using PhoneAuthProvider + SmsRetriever for auto-fill. Include the 11-char app hash in your SMS template.' },
+  { title: 'Custom claims UX', description: 'Set a `role: admin` claim via a Cloud Function. Read it from the client via getIdToken. Show an admin menu conditionally.' },
+  { title: 'Delete account', description: 'Build a two-step delete-account flow: re-authenticate, then delete Firestore user doc + Auth account. Add a confirmation dialog.' }
+]} />
+
+## Next
+
+Continue to **[Firestore](./firestore-deep-dive)** for real-time queries, transactions, offline persistence, and security rules.

@@ -1,0 +1,556 @@
+---
+id: battery-power
+title: Battery & Power Optimization
+sidebar_label: Battery & Power
+description: Doze, App Standby, background execution limits, sensor batching, network efficiency, Battery Historian, and the production battery playbook.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Battery & Power Optimization
+
+Battery is a silent feature. Users don't praise efficient apps — they
+one-star drain the ones that don't respect the phone. This chapter
+covers Android's power management system (Doze, App Standby), the
+background execution limits that ship in every Android release, and the
+profiling tools that turn "my app is draining battery" from a
+complaint into a diagnosis.
+
+## The power landscape
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  Interactive (screen on)                                     │
+│    Your app is foreground OR user is interacting             │
+│    → Few restrictions                                         │
+├─────────────────────────────────────────────────────────────┤
+│  Background (screen off, charging)                           │
+│    → Moderate restrictions                                    │
+├─────────────────────────────────────────────────────────────┤
+│  Doze (screen off, on battery, stationary)                   │
+│    → Most network / alarms deferred to maintenance windows   │
+├─────────────────────────────────────────────────────────────┤
+│  Deep Doze (several hours of Doze)                           │
+│    → Longer maintenance windows; even tighter restrictions   │
+├─────────────────────────────────────────────────────────────┤
+│  App Standby Buckets                                         │
+│    Active → Working Set → Frequent → Rare → Restricted       │
+│    Determines JobScheduler / AlarmManager quota              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Your app has no control** over Doze / App Standby; the system decides.
+Your job is to write code that still works correctly under restrictions.
+
+---
+
+## App Standby Buckets
+
+Android 9+ sorts every app into buckets based on usage:
+
+| Bucket           | Criteria                       | Job / alarm quota      |
+|------------------|--------------------------------|------------------------|
+| **Active**       | User has the app open now      | Unrestricted           |
+| **Working Set**  | Used daily                      | Near-unrestricted      |
+| **Frequent**     | Used weekly                     | Deferred               |
+| **Rare**         | Used monthly                    | Heavily deferred       |
+| **Restricted**   | Manual or detected as battery-abusive | Minimum; user-imposed |
+
+```kotlin
+val usageStats = context.getSystemService(UsageStatsManager::class.java)
+val bucket = usageStats.appStandbyBucket
+
+when (bucket) {
+    UsageStatsManager.STANDBY_BUCKET_ACTIVE -> "active"
+    UsageStatsManager.STANDBY_BUCKET_WORKING_SET -> "working set"
+    UsageStatsManager.STANDBY_BUCKET_FREQUENT -> "frequent"
+    UsageStatsManager.STANDBY_BUCKET_RARE -> "rare"
+    UsageStatsManager.STANDBY_BUCKET_RESTRICTED -> "restricted"
+    else -> "unknown"
+}
+```
+
+If your WorkManager periodic job stops running, the user probably hasn't
+opened the app in a week → moved to Rare → jobs deferred to twice a day.
+
+**Solution:** no code change; user engagement drives bucket. Don't fight
+the system.
+
+---
+
+## Doze mode
+
+When the device is stationary with screen off on battery for a few
+minutes, Doze kicks in:
+
+- Wake locks ignored
+- Alarms deferred to next maintenance window
+- Network access suspended
+- JobScheduler jobs deferred
+- GCM / FCM messages delayed (unless high priority)
+
+### Maintenance windows
+
+Every 30-60 minutes in light Doze, every 3-6 hours in deep Doze, the
+system wakes everything up for ~10 seconds. Your deferred work runs
+then.
+
+### High-priority FCM
+
+For time-sensitive data (chat message, real-time alert):
+
+```javascript
+// Backend — send with priority: 'high'
+await admin.messaging().send({
+  token,
+  notification: { title, body },
+  android: { priority: 'high' }
+});
+```
+
+High-priority messages bypass Doze; the device wakes immediately. Use
+**sparingly** — abuse triggers Google's abuse detection, your app gets
+throttled.
+
+### Testing Doze
+
+```bash
+# Put device in Doze immediately
+adb shell dumpsys deviceidle force-idle
+
+# Exit Doze
+adb shell dumpsys deviceidle unforce
+
+# Check state
+adb shell dumpsys deviceidle
+```
+
+Run your WorkManager periodic job; verify it defers correctly.
+
+---
+
+## Background execution limits (Android 8+)
+
+Before Android 8, background services ran indefinitely. Since Android 8:
+
+- **Background services** stopped within ~1 minute of app backgrounding
+- **Implicit broadcast receivers** in manifest: most no longer allowed
+- **Background location** restricted to occasional updates
+
+**Solution**: use **WorkManager** for fire-and-forget work; **foreground
+services** for user-visible ongoing tasks. See
+[WorkManager](/docs/advanced-components/workmanager) and
+[Services & Notifications](/docs/advanced-components/services-notifications).
+
+---
+
+## The WorkManager + constraints pattern
+
+```kotlin
+val sync = PeriodicWorkRequestBuilder<SyncWorker>(6, TimeUnit.HOURS)
+    .setConstraints(Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.UNMETERED)      // Wi-Fi only
+        .setRequiresBatteryNotLow(true)
+        .setRequiresCharging(true)                           // charging only
+        .setRequiresDeviceIdle(true)                          // idle only (opportunistic)
+        .build())
+    .build()
+
+WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+    "background_sync",
+    ExistingPeriodicWorkPolicy.KEEP,
+    sync
+)
+```
+
+Constraints are **battery gifts**. If sync happens at night on Wi-Fi
+while charging, it costs the user nothing.
+
+---
+
+## Sensor batching
+
+For step counting, location tracking, any polling sensor, use
+**maxReportLatencyUs** to batch events:
+
+```kotlin
+val stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+
+sensorManager.registerListener(
+    listener,
+    stepSensor,
+    SensorManager.SENSOR_DELAY_NORMAL,          // 200ms sampling
+    TimeUnit.MINUTES.toMicros(5).toInt()         // batch every 5 min
+)
+```
+
+Without batching: sensor fires every 200ms → 300 wakeups per minute.
+With 5-min batching: 5 wakeups per minute of actual work; system
+aggregates the rest.
+
+### FusedLocationProvider
+
+```kotlin
+val request = LocationRequest.Builder(Priority.PRIORITY_BALANCED_POWER_ACCURACY, 60_000L)
+    .setMinUpdateIntervalMillis(30_000L)
+    .setMaxUpdateDelayMillis(5 * 60_000L)         // allow 5-min batching
+    .build()
+
+fusedLocationClient.requestLocationUpdates(request, callback, Looper.getMainLooper())
+```
+
+`setMaxUpdateDelayMillis` lets the system batch location updates when
+the user isn't interacting — significant battery savings.
+
+---
+
+## Network efficiency
+
+### Batch network calls
+
+Instead of 10 small requests, one big batch:
+
+```kotlin
+// ❌ 10 individual fetches
+ids.map { async { api.fetchUser(it) } }.awaitAll()
+
+// ✅ One batch fetch
+api.fetchUsers(ids = ids)
+```
+
+Each network request has overhead (DNS, TCP, TLS handshake on fresh
+connections). Batch where server supports it.
+
+### Coalesce sync
+
+```kotlin
+// ❌ Sync per message
+viewModelScope.launch {
+    messages.forEach { msg -> api.markAsRead(msg.id) }
+}
+
+// ✅ Debounced batch
+private val _readQueue = MutableSharedFlow<String>(extraBufferCapacity = 64)
+
+init {
+    _readQueue
+        .buffer(capacity = 100)
+        .chunked(30_000)                         // wait 30s OR 100 events
+        .filter { it.isNotEmpty() }
+        .onEach { ids -> api.markAsReadBatch(ids) }
+        .launchIn(viewModelScope)
+}
+
+fun markAsRead(messageId: String) { _readQueue.tryEmit(messageId) }
+```
+
+One network call per 30 seconds instead of per-message.
+
+### Data compression
+
+```kotlin
+OkHttpClient.Builder()
+    .addInterceptor(
+        Interceptor { chain ->
+            val req = chain.request().newBuilder()
+                .addHeader("Accept-Encoding", "gzip, br")
+                .build()
+            chain.proceed(req)
+        }
+    )
+```
+
+OkHttp handles gzip automatically. Brotli (~20% smaller than gzip) is
+worth configuring for text-heavy APIs.
+
+---
+
+## WakeLocks — avoid
+
+Legacy way to prevent the CPU from sleeping. Almost always wrong today:
+
+```kotlin
+// ❌ Don't do this
+val wakeLock = powerManager.newWakeLock(PARTIAL_WAKE_LOCK, "App::MyWakeLock")
+wakeLock.acquire(10 * 60 * 1000L)              // 10 minutes
+```
+
+Modern equivalents:
+- **Foreground service** for user-visible ongoing work
+- **WorkManager** for background work
+- **Doze-exempt foreground service** if you really need CPU during screen-off
+
+WakeLocks should only appear in libraries (OkHttp might use them during
+active downloads). Your code almost never needs one.
+
+---
+
+## Location — the battery villain
+
+Continuous GPS is the single biggest battery drain:
+
+- High-accuracy GPS with 1-second interval: **~15-20% per hour**
+- Balanced (WiFi + GPS occasional): **~5-8% per hour**
+- Low-power (cell towers only): **~1-2% per hour**
+
+### Adaptive accuracy
+
+```kotlin
+val accuracy = when (state) {
+    TrackingState.Driving -> Priority.PRIORITY_HIGH_ACCURACY        // every second
+    TrackingState.Walking -> Priority.PRIORITY_BALANCED_POWER_ACCURACY   // every 10s
+    TrackingState.Stationary -> Priority.PRIORITY_LOW_POWER         // every minute
+}
+```
+
+Detect stationarity via Activity Recognition API, reduce location
+accuracy when stopped. Combined with sensor batching, a delivery app's
+full-day tracking can drop from 40%/day to 10%/day.
+
+### Geofencing
+
+For "notify me when I reach the grocery store," use the geofencing
+API, not continuous polling:
+
+```kotlin
+val geofence = Geofence.Builder()
+    .setRequestId("grocery")
+    .setCircularRegion(lat, lng, 100f)                     // 100m radius
+    .setExpirationDuration(Geofence.NEVER_EXPIRE)
+    .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER)
+    .build()
+
+val request = GeofencingRequest.Builder()
+    .setInitialTrigger(GeofencingRequest.INITIAL_TRIGGER_ENTER)
+    .addGeofence(geofence)
+    .build()
+
+geofencingClient.addGeofences(request, geofencePendingIntent)
+```
+
+Geofencing is system-managed — low battery even while waiting indefinitely.
+
+---
+
+## Battery Historian — the profiler
+
+### Capture a bug report
+
+```bash
+adb bugreport bugreport.zip
+```
+
+### Upload to Battery Historian
+
+https://bathist.ef.lc/ (official Google-hosted tool)
+
+Open the bug report, you see:
+- Per-app CPU / network / location / sensor / wakelock usage
+- Doze / App Standby timeline
+- Battery drain attribution (system, display, cell, your app)
+
+### What to look for
+
+1. **Wakelock frequency** — your app shouldn't show many
+2. **Network activity during Doze** — indicates wake triggers
+3. **Sensor batches vs continuous** — continuous is expensive
+4. **Location requests** — reduce priority when possible
+5. **Alarm firings** — should be rare; WorkManager is usually better
+
+### Android Studio Battery Profiler
+
+Tools → Profiler → CPU / Network / Energy tabs. Lets you correlate code
+paths with battery cost in real time.
+
+---
+
+## Testing for battery
+
+### Manual stress test
+
+1. Charge to 100%
+2. Disconnect from charger
+3. Leave phone idle for 8 hours with your app running in background
+4. Measure battery drop
+
+Target: < 1% drop per 8-hour idle for typical apps. Anything > 3% is a
+bug.
+
+### Per-feature profiling
+
+```bash
+# Start battery stats collection
+adb shell dumpsys batterystats --reset
+
+# Use your app for 10 minutes (specific feature)
+# ...
+
+# Dump stats
+adb shell dumpsys batterystats > battery_stats.txt
+```
+
+Look for your package in the output — CPU time, wake-up count, mobile
+data usage.
+
+### JankStats for battery correlation
+
+Jank and battery are correlated — dropped frames mean re-rendering,
+which means GPU + CPU cycles. Tracking jank (see Module 09) often
+surfaces battery issues too.
+
+---
+
+## User-facing battery settings
+
+### Don't ask for battery exemption
+
+A prompt like "For best experience, whitelist us in battery optimization"
+is **anti-user**. Google restricts it in Play policy — only apps with
+specific needs (alarms, health monitoring, launchers) can legitimately
+ask.
+
+### Graceful degradation
+
+```kotlin
+val batteryManager = context.getSystemService(BatteryManager::class.java)
+val level = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+
+if (level < 20 && !isCharging) {
+    // Disable non-essential features
+    syncManager.setFrequency(Frequency.LOW)
+    imageLoader.setQuality(Quality.LOW)
+    videoPlayer.setMaxResolution(Resolution.P720)
+}
+```
+
+Respect low battery. Your app shouldn't be the reason the user's phone
+dies mid-day.
+
+### Power Saver mode
+
+Detect and reduce usage:
+
+```kotlin
+val powerManager = context.getSystemService(PowerManager::class.java)
+if (powerManager.isPowerSaveMode) {
+    // Cut animation durations, reduce image quality, pause background sync
+}
+```
+
+---
+
+## Thermal throttling
+
+Extended high CPU / GPU use triggers thermal throttling:
+
+```kotlin
+val pm = context.getSystemService(PowerManager::class.java)
+pm.addThermalStatusListener { status ->
+    when (status) {
+        PowerManager.THERMAL_STATUS_LIGHT -> Log.d("Thermal", "light throttle")
+        PowerManager.THERMAL_STATUS_MODERATE -> reduceQuality()
+        PowerManager.THERMAL_STATUS_SEVERE -> pauseNonEssentialWork()
+        PowerManager.THERMAL_STATUS_CRITICAL -> stopAllBackgroundWork()
+    }
+}
+```
+
+Long video encoding, ML inference, or real-time filters can trigger
+this. React gracefully.
+
+---
+
+## Audits by feature
+
+### Video playback
+
+- Release player on dispose / pause
+- Adaptive bitrate caps on mobile data
+- Keep screen on only during playback, not entire session
+
+### Audio / music
+
+- Foreground service for background audio
+- Respect audio focus (pause when navigation chimes)
+- Release MediaPlayer / ExoPlayer on stop
+
+### Chat / real-time
+
+- Use FCM high-priority for new messages, not WebSocket 24/7
+- Close WebSocket after screen off + 5 min of inactivity
+- Resume with delta sync via cursor
+
+### Fitness / tracking
+
+- Activity Recognition drives GPS accuracy
+- Batch sensor reads with maxReportLatencyUs
+- Pause tracking when stationary > 5 min
+
+### Social / feed
+
+- Preload next page only on Wi-Fi
+- Image quality matches network type
+- Background sync limited to idle / charging
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Battery sins',
+    variant: 'old',
+    points: [
+      'Continuous high-accuracy GPS',
+      'Polling a REST API every 30s in background',
+      'Wake locks held "just in case"',
+      'No constraints on WorkManager periodic',
+      'FCM messages without priority: high for chat',
+      'Not releasing ExoPlayer / Camera on dispose'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Efficient apps',
+    variant: 'new',
+    points: [
+      'Activity-aware location accuracy (Driving / Walking / Stationary)',
+      'WebSocket + FCM push (not polling)',
+      'No wake locks; foreground services if needed',
+      'Constraints: charging, Wi-Fi, idle',
+      'FCM priority high ONLY for time-sensitive',
+      'Lifecycle-aware teardown of every expensive resource'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Battery rules">
+- **Doze + App Standby** dictate what can run — design within those limits.
+- **WorkManager with constraints** (charging, Wi-Fi, idle) is battery-friendly by default.
+- **Batch sensor reads** with `maxReportLatencyUs`.
+- **Adaptive location accuracy** via Activity Recognition — huge savings.
+- **Geofencing** for place-based triggers, not polling.
+- **No WakeLocks** in app code; use foreground services or WorkManager.
+- **FCM high-priority only for time-sensitive** — abuse triggers throttling.
+- **Battery Historian + Android Studio Energy Profiler** for diagnosis.
+- **Don't request battery exemption** — Play policy restricts it; users hate it.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'WorkManager with constraints', description: 'Audit every WorkManager request in your app. Add Wi-Fi / charging / battery-not-low constraints where appropriate.' },
+  { title: 'Sensor batching', description: 'Add maxReportLatencyUs to step counter registration. Measure battery drop over 8h stationary with and without.' },
+  { title: 'Adaptive location', description: 'Integrate Activity Recognition. Switch location priority based on driving/walking/stationary. Measure battery over a typical day.' },
+  { title: 'Battery Historian drill', description: 'Run your app for 30 min. Capture a bug report. Upload to Battery Historian. Identify top 3 sources of wakeups.' },
+  { title: 'Power Saver mode', description: 'Detect isPowerSaveMode. Reduce animation durations, image quality, and disable non-essential background work when true.' }
+]} />
+
+## Next
+
+Return to **[Graphics, Media & Performance overview](/docs/graphics-media)**.

@@ -1,0 +1,542 @@
+---
+id: app-bundles
+title: App Bundles & Dynamic Delivery
+sidebar_label: App Bundles
+description: Android App Bundle (AAB), split APKs by ABI/density/language, Play Feature Delivery (on-demand modules), Play Asset Delivery (large assets), Play Instant.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# App Bundles & Dynamic Delivery
+
+Since 2021, Play Store **requires** Android App Bundles (AAB) for new
+apps. Beyond the format, Play's dynamic delivery lets you ship features
+and assets on-demand instead of bundling them into the base APK. This
+chapter covers AAB structure, split APKs, Play Feature Delivery, Play
+Asset Delivery, and Play Instant.
+
+## Why App Bundle replaced APK
+
+One APK had to contain **every** variant:
+- Every ABI (arm64, armv7, x86, x86_64)
+- Every density (ldpi, mdpi, hdpi, xhdpi, xxhdpi, xxxhdpi)
+- Every language
+- Every feature
+
+The result: 50+ MB APKs where a single user only used ~10 MB.
+
+App Bundle is the **blueprint**. Google Play generates per-device APKs at
+install time — only the ABI, density, and language the user needs.
+
+### Typical size savings
+
+| App                        | APK size    | Bundle-generated APK |
+|----------------------------|-------------|----------------------|
+| 50 MB AAB, global app     | 50 MB       | 15-20 MB (per user)  |
+| 200 MB game, global        | 200 MB      | 60-80 MB             |
+| Typical indie app          | 15 MB       | 6-8 MB               |
+
+30-60% size reduction for free.
+
+---
+
+## Building an AAB
+
+```bash
+./gradlew bundleRelease
+# Output: app/build/outputs/bundle/release/app-release.aab
+```
+
+```kotlin
+// app/build.gradle.kts
+android {
+    bundle {
+        language {
+            enableSplit = true      // split by language
+        }
+        density {
+            enableSplit = true      // split by density
+        }
+        abi {
+            enableSplit = true      // split by ABI (native code)
+        }
+    }
+}
+```
+
+All three should be `enableSplit = true` (the default) for maximum size
+savings.
+
+---
+
+## Testing AAB locally with bundletool
+
+```bash
+# Install bundletool: brew install bundletool
+
+# Generate per-device APKs for your device
+bundletool build-apks \
+    --bundle=app/build/outputs/bundle/release/app-release.aab \
+    --output=app.apks \
+    --ks=release.keystore \
+    --ks-pass=pass:$KEYSTORE_PASSWORD \
+    --ks-key-alias=$KEY_ALIAS \
+    --key-pass=pass:$KEY_PASSWORD \
+    --mode=universal                        # or: default (per-device splits)
+
+# Install on connected device
+bundletool install-apks --apks=app.apks
+```
+
+`--mode=universal` produces a single APK containing everything — for CI
+debugging and Firebase Test Lab. `default` produces a zip of per-device
+APKs matching what Play would deliver.
+
+---
+
+## Play Feature Delivery
+
+Ship features as **Dynamic Feature Modules** that users download on
+demand:
+
+### Module setup
+
+```kotlin
+// feature/premium-analytics/build.gradle.kts
+plugins {
+    alias(libs.plugins.android.dynamic.feature)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.hilt)
+    alias(libs.plugins.ksp)
+}
+
+android {
+    namespace = "com.myapp.premium.analytics"
+}
+
+dependencies {
+    implementation(project(":app"))                // dynamic features depend on :app
+    implementation(projects.core.ui)
+    implementation(projects.core.domain)
+}
+```
+
+```xml
+<!-- feature/premium-analytics/src/main/AndroidManifest.xml -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:dist="http://schemas.android.com/apk/distribution">
+
+    <dist:module
+        dist:instant="false"
+        dist:title="@string/premium_analytics_title">
+        <dist:delivery>
+            <dist:on-demand/>                      <!-- download at runtime -->
+        </dist:delivery>
+        <dist:fusing dist:include="true"/>         <!-- include for pre-API 21 devices -->
+    </dist:module>
+</manifest>
+```
+
+### Delivery modes
+
+| Mode                     | When downloaded                                    |
+|--------------------------|----------------------------------------------------|
+| `<install-time>`         | At install; part of the base (not really dynamic) |
+| `<on-demand>`            | When your app requests it                          |
+| `<conditional>`          | If conditions match (device features, country, min SDK) |
+| `<instant>`              | For Google Play Instant apps                       |
+
+Conditional example:
+
+```xml
+<dist:delivery>
+    <dist:install-time>
+        <dist:conditions>
+            <dist:min-sdk dist:value="26"/>
+            <dist:device-feature dist:name="android.hardware.camera.ar"/>
+            <dist:user-countries dist:include="true">
+                <dist:country dist:code="US"/>
+                <dist:country dist:code="CA"/>
+            </dist:user-countries>
+        </dist:conditions>
+    </dist:install-time>
+</dist:delivery>
+```
+
+### Requesting on-demand modules
+
+```kotlin
+implementation("com.google.android.play:feature-delivery-ktx:2.1.0")
+
+class PremiumFeatureLoader @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    private val manager = SplitInstallManagerFactory.create(context)
+
+    suspend fun installAnalytics(): Result<Unit> = suspendCancellableCoroutine { cont ->
+        val request = SplitInstallRequest.newBuilder()
+            .addModule("premium-analytics")
+            .build()
+
+        manager.startInstall(request)
+            .addOnSuccessListener { sessionId ->
+                // Track progress via status updates (below)
+                cont.resume(Result.success(Unit)) {}
+            }
+            .addOnFailureListener { error ->
+                cont.resume(Result.failure(error)) {}
+            }
+    }
+
+    fun observeProgress(): Flow<InstallProgress> = callbackFlow {
+        val listener = SplitInstallStateUpdatedListener { state ->
+            trySend(InstallProgress.from(state))
+        }
+        manager.registerListener(listener)
+        awaitClose { manager.unregisterListener(listener) }
+    }
+}
+```
+
+### After install — use the module
+
+```kotlin
+// In dynamic feature module, register an activity
+<activity android:name="com.myapp.premium.analytics.PremiumActivity"/>
+
+// Main app — launch via reflection or Intent
+context.startActivity(Intent().setClassName(
+    context.packageName,
+    "com.myapp.premium.analytics.PremiumActivity"
+))
+```
+
+### User-visible flow
+
+Play downloads the module (~1-5 MB). The user sees a progress bar (no
+dismissable dialog). After install, your code proceeds.
+
+If the network is slow, offer a meaningful UX:
+
+```kotlin
+lifecycleScope.launch {
+    loader.observeProgress().collect { progress ->
+        when (progress) {
+            is Downloading -> showBar(progress.percent)
+            is RequiresUserConfirmation -> manager.startConfirmationDialogForResult(progress.state, activity, REQ_CODE)
+            is Installed -> openFeature()
+            is Failed -> showRetry()
+        }
+    }
+}
+```
+
+### When to use dynamic features
+
+<ComparisonCard
+  left={{
+    label: 'Good candidates',
+    title: 'When dynamic pays off',
+    variant: 'new',
+    points: [
+      'Large feature (>1 MB) used by minority',
+      'Premium / paid features',
+      'Region-specific (country-conditional)',
+      'AR / ML features that need extra libraries',
+      'Rarely-used power-user tools',
+      'Instant-app experience modules'
+    ]
+  }}
+  right={{
+    label: 'Bad candidates',
+    title: 'Skip dynamic',
+    variant: 'old',
+    points: [
+      'Core features (everyone uses them)',
+      'Small features (< 200 KB)',
+      'Frequently used — loading delay hurts UX',
+      'Teams < 3 engineers (complexity cost > benefit)',
+      'Apps distributed outside Play Store',
+      'When Play Instant / install-time conditions suffice'
+    ]
+  }}
+/>
+
+---
+
+## Play Asset Delivery (PAD)
+
+For **large assets** (game textures, audio, video, ML models) — up to
+**4 GB** total per asset pack. Three delivery modes:
+
+| Mode              | Size limit        | Behavior                               |
+|-------------------|-------------------|----------------------------------------|
+| `install-time`    | 1 GB              | Bundled at install                     |
+| `fast-follow`     | 512 MB total + per-pack 150 MB | Downloads right after install     |
+| `on-demand`       | 4 GB total + per-pack 1.5 GB | On request                         |
+
+### Setup — asset pack module
+
+```kotlin
+// asset_pack/level_data/build.gradle.kts
+plugins {
+    id("com.android.asset-pack")
+}
+
+assetPack {
+    packName = "level_data"
+    dynamicDelivery {
+        deliveryType = "on-demand"    // or "install-time" / "fast-follow"
+    }
+}
+```
+
+```text
+asset_pack/level_data/
+├── build.gradle.kts
+└── src/main/assets/level_data/     ← your huge files here
+    ├── level_1.pak
+    ├── level_2.pak
+    └── textures_hd.pkg
+```
+
+```kotlin
+// app/build.gradle.kts
+android {
+    assetPacks += listOf(":asset_pack:level_data")
+}
+```
+
+### Retrieving assets at runtime
+
+```kotlin
+implementation("com.google.android.play:asset-delivery-ktx:2.2.2")
+
+class LevelAssetLoader @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    private val manager = AssetPackManagerFactory.getInstance(context)
+
+    suspend fun getLevelFile(): File? {
+        val state = manager.getPackStates(listOf("level_data")).await()
+            .packStates()["level_data"] ?: return null
+
+        if (state.status() != AssetPackStatus.COMPLETED) {
+            manager.fetch(listOf("level_data")).await()
+        }
+
+        val location = manager.getPackLocation("level_data")
+        val assetsFolder = location?.assetsPath()
+        return File(assetsFolder, "level_1.pak")
+    }
+}
+```
+
+Asset packs ship via Play's CDN — orders of magnitude cheaper than
+Firebase Storage or a custom CDN for game-sized assets.
+
+---
+
+## Play Instant
+
+Lets users try your app **without installing** — a stripped-down version
+launches from a "Try now" button in the Play Store.
+
+### Requirements
+
+- **Size limit**: 15 MB base instant APK
+- Must declare at least one activity as `android:exported="true"` with
+  `android.intent.action.VIEW`
+- App Links configured for `instant` URL patterns
+
+### Setup
+
+```xml
+<!-- AndroidManifest.xml -->
+<manifest ...>
+    <dist:module dist:instant="true"/>
+
+    <application>
+        <activity
+            android:name=".InstantActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="https" android:host="myapp.com" android:pathPrefix="/try"/>
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+```
+
+### Testing
+
+```bash
+# Upload instant-enabled AAB to Play Console → Internal App Sharing
+# Click the Internal App Sharing link as "Try now"
+```
+
+Instant apps are ideal for:
+- Game demos
+- Shopping catalogs (click ad → instant cart)
+- One-time tools
+- Progressive "try before install" onboarding
+
+Rare for full apps — the 15 MB limit is tight.
+
+---
+
+## Baseline profiles in AAB
+
+Baseline profiles (see [Module 10: Baseline Profiles](/docs/performance/baseline-profiles))
+ship inside the AAB as `app/src/main/baseline-prof.txt`. Play generates
+per-device APKs that include the profile — users get the cold-start
+boost automatically.
+
+---
+
+## Minimizing AAB size
+
+Beyond splits:
+
+### 1. R8 full-mode
+
+```kotlin
+// gradle.properties
+android.enableR8.fullMode=true
+```
+
+Full mode strips more aggressively. May reveal keep-rule gaps; add them
+as needed.
+
+### 2. Shrink unused resources
+
+```kotlin
+buildTypes {
+    release {
+        isMinifyEnabled = true
+        isShrinkResources = true
+    }
+}
+```
+
+### 3. Remove unused locales via `resourceConfigurations`
+
+```kotlin
+android {
+    defaultConfig {
+        resourceConfigurations += listOf("en", "es", "hi", "ar")
+    }
+}
+```
+
+Drops resources for every other locale — saves MB if you have Android
+support libraries with translations for 80+ languages.
+
+### 4. APK Analyzer
+
+Android Studio → Build → Analyze APK. Shows per-file size, lets you
+compare versions, reveals surprise large assets.
+
+### 5. `classes.dex` bloat
+
+Check `classes*.dex` sizes — a large second DEX often indicates kapt
+overhead (Hilt, Room). Migrate to KSP for ~30-40% smaller DEXes.
+
+### 6. Avoid fat libraries
+
+Check `AndroidManifest.xml` of dependencies for huge activities you're
+not using. Use `tools:node="remove"` to strip them:
+
+```xml
+<application>
+    <activity android:name="com.example.UnusedActivity" tools:node="remove"/>
+</application>
+```
+
+---
+
+## Distributing outside Play Store
+
+For alternative stores (Amazon Appstore, Samsung Galaxy Store, Huawei
+AppGallery), upload a **universal APK** built from the AAB:
+
+```bash
+bundletool build-apks \
+    --bundle=app-release.aab \
+    --output=app-universal.apks \
+    --mode=universal
+```
+
+Some stores accept AAB; many still require APK. Check per-store docs.
+
+For **enterprise sideloading** (MDM-deployed apps), APK works fine. AAB
+is Play-specific.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'AAB / dynamic mistakes',
+    variant: 'old',
+    points: [
+      'Treating dynamic features like install-time modules',
+      'No fusing for pre-API 21 devices',
+      '15 MB game assets in base APK instead of asset pack',
+      'Testing AAB via adb install-multiple without bundletool',
+      'Splits disabled to "make debugging easier"',
+      'Universal APK for Play (loses all size benefits)'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Modern distribution',
+    variant: 'new',
+    points: [
+      'Dynamic modules reserved for large, optional features',
+      '<dist:fusing include="true"> for old devices',
+      'Play Asset Delivery for > 100 MB assets',
+      'bundletool build-apks → install-apks for realistic tests',
+      'All splits enabled by default',
+      'AAB for Play; universal APK only for alt stores'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="AAB & dynamic delivery rules">
+- **AAB is required** on Play Store; it generates per-device APKs on the fly.
+- **Enable all splits** (language, density, ABI) for 30-60% size reduction.
+- **Dynamic features** for large, optional capabilities — not for everything.
+- **Conditional delivery** (country, SDK, device-feature) ships modules to the right users only.
+- **Play Asset Delivery** for 100 MB+ assets; cheaper than your own CDN.
+- **Play Instant** for 15 MB "try without installing" experiences.
+- **R8 full mode + shrink resources + KSP** maximize shrinkage beyond splits.
+- **bundletool** for local AAB testing; universal APK for non-Play distribution.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Measure AAB savings', description: 'Build your app as APK and AAB. Run bundletool build-apks on the AAB. Compare sizes — you should see 30%+ reduction.' },
+  { title: 'Add a dynamic feature', description: 'Extract one optional feature (analytics dashboard, AR mode, admin tools) into a dynamic module with on-demand delivery.' },
+  { title: 'Asset pack', description: 'Move a large asset (>50 MB) out of base assets and into a fast-follow asset pack. Verify it downloads after install.' },
+  { title: 'Resource shrink audit', description: 'Enable isShrinkResources, add resourceConfigurations for supported locales. Re-measure AAB size.' },
+  { title: 'Play Instant test', description: 'Configure your launcher activity for instant delivery (if your app fits in 15 MB). Upload to Internal App Sharing and test via the "Try now" flow.' }
+]} />
+
+## Next
+
+Return to **[Module 11 Overview](./overview)** or continue to
+**[Module 12 — Advanced & Trending](/docs/advanced-trending/overview)**.

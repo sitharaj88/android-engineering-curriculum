@@ -1,0 +1,511 @@
+---
+id: intents-pendingintent
+title: Intents & PendingIntent
+sidebar_label: Intents & PendingIntent
+description: Explicit and implicit intents, Intent filters, ActionResult API, deep links, App Links, PendingIntent flags (IMMUTABLE/MUTABLE), chooser intents, share actions.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Intents & PendingIntent
+
+`Intent` is Android's IPC primitive — "do this action with this data."
+Explicit intents launch components in your app; implicit intents let
+other apps handle the action. `PendingIntent` wraps an intent so another
+process can fire it on your behalf. This chapter covers the full surface.
+
+## Explicit vs implicit intents
+
+### Explicit — you name the target
+
+```kotlin
+val intent = Intent(context, ProfileActivity::class.java).apply {
+    putExtra("userId", "u1")
+    flags = Intent.FLAG_ACTIVITY_CLEAR_TOP
+}
+context.startActivity(intent)
+```
+
+Use within your own app — full control.
+
+### Implicit — describe the action, let Android pick
+
+```kotlin
+val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com"))
+context.startActivity(intent)
+
+val share = Intent(Intent.ACTION_SEND).apply {
+    type = "text/plain"
+    putExtra(Intent.EXTRA_TEXT, "Check out this product!")
+}
+context.startActivity(Intent.createChooser(share, "Share via"))
+
+val dial = Intent(Intent.ACTION_DIAL, Uri.parse("tel:5551234567"))
+context.startActivity(dial)
+```
+
+Implicit intents let the user pick (browser, share target, phone app).
+
+### Resolving before starting
+
+Some devices may have no handler for an action. Check first:
+
+```kotlin
+if (intent.resolveActivity(context.packageManager) != null) {
+    context.startActivity(intent)
+} else {
+    // Fallback — show a message, open Play Store, etc.
+}
+```
+
+### Android 11+ package visibility
+
+Android 11 restricts which other packages your app can see. Declare what
+you query:
+
+```xml
+<!-- AndroidManifest.xml -->
+<queries>
+    <intent>
+        <action android:name="android.intent.action.VIEW"/>
+        <data android:scheme="https"/>
+    </intent>
+
+    <!-- By package name -->
+    <package android:name="com.google.android.gm"/>
+</queries>
+```
+
+Without this, `resolveActivity` returns null even when a handler exists.
+
+---
+
+## Intent extras
+
+```kotlin
+intent.putExtra("string_key", "value")
+intent.putExtra("int_key", 42)
+intent.putExtra("boolean_key", true)
+intent.putExtra("long_array", longArrayOf(1L, 2L, 3L))
+intent.putExtra("parcelable", user)       // must be @Parcelize
+
+// Read
+val id = intent.getStringExtra("string_key")
+val count = intent.getIntExtra("int_key", 0)
+
+// Android 13+ typed getters for Parcelable
+val user = intent.getParcelableExtra("parcelable", User::class.java)
+```
+
+### `@Parcelize` — the modern way to serialize
+
+```kotlin
+@Parcelize
+data class User(val id: String, val name: String, val email: String) : Parcelable
+```
+
+```kotlin
+// build.gradle.kts
+plugins {
+    id("kotlin-parcelize")
+}
+```
+
+`@Parcelize` generates the `Parcelable` implementation at compile time.
+Far faster than `Serializable`, and idiomatic Kotlin.
+
+---
+
+## `ActivityResult` API — the modern result flow
+
+The legacy `startActivityForResult` + `onActivityResult` is deprecated.
+Use the Activity Result API:
+
+```kotlin
+class PhotoPickerFragment : Fragment() {
+
+    private val pickMedia = registerForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) uploadPhoto(uri)
+    }
+
+    fun onPickClick() {
+        pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+    }
+}
+```
+
+### From Compose
+
+```kotlin
+@Composable
+fun Screen() {
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri -> /* ... */ }
+
+    Button(onClick = {
+        launcher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+    }) { Text("Pick") }
+}
+```
+
+### Built-in contracts
+
+| Contract                                    | Purpose                               |
+|---------------------------------------------|---------------------------------------|
+| `PickVisualMedia`                           | Photo Picker (recommended)            |
+| `RequestPermission`                          | Single permission                     |
+| `RequestMultiplePermissions`                 | Multiple permissions                  |
+| `StartActivityForResult`                    | Raw Activity result                   |
+| `TakePicture`                               | Camera → saved to a URI you provide   |
+| `TakePicturePreview`                        | Camera → small Bitmap                 |
+| `GetContent`                                | File pick via MIME type               |
+| `OpenDocument`                              | SAF document pick (persistent access) |
+| `CreateDocument`                            | SAF document create                   |
+| `OpenDocumentTree`                          | Folder pick                           |
+| `CaptureVideo`                              | Video capture                         |
+| `StartIntentSenderForResult`                | PendingIntent → result                |
+
+### Custom contract
+
+```kotlin
+class PickColorContract : ActivityResultContract<Unit, Int?>() {
+    override fun createIntent(context: Context, input: Unit): Intent =
+        Intent(context, ColorPickerActivity::class.java)
+
+    override fun parseResult(resultCode: Int, intent: Intent?): Int? =
+        if (resultCode == Activity.RESULT_OK)
+            intent?.getIntExtra("color", 0)?.takeIf { it != 0 }
+        else null
+}
+```
+
+Encapsulates the Activity contract — typed inputs, typed outputs, no
+bundle juggling at call sites.
+
+---
+
+## Deep linking
+
+### Custom scheme (rare for new apps)
+
+```xml
+<activity android:name=".MainActivity" android:exported="true">
+    <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="myapp" android:host="profile"/>
+    </intent-filter>
+</activity>
+```
+
+`myapp://profile/u1` launches your app. But browsers don't auto-open
+custom schemes — users have to type them, which nobody does.
+
+### App Links (recommended — HTTPS verified)
+
+```xml
+<intent-filter android:autoVerify="true">
+    <action android:name="android.intent.action.VIEW"/>
+    <category android:name="android.intent.category.DEFAULT"/>
+    <category android:name="android.intent.category.BROWSABLE"/>
+    <data android:scheme="https"/>
+    <data android:host="myapp.com"/>
+    <data android:pathPrefix="/user"/>
+</intent-filter>
+```
+
+And a Digital Asset Links file hosted at
+`https://myapp.com/.well-known/assetlinks.json`:
+
+```json
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "com.myapp",
+    "sha256_cert_fingerprints": ["14:6D:...:FF"]
+  }
+}]
+```
+
+With `autoVerify="true"` + assetlinks.json, Android opens your app
+directly — no chooser, no confusion.
+
+### Getting the signing cert fingerprint
+
+```bash
+# Play App Signing (from Play Console → Setup → App Integrity)
+# Copy the SHA-256 from "App signing key certificate"
+
+# Or from upload keystore
+keytool -list -v -keystore release.keystore
+```
+
+### Verifying the link
+
+```bash
+adb shell am start -W -a android.intent.action.VIEW -d "https://myapp.com/user/u1"
+```
+
+Watch logcat for `IntentFilterVerifier` results.
+
+### Reading deep link data
+
+```kotlin
+override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    handleIntent(intent)
+}
+
+override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    setIntent(intent)
+    handleIntent(intent)
+}
+
+private fun handleIntent(intent: Intent?) {
+    val uri = intent?.data ?: return
+    when (uri.pathSegments.firstOrNull()) {
+        "user" -> {
+            val userId = uri.pathSegments.getOrNull(1) ?: return
+            navController.navigate(Profile(userId))
+        }
+        /* ... */
+    }
+}
+```
+
+Or use **Navigation Compose's type-safe deep links** — see
+[Navigation Masterclass](/docs/jetpack-compose/navigation).
+
+---
+
+## `Intent.createChooser` — force chooser
+
+```kotlin
+val intent = Intent(Intent.ACTION_SEND).apply {
+    type = "text/plain"
+    putExtra(Intent.EXTRA_TEXT, "Check this out")
+}
+context.startActivity(Intent.createChooser(intent, "Share via"))
+```
+
+`createChooser` always shows the system chooser, even if the user
+previously picked a default. Good for "Share to…" where you want every
+app listed.
+
+### Share Sheet with ChooserTargets (Android 10+)
+
+Apps can register **direct share targets** (specific people / channels)
+visible in the system share sheet:
+
+```xml
+<meta-data
+    android:name="android.service.chooser.chooser_target_service"
+    android:value=".ShareTargetService"/>
+```
+
+Plus a `ChooserTargetService` implementation. Mostly relevant for messaging
+apps.
+
+---
+
+## PendingIntent — deferred execution
+
+A `PendingIntent` is a token you hand to another process (AlarmManager,
+NotificationManager, WorkManager) to fire an intent later on your behalf.
+
+### The three varieties
+
+```kotlin
+// Activity
+PendingIntent.getActivity(context, requestCode, intent, flags)
+
+// Broadcast
+PendingIntent.getBroadcast(context, requestCode, intent, flags)
+
+// Service
+PendingIntent.getService(context, requestCode, intent, flags)
+```
+
+### Flags
+
+| Flag                          | Effect                                               |
+|-------------------------------|------------------------------------------------------|
+| `FLAG_UPDATE_CURRENT`         | Replace the wrapped intent; keep the PendingIntent ID|
+| `FLAG_CANCEL_CURRENT`         | Cancel any existing PendingIntent before creating    |
+| `FLAG_IMMUTABLE`              | Disallow modifying the wrapped intent (required 23+) |
+| `FLAG_MUTABLE`                | Allow modification — only when specifically needed  |
+| `FLAG_NO_CREATE`              | Don't create; return null if none exists            |
+| `FLAG_ONE_SHOT`               | Can only be used once                                |
+
+### IMMUTABLE by default (Android 12+ requires it)
+
+```kotlin
+val pi = PendingIntent.getActivity(
+    context,
+    0,
+    intent,
+    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+)
+```
+
+Android 12+ **requires** specifying either `FLAG_IMMUTABLE` or
+`FLAG_MUTABLE`. Omitting crashes.
+
+Always prefer `IMMUTABLE` unless you specifically need the receiver to
+modify the intent (e.g., RemoteInput — the system fills in reply text).
+
+### MUTABLE for direct reply
+
+```kotlin
+val replyPi = PendingIntent.getBroadcast(
+    context,
+    convId.hashCode(),
+    Intent(context, DirectReplyReceiver::class.java),
+    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_MUTABLE
+)
+```
+
+When `RemoteInput` is attached, Android fills in the user's typed reply
+via `RemoteInput.getResultsFromIntent(intent)`. That requires the PI to
+be mutable — but Android provides enough hardening via `FLAG_IMMUTABLE`
+context that combining both is still safe.
+
+### requestCode uniqueness
+
+Two PendingIntents are considered "the same" if their intents match by
+action + data + type + class + categories. If you want distinct ones,
+vary the `requestCode`:
+
+```kotlin
+// Per-message notification — each needs a unique PendingIntent
+val pi = PendingIntent.getActivity(
+    context,
+    messageId.hashCode(),          // varied per message
+    intent,
+    FLAG_IMMUTABLE
+)
+```
+
+Otherwise, the second PendingIntent overwrites the first's extras.
+
+---
+
+## Alarms with PendingIntent
+
+```kotlin
+val alarmManager = context.getSystemService(AlarmManager::class.java)
+
+val intent = Intent(context, ReminderReceiver::class.java)
+val pi = PendingIntent.getBroadcast(
+    context, reminderId.hashCode(), intent,
+    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+)
+
+alarmManager.setExactAndAllowWhileIdle(
+    AlarmManager.RTC_WAKEUP,
+    triggerAtMillis,
+    pi
+)
+```
+
+Android 14 requires `SCHEDULE_EXACT_ALARM` permission (which triggers
+Play review on "why do you need exact alarms?"). For non-exact, use
+`set`/`setWindow`/`setInexactRepeating`. For most periodic work,
+**WorkManager is the correct choice**.
+
+---
+
+## Broadcast intents (see [BroadcastReceivers chapter](./broadcast-content-providers))
+
+```kotlin
+// Send a local broadcast via LocalBroadcastManager (deprecated) — use Flow / StateFlow instead
+
+// System broadcast (rarely)
+context.sendBroadcast(Intent("com.myapp.ACTION_CUSTOM"))
+
+// Ordered broadcast with priority
+context.sendOrderedBroadcast(intent, null)
+```
+
+Avoid broadcasts for in-process communication. Use `SharedFlow` /
+dependency injection.
+
+---
+
+## Intent resolution debugging
+
+```bash
+# Check which app handles an intent
+adb shell dumpsys package r com.myapp
+adb shell dumpsys package resolvers activity https://myapp.com/path
+
+# Log IntentFilter verification
+adb shell am get-intent-verification --user 0 https://myapp.com
+```
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Intent mistakes',
+    variant: 'old',
+    points: [
+      'startActivityForResult (deprecated)',
+      'Large objects via putExtra (TransactionTooLarge)',
+      'PendingIntent without FLAG_IMMUTABLE on Android 12+',
+      'Exporting activities that shouldn\'t be',
+      'Custom scheme deep links (nobody types myapp://)',
+      'No autoVerify + no assetlinks.json'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Modern intents',
+    variant: 'new',
+    points: [
+      'registerForActivityResult with typed contracts',
+      'Pass IDs via extras; fetch the object via repository',
+      'IMMUTABLE by default; MUTABLE only for RemoteInput',
+      'android:exported="false" unless cross-app',
+      'App Links with HTTPS + autoVerify + assetlinks.json',
+      'Run adb to verify autoVerify succeeded'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Intent rules">
+- **Explicit intents** within your app; **implicit** for cross-app actions.
+- **ActivityResult API** replaces `startActivityForResult`.
+- **@Parcelize** for complex extras; pass IDs, not objects.
+- **App Links** (HTTPS + autoVerify + assetlinks.json) over custom schemes.
+- **PendingIntent.FLAG_IMMUTABLE** is mandatory on Android 12+; pair with `FLAG_MUTABLE` only for RemoteInput.
+- **Unique `requestCode`** per PendingIntent you want to coexist.
+- **Package visibility** (`<queries>`) declared for every implicit intent target on Android 11+.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Migrate to ActivityResult API', description: 'Find one startActivityForResult in legacy code. Replace with registerForActivityResult + a typed contract.' },
+  { title: 'Set up App Links', description: 'Add autoVerify intent-filter for https://yourdomain.com. Generate assetlinks.json. Verify via adb that it opens the app directly.' },
+  { title: 'Direct-reply notification', description: 'Build a notification with RemoteInput. Use FLAG_IMMUTABLE or FLAG_MUTABLE. Handle the reply in a BroadcastReceiver.' },
+  { title: 'Share sheet integration', description: 'Add Intent.ACTION_SEND with a custom chooser title. Add a custom subject and plain-text content.' },
+  { title: 'Custom ActivityResultContract', description: 'Write a contract for a color picker Activity. Input = initial color (Int), output = picked color (Int?).' }
+]} />
+
+## Next
+
+Continue to **[BroadcastReceivers & ContentProviders](./broadcast-content-providers)** for system events and content sharing.

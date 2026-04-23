@@ -1,0 +1,526 @@
+---
+id: camerax-sensors
+title: CameraX & Sensors
+sidebar_label: CameraX & Sensors
+description: CameraX use cases (Preview, ImageCapture, VideoCapture, ImageAnalysis), sensor fusion, accelerometer/gyro/step-counter, Doze-aware sampling, and batching.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# CameraX & Sensors
+
+CameraX replaces the legacy Camera2 API for 95% of apps. It auto-handles
+device quirks, previews, and the quadruple-lifecycle dance. For sensors,
+`SensorManager` gets you accelerometer, gyroscope, step counter, and
+proximity — with careful handling for battery.
+
+## CameraX
+
+### Setup
+
+```kotlin
+// libs.versions.toml
+camerax = "1.4.1"
+
+camera-core        = { module = "androidx.camera:camera-core",         version.ref = "camerax" }
+camera-camera2     = { module = "androidx.camera:camera-camera2",      version.ref = "camerax" }
+camera-lifecycle   = { module = "androidx.camera:camera-lifecycle",    version.ref = "camerax" }
+camera-view        = { module = "androidx.camera:camera-view",         version.ref = "camerax" }
+camera-video       = { module = "androidx.camera:camera-video",        version.ref = "camerax" }
+camera-extensions  = { module = "androidx.camera:camera-extensions",   version.ref = "camerax" }
+camera-mlkit-vision= { module = "androidx.camera:camera-mlkit-vision", version = "1.4.0-beta03" }
+```
+
+### The use-case model
+
+CameraX abstracts camera work into **use cases** that you bind to a
+Lifecycle:
+
+```text
+Preview              → shows live image on screen (PreviewView)
+ImageCapture         → captures a still photo
+VideoCapture         → records a video
+ImageAnalysis        → streams frames to your algorithm (ML Kit, barcode scan)
+```
+
+Bind one or more per lifecycle. Camera supports a few simultaneous use
+cases per device (`Preview + ImageCapture + ImageAnalysis` is usually fine).
+
+### Preview + ImageCapture (the common pair)
+
+```kotlin
+@Composable
+fun CameraPreviewScreen(onPhoto: (Uri) -> Unit) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val executor = remember { Executors.newSingleThreadExecutor() }
+    val previewView = remember { PreviewView(context) }
+
+    var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
+
+    LaunchedEffect(lifecycleOwner) {
+        val cameraProvider = ProcessCameraProvider.getInstance(context).get()
+
+        val preview = Preview.Builder().build().apply {
+            setSurfaceProvider(previewView.surfaceProvider)
+        }
+
+        val capture = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setFlashMode(ImageCapture.FLASH_MODE_AUTO)
+            .build()
+
+        val selector = CameraSelector.DEFAULT_BACK_CAMERA
+
+        cameraProvider.unbindAll()
+        cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, capture)
+        imageCapture = capture
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        AndroidView({ previewView }, Modifier.fillMaxSize())
+
+        FloatingActionButton(
+            onClick = {
+                val capture = imageCapture ?: return@FloatingActionButton
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, "IMG_${System.currentTimeMillis()}.jpg")
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MyApp")
+                    }
+                }
+                val output = ImageCapture.OutputFileOptions.Builder(
+                    context.contentResolver,
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    contentValues
+                ).build()
+
+                capture.takePicture(
+                    output, executor,
+                    object : ImageCapture.OnImageSavedCallback {
+                        override fun onImageSaved(result: ImageCapture.OutputFileResults) {
+                            result.savedUri?.let(onPhoto)
+                        }
+                        override fun onError(exception: ImageCaptureException) {
+                            Log.e("Camera", "Capture failed", exception)
+                        }
+                    }
+                )
+            },
+            modifier = Modifier.align(Alignment.BottomCenter).padding(24.dp)
+        ) { Icon(Icons.Default.CameraAlt, null) }
+    }
+}
+```
+
+### VideoCapture
+
+```kotlin
+val recorder = Recorder.Builder()
+    .setQualitySelector(QualitySelector.from(Quality.HD))
+    .build()
+val videoCapture = VideoCapture.withOutput(recorder)
+
+cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, videoCapture)
+
+// Start recording
+val mediaStoreOutput = MediaStoreOutputOptions.Builder(
+    context.contentResolver,
+    MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+).setContentValues(contentValues).build()
+
+val recording = videoCapture.output
+    .prepareRecording(context, mediaStoreOutput)
+    .apply {
+        if (ActivityCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED) withAudioEnabled()
+    }
+    .start(executor) { event ->
+        when (event) {
+            is VideoRecordEvent.Start -> {}
+            is VideoRecordEvent.Finalize -> {
+                if (!event.hasError()) { /* saved to event.outputResults.outputUri */ }
+            }
+            is VideoRecordEvent.Status -> {
+                // event.recordingStats.recordedDurationNanos, sizeBytes
+            }
+        }
+    }
+
+// Stop
+recording.stop()
+```
+
+### ImageAnalysis + ML Kit barcode example
+
+```kotlin
+@OptIn(ExperimentalGetImage::class)
+val analysisUseCase = ImageAnalysis.Builder()
+    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+    .setTargetResolution(Size(1280, 720))
+    .build()
+    .apply {
+        setAnalyzer(executor) { imageProxy ->
+            val mediaImage = imageProxy.image ?: run { imageProxy.close(); return@setAnalyzer }
+            val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+
+            val scanner = BarcodeScanning.getClient()
+            scanner.process(inputImage)
+                .addOnSuccessListener { barcodes ->
+                    barcodes.firstOrNull()?.rawValue?.let { onBarcode(it) }
+                }
+                .addOnCompleteListener { imageProxy.close() }    // critical!
+        }
+    }
+
+cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, analysisUseCase)
+```
+
+<Callout kind="warning" title="Always close() the ImageProxy">
+If you don't call `imageProxy.close()`, the analyzer backpressure kicks in
+and you'll stop receiving frames. Use a try/finally or `addOnCompleteListener`
+to guarantee close.
+</Callout>
+
+### Switching cameras
+
+```kotlin
+val lensFacing = if (usingBack) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+
+val selector = CameraSelector.Builder()
+    .requireLensFacing(lensFacing)
+    .build()
+
+cameraProvider.unbindAll()
+cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, capture)
+```
+
+### Focus, exposure, zoom
+
+```kotlin
+val cameraControl = camera.cameraControl
+val cameraInfo = camera.cameraInfo
+
+// Tap to focus
+val factory = previewView.meteringPointFactory
+val point = factory.createPoint(x, y)
+val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+    .disableAutoCancel()
+    .build()
+cameraControl.startFocusAndMetering(action)
+
+// Zoom
+cameraControl.setZoomRatio(2.5f)
+cameraInfo.zoomState.observe(lifecycleOwner) { state ->
+    // state.linearZoom, state.zoomRatio, state.minZoomRatio, state.maxZoomRatio
+}
+
+// Exposure (EV compensation)
+val range = cameraInfo.exposureState.exposureCompensationRange
+cameraControl.setExposureCompensationIndex(0)
+```
+
+### Extensions (HDR, bokeh, night)
+
+```kotlin
+val extensionsManager = ExtensionsManager.getInstanceAsync(context, cameraProvider).await()
+val extSelector = extensionsManager.getExtensionEnabledCameraSelector(
+    CameraSelector.DEFAULT_BACK_CAMERA,
+    ExtensionMode.NIGHT
+)
+cameraProvider.bindToLifecycle(lifecycleOwner, extSelector, preview, capture)
+```
+
+Extensions use vendor SDKs (Samsung, Google, etc.). Support varies by device — check `extensionsManager.isExtensionAvailable(...)`.
+
+### Best practices
+
+- Use one `Executor` per camera session; reuse it (don't spawn per frame).
+- Bind all use cases at once — rebinding is expensive.
+- Release the `ProcessCameraProvider` reference when done; `unbindAll()` is lifecycle-aware and handles teardown.
+- For custom overlays, use `GraphicOverlay` pattern on top of `PreviewView`.
+
+---
+
+## Sensors — `SensorManager`
+
+### Available sensor types
+
+| Type                              | Use                                              |
+|-----------------------------------|--------------------------------------------------|
+| `TYPE_ACCELEROMETER`              | Linear acceleration + gravity                    |
+| `TYPE_GYROSCOPE`                  | Rotation rate                                    |
+| `TYPE_MAGNETIC_FIELD`             | Compass                                          |
+| `TYPE_ROTATION_VECTOR`            | Combined orientation (fused accel+gyro+mag)      |
+| `TYPE_STEP_COUNTER`               | Steps since boot (system-maintained)             |
+| `TYPE_STEP_DETECTOR`              | Event per step                                   |
+| `TYPE_PROXIMITY`                  | Near / far binary                                |
+| `TYPE_LIGHT`                      | Ambient light (lux)                              |
+| `TYPE_PRESSURE`                   | Barometer (pressure in hPa)                      |
+| `TYPE_AMBIENT_TEMPERATURE`        | Temperature                                      |
+| `TYPE_HEART_RATE` (Wear OS)       | Heart rate BPM                                   |
+| `TYPE_LINEAR_ACCELERATION`        | Accel without gravity                            |
+| `TYPE_GRAVITY`                    | Gravity-only component                           |
+
+### Basic listener
+
+```kotlin
+class MotionListener(private val context: Context) : SensorEventListener {
+    private val sensorManager = context.getSystemService(SensorManager::class.java)
+    private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+
+    fun start() {
+        accelerometer?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+    }
+
+    fun stop() {
+        sensorManager.unregisterListener(this)
+    }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        val (x, y, z) = event.values     // m/s²
+        val timestampNanos = event.timestamp
+        // Use the data
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) { /* ... */ }
+}
+```
+
+### Sampling rates
+
+| Rate                        | Approx interval | Use                            |
+|-----------------------------|-----------------|--------------------------------|
+| `SENSOR_DELAY_FASTEST`      | 0 ms            | Gaming, extreme motion tracking |
+| `SENSOR_DELAY_GAME`         | 20 ms           | Games, AR                       |
+| `SENSOR_DELAY_UI`           | 60 ms           | UI animations                   |
+| `SENSOR_DELAY_NORMAL`       | 200 ms          | General use                     |
+| Custom microseconds         | any             | Precise control                 |
+
+**Higher rate = more battery drain.** Use the slowest rate that still
+meets your needs.
+
+### Flow wrapper
+
+```kotlin
+fun SensorManager.events(type: Int, rate: Int = SensorManager.SENSOR_DELAY_NORMAL): Flow<SensorEvent> = callbackFlow {
+    val sensor = getDefaultSensor(type) ?: run {
+        close(IllegalStateException("Sensor $type not available")); return@callbackFlow
+    }
+
+    val listener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) { trySend(event) }
+        override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) {}
+    }
+
+    registerListener(listener, sensor, rate)
+    awaitClose { unregisterListener(listener) }
+}
+
+// Usage
+context.getSystemService(SensorManager::class.java)
+    .events(Sensor.TYPE_ACCELEROMETER, SensorManager.SENSOR_DELAY_GAME)
+    .sample(50)
+    .collect { event -> /* process */ }
+```
+
+### Sensor fusion — rotation matrix + orientation
+
+```kotlin
+class OrientationTracker(context: Context) {
+    private val sensorManager = context.getSystemService(SensorManager::class.java)
+    private val rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    private val matrix = FloatArray(9)
+    private val orientation = FloatArray(3)   // azimuth, pitch, roll
+
+    fun orientationFlow(): Flow<Orientation> = callbackFlow {
+        val listener = object : SensorEventListener {
+            override fun onSensorChanged(event: SensorEvent) {
+                SensorManager.getRotationMatrixFromVector(matrix, event.values)
+                SensorManager.getOrientation(matrix, orientation)
+                trySend(Orientation(
+                    azimuth = Math.toDegrees(orientation[0].toDouble()).toFloat(),
+                    pitch = Math.toDegrees(orientation[1].toDouble()).toFloat(),
+                    roll = Math.toDegrees(orientation[2].toDouble()).toFloat()
+                ))
+            }
+            override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) {}
+        }
+        sensorManager.registerListener(listener, rotationSensor, SensorManager.SENSOR_DELAY_UI)
+        awaitClose { sensorManager.unregisterListener(listener) }
+    }
+}
+
+data class Orientation(val azimuth: Float, val pitch: Float, val roll: Float)
+```
+
+`TYPE_ROTATION_VECTOR` is the **fused** sensor — already combines
+accel + gyro + magnetometer. Use it instead of reading raw sensors when
+you just need orientation.
+
+### Step counter (bucketed, battery-friendly)
+
+```kotlin
+val stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+
+sensorManager.registerListener(
+    object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            val totalStepsSinceBoot = event.values[0].toLong()
+            // Subtract the starting value to get session steps
+        }
+        override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) {}
+    },
+    stepSensor,
+    SensorManager.SENSOR_DELAY_NORMAL,
+    TimeUnit.MINUTES.toMicros(5).toInt()        // maxReportLatencyUs — batch every 5 min
+)
+```
+
+The **batch latency** parameter tells the system "I don't need events
+immediately; you can batch up to N microseconds worth." Saves huge
+amounts of battery for step counting, location, any polling-style sensor.
+
+Requires `ACTIVITY_RECOGNITION` permission on Android 10+:
+
+```xml
+<uses-permission android:name="android.permission.ACTIVITY_RECOGNITION"/>
+```
+
+### Sensor batching with foreground service
+
+For a fitness app, keep sampling during workouts via a foreground service
+with `foregroundServiceType="health"`:
+
+```kotlin
+@AndroidEntryPoint
+class WorkoutService : LifecycleService() {
+    @Inject lateinit var sensorManager: SensorManager
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        startForeground(NOTIF_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
+
+        lifecycleScope.launch {
+            sensorManager.events(Sensor.TYPE_HEART_RATE).collect { event ->
+                val bpm = event.values[0]
+                heartRateRepository.record(bpm, event.timestamp)
+            }
+        }
+        return START_STICKY
+    }
+}
+```
+
+### Doze and sensor sampling
+
+- App in Doze → most sensors deliver events, but at reduced rate.
+- Step counter has a special low-power path that works even in Doze.
+- Custom sensor sampling from a **background service** is severely
+  restricted since Android 8. Use WorkManager or a foreground service.
+
+---
+
+## Combining Camera + Sensors: AR use case
+
+```kotlin
+@Composable
+fun ArScreen() {
+    val context = LocalContext.current
+    var orientation by remember { mutableStateOf(Orientation(0f, 0f, 0f)) }
+
+    LaunchedEffect(Unit) {
+        OrientationTracker(context).orientationFlow().collect { orientation = it }
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        CameraPreview()
+        Canvas(Modifier.fillMaxSize()) {
+            // Rotate an overlay by orientation.azimuth
+            rotate(-orientation.azimuth, center) {
+                drawArrow()
+            }
+        }
+    }
+}
+```
+
+Camera preview + rotation vector = a compass-aligned AR overlay. For full
+AR (plane detection, depth), use **ARCore**.
+
+---
+
+## Battery checklist
+
+<StepList steps={[
+  { title: 'Pick the slowest sensor rate that works', description: 'Gaming (20ms) vs normal (200ms) is a 10× battery difference. Measure actual requirement.' },
+  { title: 'Use batch reporting', description: 'Pass maxReportLatencyUs for step counter and similar accumulators. System batches events, wakes up less often.' },
+  { title: 'Unregister on lifecycle events', description: 'Never leave listeners registered when the screen is off. Use lifecycle-aware collection (repeatOnLifecycle).' },
+  { title: 'Prefer fused sensors', description: 'TYPE_ROTATION_VECTOR runs on the dedicated sensor hub and costs less than manually fusing accel/gyro/mag.' },
+  { title: 'Measure with Battery Historian', description: 'For fitness apps, profile with Battery Historian to verify sensor usage doesn\'t drain > 10% per active hour.' }
+]} />
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Mistakes',
+    variant: 'old',
+    points: [
+      'Using Camera2 directly when CameraX fits',
+      'Forgetting imageProxy.close() in ImageAnalysis',
+      'SENSOR_DELAY_FASTEST for everything',
+      'Keeping sensors registered while screen is off',
+      'Manually fusing accel + gyro + mag',
+      'No foreground service for long-running sensor capture'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production patterns',
+    variant: 'new',
+    points: [
+      'CameraX use cases; Camera2 only for edge needs',
+      'Always close the ImageProxy in a finally/onComplete',
+      'SENSOR_DELAY_NORMAL as default; rate-down for polling',
+      'Lifecycle-aware registration via repeatOnLifecycle',
+      'TYPE_ROTATION_VECTOR for orientation',
+      'Foreground service + foregroundServiceType=health for workouts'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="CameraX & sensor rules">
+- **CameraX use cases**: Preview + ImageCapture + ImageAnalysis + VideoCapture. Bind to lifecycle.
+- **ImageAnalysis** requires `imageProxy.close()` — always.
+- **ML Kit + ImageAnalysis** is the idiomatic on-device CV pipeline.
+- **Sensors**: pick slowest usable rate; batch with `maxReportLatencyUs`.
+- **Fused sensors** (rotation vector, linear acceleration) beat manual fusion.
+- **Lifecycle-aware registration** — unregister when screen off.
+- **Foreground service + health / location type** for long-running sensor capture.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'CameraX capture', description: 'Build a Compose camera screen with Preview + ImageCapture. Save to MediaStore Pictures/MyApp. Show the thumbnail afterwards.' },
+  { title: 'Barcode scanner', description: 'Add ImageAnalysis + ML Kit barcode scanning to your camera screen. Highlight detected codes on an overlay Canvas.' },
+  { title: 'Orientation Flow', description: 'Create a SensorManager.events(TYPE_ROTATION_VECTOR) extension returning Flow<Orientation>. Bind to a compass UI.' },
+  { title: 'Battery-efficient steps', description: 'Register TYPE_STEP_COUNTER with a 5-minute batch latency. Verify the number increments in the background.' },
+  { title: 'Swap cameras', description: 'Add a button that flips between LENS_FACING_BACK and LENS_FACING_FRONT, preserving the current use cases.' }
+]} />
+
+## Next
+
+Return to **[Module 08 Overview](./overview)** or continue to
+**[Module 09 — Testing & Quality](/docs/testing-quality/overview)**.

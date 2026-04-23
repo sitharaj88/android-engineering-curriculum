@@ -1,0 +1,594 @@
+---
+id: files-and-media
+title: Files, MediaStore & Scoped Storage
+sidebar_label: Files & MediaStore
+description: Scoped storage on Android 10+, internal vs external, MediaStore API, Storage Access Framework, document providers, and picking the right location for every file.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Files, MediaStore & Scoped Storage
+
+Android 10 (API 29) overhauled storage: the old "just write anywhere on
+the SD card" model is gone. Apps now get **scoped access** — they can
+read/write their own sandbox freely, but accessing shared media or
+external files requires explicit APIs and user consent. This chapter
+covers every file-storage surface and the current best practices.
+
+## The five storage locations
+
+```text
+┌────────────────────────────────────────────────────────────────────┐
+│ 1. App-internal private                                            │
+│    context.filesDir / cacheDir / codeCacheDir                      │
+│    - Sandboxed to your app; deleted on uninstall                   │
+│    - No permissions required                                        │
+│                                                                    │
+│ 2. App-external private                                            │
+│    context.getExternalFilesDir() / externalCacheDir                │
+│    - Larger; user-accessible via file managers                     │
+│    - Deleted on uninstall                                           │
+│                                                                    │
+│ 3. MediaStore (shared media)                                       │
+│    Images, Video, Audio, Downloads                                 │
+│    - Survives uninstall                                             │
+│    - Owned by user; your app writes to it                          │
+│                                                                    │
+│ 4. Storage Access Framework (SAF)                                  │
+│    ACTION_OPEN_DOCUMENT, ACTION_CREATE_DOCUMENT                    │
+│    - Any location the user picks                                    │
+│    - Returns a content:// URI                                       │
+│                                                                    │
+│ 5. Downloads (MediaStore.Downloads)                                │
+│    Classic "Downloads" folder                                      │
+│    - Shared across apps                                             │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## App-internal storage
+
+### `filesDir` — persistent private data
+
+```kotlin
+suspend fun saveDraft(draft: Draft) = withContext(Dispatchers.IO) {
+    val file = File(context.filesDir, "drafts/${draft.id}.json")
+    file.parentFile?.mkdirs()
+    file.writeText(Json.encodeToString(draft))
+}
+
+suspend fun loadDraft(id: String): Draft? = withContext(Dispatchers.IO) {
+    val file = File(context.filesDir, "drafts/$id.json")
+    if (!file.exists()) return@withContext null
+    Json.decodeFromString(file.readText())
+}
+```
+
+Use for: drafts, user-generated config, downloaded assets you own.
+
+### `cacheDir` — ephemeral
+
+```kotlin
+val thumbnailFile = File(context.cacheDir, "thumbs/${url.hashCode()}.jpg")
+```
+
+The system evicts `cacheDir` under storage pressure. Use for thumbnails,
+HTTP response bodies, anything regeneratable.
+
+### `codeCacheDir` — compiled/generated code
+
+Rarely touched directly; used by JIT caches and some libraries.
+
+### Internal file paths vs MediaStore
+
+| Want...                                    | Use                                           |
+|--------------------------------------------|-----------------------------------------------|
+| App-only notes, drafts                     | `filesDir`                                    |
+| Regeneratable caches                       | `cacheDir`                                    |
+| Photos users can see in Gallery            | `MediaStore.Images`                           |
+| Videos                                     | `MediaStore.Video`                            |
+| Documents in user's Downloads              | `MediaStore.Downloads`                        |
+| Files user picks (OneDrive, etc.)          | Storage Access Framework                      |
+
+---
+
+## App-external storage (private)
+
+```kotlin
+val privateDir = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
+val file = File(privateDir, "export.pdf")
+```
+
+Same scoping as `filesDir` but on the "external" partition. Historically
+this meant the SD card; today it's usually just a different mount point.
+
+**No runtime permissions** required on any API level. Use when:
+- Files are large (videos the user can later copy elsewhere)
+- User should be able to access via a file manager without leaving your app
+
+---
+
+## Scoped Storage and MediaStore (Android 10+)
+
+Before Android 10, your app could read/write anywhere with
+`WRITE_EXTERNAL_STORAGE`. From Android 10 onward:
+
+- Your app can freely read/write **its own** media it created
+- Reading **other apps'** media requires `READ_MEDIA_IMAGES` (API 33+) or
+  `READ_EXTERNAL_STORAGE` (< API 33)
+- Writing arbitrary paths on external storage is not allowed for normal apps
+- Modifying other apps' media requires consent via `MediaStore.createWriteRequest()`
+
+### Manifest permissions
+
+```xml
+<!-- Android 13+ -->
+<uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+<uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+<uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
+
+<!-- Android 14+ (partial access) -->
+<uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED"/>
+
+<!-- Android 12 and below -->
+<uses-permission
+    android:name="android.permission.READ_EXTERNAL_STORAGE"
+    android:maxSdkVersion="32"/>
+```
+
+### Saving an image to the user's gallery
+
+```kotlin
+suspend fun saveImageToGallery(
+    context: Context,
+    bitmap: Bitmap,
+    displayName: String
+): Uri = withContext(Dispatchers.IO) {
+    val resolver = context.contentResolver
+
+    val values = ContentValues().apply {
+        put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/MyApp")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
+        }
+    }
+
+    val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+    } else {
+        MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+    }
+
+    val uri = resolver.insert(collection, values) ?: throw IOException("Could not create row")
+
+    resolver.openOutputStream(uri).use { output ->
+        output ?: throw IOException("Null output stream")
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 95, output)
+    }
+
+    // Mark the file as ready to show
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        values.clear()
+        values.put(MediaStore.Images.Media.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+    }
+
+    uri
+}
+```
+
+<Callout kind="tip" title="IS_PENDING prevents half-written files from showing up">
+While writing, `IS_PENDING = 1` hides the file from other apps. Clearing
+it atomically makes the file visible. Without this, the Photos app can
+scan and show corrupt thumbnails mid-write.
+</Callout>
+
+### Querying MediaStore
+
+```kotlin
+suspend fun recentImages(context: Context, limit: Int = 50): List<ImageRecord> = withContext(Dispatchers.IO) {
+    val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+    } else {
+        MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+    }
+
+    val projection = arrayOf(
+        MediaStore.Images.Media._ID,
+        MediaStore.Images.Media.DISPLAY_NAME,
+        MediaStore.Images.Media.DATE_ADDED,
+        MediaStore.Images.Media.SIZE
+    )
+
+    val sort = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+
+    val results = mutableListOf<ImageRecord>()
+    context.contentResolver.query(uri, projection, null, null, sort)?.use { cursor ->
+        val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+        val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+        val dateCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+        val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
+
+        while (cursor.moveToNext() && results.size < limit) {
+            val id = cursor.getLong(idCol)
+            val contentUri = ContentUris.withAppendedId(uri, id)
+            results += ImageRecord(
+                uri = contentUri,
+                name = cursor.getString(nameCol),
+                dateAddedMs = cursor.getLong(dateCol) * 1000L,
+                sizeBytes = cursor.getLong(sizeCol)
+            )
+        }
+    }
+    results
+}
+
+data class ImageRecord(val uri: Uri, val name: String, val dateAddedMs: Long, val sizeBytes: Long)
+```
+
+### Deleting user media (requires consent on Android 11+)
+
+```kotlin
+suspend fun deleteImage(context: Context, uri: Uri): IntentSender? = withContext(Dispatchers.IO) {
+    try {
+        context.contentResolver.delete(uri, null, null)
+        null
+    } catch (e: SecurityException) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val pending = MediaStore.createDeleteRequest(context.contentResolver, listOf(uri))
+            pending.intentSender
+        } else throw e
+    }
+}
+
+// Launch the IntentSender from a Composable
+val launcher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.StartIntentSenderForResult()
+) { result ->
+    if (result.resultCode == Activity.RESULT_OK) {
+        // deleted
+    }
+}
+
+val intentSender = deleteImage(context, uri)
+if (intentSender != null) launcher.launch(IntentSenderRequest.Builder(intentSender).build())
+```
+
+---
+
+## Photo Picker — the modern image chooser (Android 13+, backported)
+
+The new **Photo Picker** is the correct API to select images/videos from
+the user's gallery. It **doesn't require any storage permission**:
+
+```kotlin
+val pickMedia = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.PickVisualMedia()
+) { uri ->
+    if (uri != null) {
+        // Read-only URI granted for the picked item
+        context.contentResolver.openInputStream(uri)?.use { it.copyTo(outputStream) }
+    }
+}
+
+Button(onClick = {
+    pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+}) { Text("Pick image") }
+
+// Multiple items
+val pickMultiple = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 10)
+) { uris -> /* up to 10 URIs */ }
+```
+
+**Always prefer Photo Picker over `READ_MEDIA_IMAGES` for "let the user
+pick something."** No permission prompts, no leaked access to the whole
+gallery, and it's cross-version via the Play Services backport.
+
+---
+
+## Storage Access Framework (SAF)
+
+For arbitrary file picking (documents, spreadsheets, any MIME type), use
+SAF. It shows the system file picker across local files, cloud drives,
+and document providers (Google Drive, OneDrive, etc.).
+
+### Open a document
+
+```kotlin
+val openDocument = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.OpenDocument()
+) { uri ->
+    if (uri != null) {
+        // Persistent URI — need to persist the permission flag
+        context.contentResolver.takePersistableUriPermission(
+            uri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION
+        )
+        readDocument(uri)
+    }
+}
+
+Button(onClick = {
+    openDocument.launch(arrayOf("application/pdf", "application/json"))
+}) { Text("Open document") }
+```
+
+### Create a new document
+
+```kotlin
+val createDocument = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.CreateDocument("text/plain")
+) { uri ->
+    if (uri != null) {
+        context.contentResolver.openOutputStream(uri)?.use { it.write("Hello".toByteArray()) }
+    }
+}
+
+Button(onClick = { createDocument.launch("export-${System.currentTimeMillis()}.txt") }) {
+    Text("Save to...")
+}
+```
+
+### Open a tree (folder)
+
+```kotlin
+val openTree = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.OpenDocumentTree()
+) { treeUri ->
+    if (treeUri != null) {
+        context.contentResolver.takePersistableUriPermission(
+            treeUri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        )
+        val tree = DocumentFile.fromTreeUri(context, treeUri)
+        tree?.listFiles()?.forEach { file ->
+            println("${file.name} ${file.length()}")
+        }
+    }
+}
+```
+
+Folder picking is how document-editor apps let users "work in this folder"
+across sessions.
+
+---
+
+## Downloads — `MediaStore.Downloads`
+
+```kotlin
+suspend fun saveToDownloads(
+    context: Context,
+    content: ByteArray,
+    fileName: String,
+    mimeType: String = "application/pdf"
+): Uri = withContext(Dispatchers.IO) {
+    val resolver = context.contentResolver
+    val values = ContentValues().apply {
+        put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+        put(MediaStore.Downloads.MIME_TYPE, mimeType)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/MyApp")
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+    }
+
+    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        ?: throw IOException("Could not create Downloads row")
+
+    resolver.openOutputStream(uri).use { it?.write(content) }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        values.clear()
+        values.put(MediaStore.Downloads.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+    }
+    uri
+}
+```
+
+---
+
+## DownloadManager — system-managed background downloads
+
+```kotlin
+fun downloadViaSystem(context: Context, url: String, displayName: String) {
+    val request = DownloadManager.Request(Uri.parse(url))
+        .setTitle(displayName)
+        .setDescription("Downloading via MyApp")
+        .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, displayName)
+        .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+        .setAllowedOverMetered(true)
+        .setAllowedOverRoaming(false)
+
+    val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+    dm.enqueue(request)
+}
+```
+
+`DownloadManager` handles:
+- Foreground service to keep downloading in background
+- Retries with exponential backoff
+- Resume after network loss
+- System notification UI
+
+Limitations:
+- No progress callback (query status via cursor)
+- Less flexible than WorkManager + OkHttp for custom auth/headers
+
+For most app-driven downloads, **prefer WorkManager + OkHttp** (full
+control, custom notification); use `DownloadManager` when the user
+explicitly wanted a "download to their device" action.
+
+---
+
+## FileProvider — sharing files with other apps
+
+Never share a raw `file://` URI on Android 7+. Instead, expose your
+internal files via a `FileProvider`:
+
+```xml
+<!-- AndroidManifest.xml -->
+<provider
+    android:name="androidx.core.content.FileProvider"
+    android:authorities="${applicationId}.fileprovider"
+    android:exported="false"
+    android:grantUriPermissions="true">
+    <meta-data
+        android:name="android.support.FILE_PROVIDER_PATHS"
+        android:resource="@xml/file_paths"/>
+</provider>
+```
+
+```xml
+<!-- res/xml/file_paths.xml -->
+<paths>
+    <files-path name="documents" path="documents/"/>
+    <cache-path name="thumbs" path="thumbs/"/>
+    <external-files-path name="exports" path="exports/"/>
+</paths>
+```
+
+```kotlin
+fun shareDocument(context: Context, file: File) {
+    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "application/pdf"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(intent, "Share"))
+}
+```
+
+The `FLAG_GRANT_READ_URI_PERMISSION` gives the receiving app temporary
+read access to the specific file.
+
+---
+
+## URI vs File — modern code uses URIs
+
+Android 11+ has been tightening down on raw file paths. Aim for:
+
+| Have                          | Convert to                                           |
+|-------------------------------|------------------------------------------------------|
+| File in `filesDir`            | Keep `File` OR use `FileProvider` for sharing       |
+| File in external storage      | Use MediaStore URI from the start                    |
+| URI from Photo Picker / SAF   | Keep as URI; read via ContentResolver                |
+| DocumentFile (SAF tree)       | Keep as DocumentFile; treat like a File API         |
+
+```kotlin
+// Read bytes from any URI
+suspend fun readUriBytes(context: Context, uri: Uri): ByteArray = withContext(Dispatchers.IO) {
+    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        ?: throw IOException("Cannot open $uri")
+}
+
+// Write bytes to any URI
+suspend fun writeUriBytes(context: Context, uri: Uri, bytes: ByteArray) = withContext(Dispatchers.IO) {
+    context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+        ?: throw IOException("Cannot open $uri for writing")
+}
+
+// Query file info
+fun queryFileInfo(context: Context, uri: Uri): FileInfo? {
+    return context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+        if (!cursor.moveToFirst()) return@use null
+        val nameCol = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        val sizeCol = cursor.getColumnIndex(OpenableColumns.SIZE)
+        FileInfo(
+            name = cursor.getString(nameCol),
+            sizeBytes = cursor.getLong(sizeCol)
+        )
+    }
+}
+```
+
+---
+
+## `MANAGE_EXTERNAL_STORAGE` — don't use it
+
+On Android 11+, `MANAGE_EXTERNAL_STORAGE` grants full access to all files.
+Google restricts its use to **file manager / backup apps only** and will
+reject most apps requesting it in Play review.
+
+Use SAF, MediaStore, or scoped private directories — there's always a
+legitimate path.
+
+---
+
+## File vs DocumentFile — API cheat sheet
+
+| Operation                 | `File`                       | `DocumentFile` (SAF)                    |
+|---------------------------|------------------------------|-----------------------------------------|
+| Create                    | `file.createNewFile()`       | `parent.createFile(mime, name)`         |
+| Exists                    | `file.exists()`              | `docFile.exists()`                      |
+| List children             | `dir.listFiles()`            | `tree.listFiles()`                      |
+| Delete                    | `file.delete()`              | `docFile.delete()`                      |
+| Read                      | `file.inputStream()`         | `resolver.openInputStream(docFile.uri)` |
+| Rename                    | `file.renameTo(target)`      | `docFile.renameTo(newName)`             |
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Storage mistakes',
+    variant: 'old',
+    points: [
+      'Using Environment.getExternalStorageDirectory() on API 29+',
+      'READ_EXTERNAL_STORAGE when you only need to pick one image',
+      'Sharing raw file:// URIs (FileUriExposedException)',
+      'Requesting MANAGE_EXTERNAL_STORAGE without compelling use case',
+      'No IS_PENDING flag during MediaStore writes',
+      'Saving user media to app-private dir (lost on uninstall)'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Correct Android 11+ storage',
+    variant: 'new',
+    points: [
+      'Use context.getExternalFilesDir() or MediaStore',
+      'Photo Picker for "let user pick an image" — no permission',
+      'FileProvider for all sharing',
+      'Never request MANAGE_EXTERNAL_STORAGE',
+      'IS_PENDING = 1 during write, = 0 when done',
+      'Save user-shared media to MediaStore collections'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Storage rules">
+- **Internal (`filesDir`)** for private app data; **external private (`getExternalFilesDir`)** for larger data without permissions.
+- **MediaStore** for shared media (Images, Video, Audio, Downloads); use `IS_PENDING` to avoid half-written files.
+- **Photo Picker** is the modern gallery chooser — no permissions, works back to Android 4.4 via backport.
+- **SAF** for arbitrary file picking and user-chosen folders.
+- **FileProvider** for sharing `File`s with other apps; never raw `file://`.
+- **Avoid `MANAGE_EXTERNAL_STORAGE`** — Play review will reject most apps.
+- **URI-first** — model your code around `Uri` + `ContentResolver`, not `File` paths.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Save a photo to Gallery', description: 'Use MediaStore.Images to write a Bitmap with IS_PENDING. Verify it appears in the Photos app.' },
+  { title: 'Photo Picker integration', description: 'Add a "Pick image" button using ActivityResultContracts.PickVisualMedia. Remove READ_MEDIA_IMAGES permission from your manifest.' },
+  { title: 'SAF document picker', description: 'Let the user pick a .pdf. Use takePersistableUriPermission to read it again on the next app launch.' },
+  { title: 'FileProvider sharing', description: 'Generate a CSV in filesDir. Share it via an Intent using FileProvider — not a raw file:// URI.' },
+  { title: 'Audit your app', description: 'Find every File() constructor in your codebase. Classify each as needing FileProvider, MediaStore, SAF, or stays as File.' }
+]} />
+
+## Next
+
+Return to **[Module 05 Overview](./overview)** or continue to
+**[Module 06 — Networking & API](/docs/networking-api/overview)**.

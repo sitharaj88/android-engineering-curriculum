@@ -1,0 +1,578 @@
+---
+id: resources-localization
+title: Resources & Localization
+sidebar_label: Resources & i18n
+description: Resource qualifiers, strings.xml, plurals, ICU MessageFormat, dates and numbers, right-to-left (RTL), pseudo-localization, and translation workflow.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Resources & Localization
+
+Resources are Android's mechanism for adapting content to device
+configuration — locale, density, orientation, theme, API level. Done
+right, adding a new language is a text-file import; a new form factor is
+zero code. Done wrong, translations break, layouts clip, and users in
+RTL locales see garbage. This chapter covers the resource system end to
+end.
+
+## Resource qualifiers
+
+Every resource folder under `res/` can have qualifiers that narrow when
+it applies:
+
+```text
+res/
+├── values/                          default values
+├── values-night/                    dark mode
+├── values-es/                       Spanish
+├── values-hi/                       Hindi
+├── values-ar/                       Arabic
+├── values-sw600dp/                  tablet portrait
+├── values-w720dp/                   tablet landscape / large phone
+├── values-land/                     landscape
+├── values-v31/                      API 31+ (Android 12+)
+├── layout/
+├── layout-sw600dp/
+├── drawable/
+├── drawable-hdpi/ -mdpi/ -xhdpi/ -xxhdpi/ -xxxhdpi/
+├── drawable-v24/                    vector drawables that need API 24+ features
+├── mipmap-anydpi-v26/               adaptive launcher icons
+├── raw/                             raw files (fonts, JSON, audio)
+├── font/                            font resources
+└── xml/                             arbitrary XML
+```
+
+Qualifiers stack: `values-sw600dp-land-night/` applies on tablet,
+landscape, dark mode. Order matters in folder names — see the
+[resource qualifier precedence table](https://developer.android.com/guide/topics/resources/providing-resources).
+
+---
+
+## Strings
+
+### Basic strings
+
+```xml
+<!-- res/values/strings.xml -->
+<resources>
+    <string name="app_name">My App</string>
+    <string name="greeting">Hello, %1$s!</string>
+    <string name="items_selected">%1$d items selected</string>
+</resources>
+```
+
+### Accessing from code
+
+```kotlin
+val name = context.getString(R.string.greeting, user.name)
+
+// In Compose
+@Composable
+fun Greeting(user: User) {
+    Text(stringResource(R.string.greeting, user.name))
+}
+```
+
+### Format specifiers
+
+Use **numbered** specifiers (`%1$s`, `%2$d`) not unnumbered (`%s`) — some
+languages need to reorder arguments:
+
+```xml
+<!-- English -->
+<string name="duration">%1$d minutes and %2$d seconds</string>
+
+<!-- Japanese reorders -->
+<string name="duration">%2$d秒と%1$d分</string>
+```
+
+Without numbering, the reorder is impossible — translation breaks.
+
+### Plurals
+
+```xml
+<plurals name="item_count">
+    <item quantity="zero">No items</item>
+    <item quantity="one">1 item</item>
+    <item quantity="other">%d items</item>
+</plurals>
+```
+
+```kotlin
+val text = context.resources.getQuantityString(R.plurals.item_count, count, count)
+
+// Compose
+Text(pluralStringResource(R.plurals.item_count, count, count))
+```
+
+Different languages have different plural rules — Arabic has six forms
+(zero, one, two, few, many, other), Chinese has one (other). **Always
+use `<plurals>`** for countable nouns, never string concatenation.
+
+### ICU MessageFormat (Android 7+)
+
+For gendered or complex formatting, use ICU:
+
+```xml
+<string name="message_preview">
+    {gender, select,
+        female {She sent you a message}
+        male {He sent you a message}
+        other {They sent you a message}
+    }
+</string>
+```
+
+```kotlin
+val text = context.getString(
+    R.string.message_preview,
+    mapOf("gender" to user.gender)
+)
+```
+
+More powerful than Android's built-in format specifiers — handles gender,
+nested plurals, select variants.
+
+---
+
+## Dates, numbers, currency
+
+Use the **system locale**, not your custom formatters:
+
+```kotlin
+val locale = Locale.getDefault()
+
+// Dates (java.time since API 26)
+val formatter = DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM).withLocale(locale)
+val text = formatter.format(LocalDate.now())
+// en-US: "Jul 15, 2025"
+// de-DE: "15. Juli 2025"
+// ja-JP: "2025年7月15日"
+
+// Numbers
+val number = NumberFormat.getNumberInstance(locale).format(1_234_567.89)
+// en-US: "1,234,567.89"
+// de-DE: "1.234.567,89"
+// fr-FR: "1 234 567,89"
+
+// Currency
+val currency = NumberFormat.getCurrencyInstance(locale).apply {
+    currency = Currency.getInstance("USD")   // always specify — device locale might be EUR
+}.format(99.95)
+// en-US: "$99.95"
+// de-DE: "99,95 $"
+```
+
+Hardcoded formatting like `"$%.2f".format(price)` breaks for non-English
+locales.
+
+---
+
+## Dimensions and densities
+
+```xml
+<!-- res/values/dimens.xml -->
+<resources>
+    <dimen name="list_item_padding">16dp</dimen>
+    <dimen name="title_text_size">18sp</dimen>
+</resources>
+
+<!-- res/values-sw600dp/dimens.xml — overrides for tablets -->
+<resources>
+    <dimen name="list_item_padding">24dp</dimen>
+    <dimen name="title_text_size">22sp</dimen>
+</resources>
+```
+
+`dp` scales with density; `sp` scales with density AND font size setting.
+**Always use `sp` for text**, `dp` for everything else.
+
+In Compose:
+
+```kotlin
+val padding = dimensionResource(R.dimen.list_item_padding)
+
+Text(
+    text = "Title",
+    fontSize = with(LocalDensity.current) { dimensionResource(R.dimen.title_text_size).toSp() }
+)
+```
+
+---
+
+## Drawables
+
+### Vector drawables — scalable, tiny
+
+```xml
+<!-- res/drawable/ic_cart.xml -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24"
+    android:tint="?attr/colorControlNormal">
+    <path android:fillColor="@android:color/white"
+        android:pathData="M7,18c-1.1,0 -1.99,0.9 -1.99,2 ..."/>
+</vector>
+```
+
+Vectors replace 5+ PNG density buckets with one file. Use Android Studio's
+vector asset importer.
+
+### Tint and states
+
+```xml
+<!-- res/drawable/ic_favorite_state.xml -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_checked="true" android:drawable="@drawable/ic_favorite_filled"/>
+    <item android:drawable="@drawable/ic_favorite_outlined"/>
+</selector>
+```
+
+For Compose, do this with state directly — no selector XML needed.
+
+### Adaptive icons (API 26+)
+
+```xml
+<!-- res/mipmap-anydpi-v26/ic_launcher.xml -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background"/>
+    <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+    <monochrome android:drawable="@drawable/ic_launcher_monochrome"/>   <!-- for Material You themed icons -->
+</adaptive-icon>
+```
+
+The OS masks the icon into the device's icon shape (circle, squircle,
+etc.) — one icon, consistent across OEMs.
+
+---
+
+## Colors and themes
+
+```xml
+<!-- res/values/colors.xml — always define colors as resources -->
+<resources>
+    <color name="primary_green">#0F9D58</color>
+    <color name="on_primary">#FFFFFF</color>
+</resources>
+
+<!-- res/values/themes.xml -->
+<resources>
+    <style name="Theme.MyApp" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/primary_green</item>
+        <item name="colorOnPrimary">@color/on_primary</item>
+    </style>
+</resources>
+
+<!-- res/values-night/themes.xml — dark variants -->
+<resources>
+    <style name="Theme.MyApp" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/primary_green_dark</item>
+    </style>
+</resources>
+```
+
+In Compose you mostly use `MaterialTheme.colorScheme.*`, not these. But
+non-Compose screens and system UI (notification color, splash) still
+need theme attributes.
+
+---
+
+## Right-to-left (RTL)
+
+Arabic, Hebrew, Persian, Urdu all use RTL scripts. Android flips the UI
+automatically if you:
+
+### 1. Opt in
+
+```xml
+<!-- AndroidManifest.xml -->
+<application android:supportsRtl="true">
+```
+
+### 2. Use `start`/`end` everywhere, never `left`/`right`
+
+```xml
+<!-- XML -->
+<LinearLayout
+    android:paddingStart="16dp"
+    android:paddingEnd="8dp"
+    android:layout_marginStart="8dp"/>
+```
+
+```kotlin
+// Compose
+Modifier.padding(start = 16.dp, end = 8.dp)
+Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { /* ... */ }
+```
+
+### 3. Mirror directional icons
+
+```xml
+<!-- Arrow icons that have direction — mirror in RTL -->
+<vector android:autoMirrored="true" .../>
+```
+
+```kotlin
+// Compose — AutoMirrored variants
+Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = null)
+```
+
+### 4. Test with pseudo-localization or real RTL locale
+
+```bash
+adb shell settings put system locale ar-EG
+adb shell settings put system layout_direction 1     # force RTL
+```
+
+Or use `locale-qualified` resources:
+
+```xml
+<!-- res/values-ar/strings.xml -->
+<resources>
+    <string name="greeting">مرحبا، %1$s!</string>
+</resources>
+```
+
+Android flips layouts automatically — your job is to avoid hardcoding
+direction.
+
+---
+
+## Pseudo-localization
+
+Before translating, wrap strings with **pseudo-localization** to catch
+RTL and length bugs:
+
+```bash
+adb shell setprop persist.sys.locale en-XA
+adb shell stop; adb shell start
+```
+
+`en-XA` produces `[!!!Hëllø, Wörld !!!]` — readable but expanded ~30%.
+RTL variant is `ar-XB` — flipped text, forces layout to render right-
+to-left.
+
+Android Studio → Help → Edit Custom Properties → add `enable.pseudo.locales=true`
+if not already.
+
+### Compose preview
+
+```kotlin
+@Preview(locale = "ar", showBackground = true)
+@Preview(locale = "en-XA", showBackground = true)
+@Composable
+fun GreetingPreview() { /* ... */ }
+```
+
+Catches clipped layouts before any translation is written.
+
+---
+
+## Translation workflow
+
+Typical enterprise pipeline:
+
+```text
+1. Developer writes strings.xml with English (default locale)
+2. CI sends new strings to Translation Management System (TMS):
+   - Lokalise, Phrase, Crowdin, Smartling
+3. Translators produce strings-es.xml, strings-fr.xml, etc.
+4. TMS pushes back → your repo
+5. Lint verifies every string exists in every supported language
+```
+
+### Mark strings not translatable
+
+```xml
+<string name="app_version" translatable="false">1.2.3</string>
+```
+
+Prevents sending internal identifiers to translators.
+
+### `xliff:g` for placeholders
+
+```xml
+<string name="greeting">Hello, <xliff:g id="name" example="Aarav">%1$s</xliff:g>!</string>
+```
+
+Translators see the placeholder with example context — don't accidentally
+translate the `%1$s` itself.
+
+---
+
+## Config-qualified resources beyond strings
+
+### Layouts per orientation / size
+
+```text
+res/layout/fragment_detail.xml           phones, portrait
+res/layout-land/fragment_detail.xml      phones, landscape
+res/layout-sw600dp/fragment_detail.xml   tablets
+```
+
+In Compose, `WindowSizeClass` replaces layout qualifiers for most cases —
+see [Compose: Enterprise UX](/docs/enterprise-ux/overview).
+
+### Colors per API level
+
+```text
+res/values/colors.xml          pre-Android 12 fallback
+res/values-v31/colors.xml       dynamic colors (Android 12+)
+```
+
+### Animations per reduced-motion preference
+
+No direct qualifier — query at runtime:
+
+```kotlin
+val reduceMotion = Settings.Global.getFloat(
+    context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f
+) == 0f
+```
+
+Then adjust animation durations in Compose / XML.
+
+---
+
+## Raw resources and assets
+
+```text
+res/raw/         accessed via R.raw.*; compiled
+assets/          accessed via AssetManager; loose files, any nesting
+```
+
+```kotlin
+// Raw
+context.resources.openRawResource(R.raw.sample_video).use { /* ... */ }
+
+// Assets
+context.assets.open("models/classifier.tflite").use { /* ... */ }
+```
+
+Assets are typically for large files (ML models, video), fonts, HTML pages.
+
+---
+
+## Fonts
+
+### Resource fonts
+
+```xml
+<!-- res/font/inter.xml -->
+<font-family xmlns:android="http://schemas.android.com/apk/res/android">
+    <font android:fontStyle="normal" android:fontWeight="400" android:font="@font/inter_regular"/>
+    <font android:fontStyle="normal" android:fontWeight="500" android:font="@font/inter_medium"/>
+    <font android:fontStyle="normal" android:fontWeight="700" android:font="@font/inter_bold"/>
+</font-family>
+```
+
+### Downloadable fonts (recommended)
+
+Fonts fetched once per device via Play Services Fonts, shared across apps:
+
+```kotlin
+val provider = GoogleFont.Provider(
+    providerAuthority = "com.google.android.gms.fonts",
+    providerPackage = "com.google.android.gms",
+    certificates = R.array.com_google_android_gms_fonts_certs
+)
+val Inter = FontFamily(
+    Font(GoogleFont("Inter"), provider, weight = FontWeight.Normal),
+    Font(GoogleFont("Inter"), provider, weight = FontWeight.Medium),
+    Font(GoogleFont("Inter"), provider, weight = FontWeight.Bold)
+)
+```
+
+Saves APK size and benefits from shared caching.
+
+---
+
+## Locale selection (in-app language switch)
+
+Android 13+ supports per-app language:
+
+```xml
+<!-- res/xml/locales_config.xml -->
+<locale-config xmlns:android="http://schemas.android.com/apk/res/android">
+    <locale android:name="en"/>
+    <locale android:name="es"/>
+    <locale android:name="hi"/>
+    <locale android:name="ar"/>
+</locale-config>
+```
+
+```xml
+<!-- AndroidManifest.xml -->
+<application android:localeConfig="@xml/locales_config">
+```
+
+```kotlin
+// Change at runtime
+AppCompatDelegate.setApplicationLocales(LocaleListCompat.forLanguageTags("es"))
+```
+
+Android handles recreation, persistence, and system Settings exposure.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'i18n mistakes',
+    variant: 'old',
+    points: [
+      'Hardcoded strings in Kotlin / Compose',
+      'String concatenation for plurals',
+      'Unnumbered %s placeholders',
+      'left/right instead of start/end',
+      '"$%.2f".format(price) — breaks for EUR',
+      'No android:supportsRtl="true" in manifest'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production i18n',
+    variant: 'new',
+    points: [
+      'Every string in strings.xml',
+      'Plurals via <plurals> or ICU',
+      'Numbered %1$s, %2$d placeholders',
+      'start/end padding, Icons.AutoMirrored',
+      'NumberFormat.getCurrencyInstance(locale)',
+      'supportsRtl + test in en-XA / ar-XB'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Resources & i18n rules">
+- **Every user-visible string** lives in `strings.xml` — never hardcode.
+- **Plurals** via `<plurals>` — counts are locale-dependent.
+- **Numbered placeholders** (`%1$s`) so translators can reorder.
+- **RTL-safe**: `start/end`, `autoMirrored` icons, `supportsRtl=true`.
+- **Pseudo-localization** (`en-XA`, `ar-XB`) catches bugs before translation.
+- **`NumberFormat` / `DateTimeFormatter`** with device locale for numbers and dates.
+- **Downloadable fonts** save APK size; declare per-weight in `FontFamily`.
+- **Per-app locale** (Android 13+) with `locales_config.xml` for in-app language switching.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Audit for hardcoded strings', description: 'Run ./gradlew lintDebug. Fix every HardcodedText warning by moving strings to strings.xml.' },
+  { title: 'Add plurals', description: 'Replace a "1 item / 2 items" conditional with a <plurals> entry and getQuantityString.' },
+  { title: 'Test pseudo-localization', description: 'Switch device locale to en-XA. Walk through 5 screens and fix every clipped layout.' },
+  { title: 'RTL audit', description: 'Switch to ar-XB. Fix every left/right in padding, every non-AutoMirrored directional icon.' },
+  { title: 'Per-app language', description: 'Add locales_config.xml + AppCompatDelegate.setApplicationLocales. Add an in-app language picker.' }
+]} />
+
+## Next
+
+Return to **[Module 02 Overview](./overview)** or continue to
+**[Module 03 — Jetpack Compose](/docs/jetpack-compose/overview)**.

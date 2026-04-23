@@ -1,0 +1,527 @@
+---
+id: play-integrity
+title: Play Integrity API & App Check
+sidebar_label: Play Integrity
+description: Verify requests come from your real app on real devices — Play Integrity API, App Check, nonce verification, and anti-abuse patterns.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Play Integrity API & App Check
+
+The Play Integrity API (successor to SafetyNet) verifies three things on
+every critical request:
+
+1. **App integrity** — the APK signature matches what's on Play Store
+2. **Device integrity** — the device is genuine, not rooted, not
+   Frida-instrumented
+3. **Account integrity** — the Google account is licensed for the app
+
+Combined with **Firebase App Check** (which builds on Play Integrity),
+this stops scrapers, bots, modded APKs, and emulator abuse from talking
+to your backend.
+
+## The threat model
+
+Without integrity checks, an attacker can:
+
+- Extract your API keys from an APK and hit your endpoints from a script
+- Run your APK in an emulator with Frida to bypass client-side checks
+- Sign a modified APK (fake "premium" flag, removed ads, unlimited coins)
+- Use disposable Google accounts to exploit trial pricing
+
+Play Integrity makes these attacks significantly harder — not impossible,
+but economically uninteresting for most attackers.
+
+---
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+integrity = "1.4.0"
+
+integrity = { module = "com.google.android.play:integrity", version.ref = "integrity" }
+```
+
+### Cloud project linking
+
+1. Play Console → Setup → App Integrity → Play Integrity API
+2. Link a Google Cloud project
+3. Copy the **Cloud project number** — you'll pass it to the client SDK
+
+---
+
+## The classic API (expensive — use sparingly)
+
+Generates a one-time token per request. Use only for high-value
+operations (payment, account creation, unlock premium):
+
+```kotlin
+class ClassicIntegrityChecker @Inject constructor(
+    @ApplicationContext context: Context,
+    private val api: BackendApi
+) {
+    private val manager = IntegrityManagerFactory.create(context)
+
+    suspend fun verifyPayment(orderId: String, amount: Long): Result<Boolean> = runCatching {
+        val nonce = ByteArray(32).apply { SecureRandom().nextBytes(this) }
+            .let { Base64.encodeToString(it, Base64.URL_SAFE or Base64.NO_WRAP) }
+
+        val request = IntegrityTokenRequest.builder()
+            .setNonce(nonce)
+            .setCloudProjectNumber(CLOUD_PROJECT_NUMBER)
+            .build()
+
+        val token: String = manager.requestIntegrityToken(request).await().token()
+
+        // Send to backend — backend verifies with Google's API
+        api.verifyPayment(orderId = orderId, amount = amount, nonce = nonce, integrityToken = token)
+    }.map { true }
+}
+```
+
+**Cost**: Classic API charges per request. Reserve for &lt;1% of requests.
+
+---
+
+## The standard API (cheap — use everywhere)
+
+For routine requests (session validation, API calls), use the Standard
+API. It pre-warms tokens so calls are fast and cheap:
+
+```kotlin
+@Singleton
+class StandardIntegrityChecker @Inject constructor(
+    @ApplicationContext context: Context
+) {
+    private val manager = IntegrityManagerFactory.createStandard(context)
+    private var tokenProvider: StandardIntegrityTokenProvider? = null
+
+    suspend fun warmUp() {
+        val request = PrepareIntegrityTokenRequest.builder()
+            .setCloudProjectNumber(CLOUD_PROJECT_NUMBER)
+            .build()
+        tokenProvider = manager.prepareIntegrityToken(request).await()
+    }
+
+    suspend fun getToken(requestHash: String): String {
+        val provider = tokenProvider ?: run {
+            warmUp()
+            tokenProvider ?: error("Failed to prepare provider")
+        }
+
+        val request = StandardIntegrityTokenRequest.builder()
+            .setRequestHash(requestHash)         // bind this token to this specific request
+            .build()
+
+        return provider.request(request).await().token()
+    }
+}
+```
+
+```kotlin
+// Warm up on app start
+class IntegrityBootstrap @Inject constructor(
+    private val checker: StandardIntegrityChecker,
+    private val scope: CoroutineScope
+) {
+    fun install() {
+        scope.launch { runCatching { checker.warmUp() } }
+    }
+}
+```
+
+Standard API tokens are **shorter-lived** (5 min) and cheaper per
+request. Enough security for most cases; pair with Classic for
+high-value ops.
+
+---
+
+## Request hash — binding tokens to requests
+
+The `requestHash` ties a token to the specific request payload — an
+attacker can't capture a token and reuse it:
+
+```kotlin
+// Client
+val payload = mapOf("userId" to userId, "amount" to amount)
+val requestHash = sha256(json.encodeToString(payload))
+val token = checker.getToken(requestHash)
+
+val response = api.submitTransaction(
+    payload = payload,
+    integrityToken = token,
+    requestHash = requestHash
+)
+```
+
+```javascript
+// Backend — verify the token AND that the hash matches our recomputed hash
+const decoded = await playDeveloperApi.playintegrityv1.integrity.decode({
+  auth,
+  packageName: 'com.myapp',
+  integrityToken: token
+});
+
+if (decoded.data.requestDetails.requestHash !== recomputedHash) {
+  return res.status(401).send('Invalid request hash');
+}
+
+// Now check integrity fields
+if (decoded.data.appIntegrity.appRecognitionVerdict !== 'PLAY_RECOGNIZED') {
+  return res.status(401).send('Not a Play-signed app');
+}
+if (decoded.data.deviceIntegrity.deviceRecognitionVerdict.length === 0) {
+  return res.status(401).send('Device integrity failed');
+}
+```
+
+---
+
+## Backend verification — the critical step
+
+**Never decode the token on the client.** Always verify on the server:
+
+```javascript
+const {google} = require('googleapis');
+const playintegrity = google.playintegrity({version: 'v1'});
+
+async function verifyIntegrityToken(token, expectedRequestHash) {
+  const auth = new google.auth.JWT({
+    keyFile: 'service-account.json',
+    scopes: ['https://www.googleapis.com/auth/playintegrity']
+  });
+  await auth.authorize();
+
+  const response = await playintegrity.v1.decodeIntegrityToken({
+    auth,
+    packageName: 'com.myapp',
+    requestBody: { integrityToken: token }
+  });
+
+  const payload = response.data.tokenPayloadExternal;
+
+  // Validate every field
+  const appOk = payload.appIntegrity.appRecognitionVerdict === 'PLAY_RECOGNIZED';
+  const deviceOk = payload.deviceIntegrity.deviceRecognitionVerdict.includes('MEETS_DEVICE_INTEGRITY');
+  const accountOk = payload.accountDetails.appLicensingVerdict === 'LICENSED';
+  const hashOk = payload.requestDetails.requestHash === expectedRequestHash;
+  const appId = payload.requestDetails.requestPackageName === 'com.myapp';
+
+  return appOk && deviceOk && accountOk && hashOk && appId;
+}
+```
+
+### Integrity verdicts
+
+| Field                            | Values                                             |
+|----------------------------------|----------------------------------------------------|
+| `appRecognitionVerdict`          | `PLAY_RECOGNIZED`, `UNRECOGNIZED_VERSION`, `UNEVALUATED` |
+| `deviceRecognitionVerdict`       | `MEETS_DEVICE_INTEGRITY`, `MEETS_BASIC_INTEGRITY`, `MEETS_STRONG_INTEGRITY`, `MEETS_VIRTUAL_INTEGRITY` (emulator) |
+| `appLicensingVerdict`            | `LICENSED`, `UNLICENSED`, `UNEVALUATED`            |
+
+### Recommended policy
+
+```javascript
+function isAllowed(payload, requestType) {
+  const device = payload.deviceIntegrity.deviceRecognitionVerdict;
+  const app = payload.appIntegrity.appRecognitionVerdict;
+
+  // High-value: require strong integrity
+  if (requestType === 'payment' || requestType === 'account_creation') {
+    return device.includes('MEETS_STRONG_INTEGRITY') && app === 'PLAY_RECOGNIZED';
+  }
+
+  // Medium-value: basic integrity OK
+  if (requestType === 'premium_feature') {
+    return device.includes('MEETS_DEVICE_INTEGRITY') && app === 'PLAY_RECOGNIZED';
+  }
+
+  // Low-value: allow emulator (for dev / testing)
+  return device.length > 0;
+}
+```
+
+---
+
+## Decision modes
+
+```kotlin
+.setCloudProjectNumber(CLOUD_PROJECT_NUMBER)
+.setRequestMode(StandardIntegrityTokenRequest.RequestMode.ON_DEMAND)
+// or
+.setRequestMode(StandardIntegrityTokenRequest.RequestMode.AUTOMATIC)
+```
+
+Most apps use **on-demand**. Automatic mode reduces latency but increases
+resource use.
+
+---
+
+## Firebase App Check — the easier path
+
+App Check is a **higher-level wrapper** around Play Integrity (plus debug
+provider support). It handles:
+- Token caching / refresh
+- Automatic attachment to Firebase requests (Firestore, Storage, Auth)
+- Debug tokens for dev builds
+
+### Setup
+
+```kotlin
+// libs.versions.toml
+firebase-appcheck = { module = "com.google.firebase:firebase-appcheck" }
+firebase-appcheck-playintegrity = { module = "com.google.firebase:firebase-appcheck-playintegrity" }
+firebase-appcheck-debug = { module = "com.google.firebase:firebase-appcheck-debug" }
+```
+
+```kotlin
+class AppCheckInitializer @Inject constructor() {
+    fun install() {
+        val provider = if (BuildConfig.DEBUG) {
+            DebugAppCheckProviderFactory.getInstance()
+        } else {
+            PlayIntegrityAppCheckProviderFactory.getInstance()
+        }
+        Firebase.appCheck.installAppCheckProviderFactory(provider)
+    }
+}
+```
+
+### Protecting Firebase services
+
+1. Firebase Console → App Check → Firestore (or Storage, Functions, etc.)
+2. **Monitor** mode — see traffic with/without App Check tokens
+3. After a week: **Enforce** — reject requests without tokens
+
+### Custom backend integration
+
+```kotlin
+class AppCheckInterceptor @Inject constructor() : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val token = try {
+            runBlocking { Firebase.appCheck.getAppCheckToken(false).await().token }
+        } catch (e: Exception) { null }
+
+        val request = if (token != null) {
+            chain.request().newBuilder()
+                .header("X-Firebase-AppCheck", token)
+                .build()
+        } else chain.request()
+
+        return chain.proceed(request)
+    }
+}
+```
+
+```javascript
+// Backend
+const {getAppCheck} = require('firebase-admin/app-check');
+
+app.use(async (req, res, next) => {
+  const token = req.header('X-Firebase-AppCheck');
+  if (!token) return res.status(401).send('Missing App Check token');
+
+  try {
+    await getAppCheck().verifyToken(token);
+    next();
+  } catch (e) {
+    res.status(401).send('Invalid App Check token');
+  }
+});
+```
+
+### Debug tokens
+
+In debug builds, `DebugAppCheckProviderFactory` generates a random UUID
+token. Logcat prints it:
+
+```
+D/com.google.firebase.appcheck: Enter this debug secret into the allow list...
+```
+
+Add the UUID to Firebase Console → App Check → Manage debug tokens. Now
+your debug build's tokens are accepted as if they were Play Integrity
+tokens.
+
+**Never commit debug tokens to git.** Each developer adds their own via
+the console.
+
+### Limited-use tokens
+
+For single-use operations (payment, account deletion), use limited-use
+tokens — your backend marks each token as consumed:
+
+```kotlin
+suspend fun deleteAccount() {
+    val token = Firebase.appCheck.getLimitedUseAppCheckToken().await().token
+    api.deleteAccount(authToken = token)
+}
+```
+
+```javascript
+// Backend — reject if token is replayed
+if (await tokenStore.isUsed(token)) return res.status(401).send('Replay detected');
+await getAppCheck().verifyToken(token);
+await tokenStore.markUsed(token);
+// ... perform account deletion
+```
+
+---
+
+## Integration with OkHttp + Retrofit
+
+```kotlin
+@Module
+@InstallIn(SingletonComponent::class)
+object NetworkModule {
+
+    @Provides @Singleton
+    fun provideOkHttp(
+        integrityChecker: StandardIntegrityChecker,
+        authInterceptor: AuthInterceptor
+    ): OkHttpClient = OkHttpClient.Builder()
+        .addInterceptor(authInterceptor)
+        .addInterceptor(IntegrityInterceptor(integrityChecker))
+        .build()
+}
+
+class IntegrityInterceptor(
+    private val checker: StandardIntegrityChecker
+) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val req = chain.request()
+
+        // Only attach for protected endpoints
+        if (req.tag(Protected::class.java) == null) {
+            return chain.proceed(req)
+        }
+
+        val hash = sha256(req.body?.contentToString() ?: req.url.toString())
+        val token = runBlocking { checker.getToken(hash) }
+
+        val enhanced = req.newBuilder()
+            .header("X-Integrity-Token", token)
+            .header("X-Integrity-Hash", hash)
+            .build()
+
+        return chain.proceed(enhanced)
+    }
+}
+
+annotation class Protected
+```
+
+Retrofit methods opt in with a custom tag or annotation.
+
+---
+
+## Handling rooted / emulator users
+
+<Callout kind="warning" title="Don't hard-block — degrade gracefully">
+Rooted devices and emulators sometimes belong to legitimate users
+(developers, power users, accessibility testers). Rather than blocking
+outright:
+
+- **Classic integrity failure** → block high-value actions (payment), allow browsing
+- **Emulator verdict** → allow in dev / staging, restrict sensitive prod operations
+- **Outdated / modified app** → force update via in-app update API
+</Callout>
+
+---
+
+## Offline / transient failures
+
+Integrity calls require network. Have a fallback:
+
+```kotlin
+suspend fun getTokenWithFallback(hash: String): String? = try {
+    checker.getToken(hash)
+} catch (e: NetworkErrorException) {
+    null
+} catch (e: IntegrityServiceException) {
+    // Service temporarily unavailable
+    null
+}
+
+// Backend accepts missing tokens from queued-offline writes under strict rate limits
+```
+
+---
+
+## Cost management
+
+Play Integrity pricing (as of 2025):
+- **Standard API**: free up to ~10,000 requests/day; paid beyond
+- **Classic API**: much higher per-request cost
+
+Strategies:
+- **Use Standard API** for routine validation
+- **Use Classic API only** for payments, account creation, premium unlocks
+- **Token caching**: a fresh token lasts 5 minutes; don't re-request per API call
+- **Server-side throttling**: rate-limit tokens per user to prevent abuse
+- **App Check enforcement**: lets Firebase validate automatically — no extra cost
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Integrity mistakes',
+    variant: 'old',
+    points: [
+      'Verifying integrity tokens on the client (pointless)',
+      'Using Classic API for every request (expensive)',
+      'No request hash (tokens are replayable)',
+      'Hard-blocking rooted users (bad UX for devs)',
+      'No debug provider for dev builds',
+      'Trusting UNEVALUATED verdicts as "OK"'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Modern integrity',
+    variant: 'new',
+    points: [
+      'Server-side verification via Google API',
+      'Standard API for routine; Classic for high-value',
+      'requestHash bound to request payload',
+      'Graceful degradation on rooted / emulator devices',
+      'Debug provider with Firebase Console allow-list',
+      'Treat UNEVALUATED as deny (explicit evidence required)'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Play Integrity rules">
+- **App + Device + Account integrity** — verify all three on high-value requests.
+- **Standard API** for 99% of traffic (cheap, fast); **Classic API** for payments / critical ops.
+- **Request hash** binds a token to the request — prevents replay.
+- **Server-side verification** via Google Play Developer API — never decode on the client.
+- **Firebase App Check** is the easier wrapper; use it if you're on Firebase.
+- **Debug provider + UUID allow-list** for dev builds; never commit tokens.
+- **Limited-use tokens** for single-use sensitive actions.
+- Treat unknown verdicts as denial; fail closed, not open.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Standard API integration', description: 'Wire up StandardIntegrityChecker. Warm it up on app start. Attach a token header to one API request.' },
+  { title: 'Server verification', description: 'Build a backend endpoint that decodes the token via Google\'s API and validates every verdict field. Reject UNEVALUATED.' },
+  { title: 'Request hash', description: 'Compute SHA-256 of the request body + URL. Include the hash in the token request and verify it matches on the backend.' },
+  { title: 'App Check + Firestore', description: 'Install PlayIntegrityAppCheckProviderFactory. Enforce App Check on one Firestore collection. Verify the app still works; run a curl hit and verify it\'s rejected.' },
+  { title: 'Limited-use token', description: 'For delete-account, use getLimitedUseAppCheckToken. Backend verifies + marks as consumed to prevent replay.' }
+]} />
+
+## Next
+
+Return to **[Module 16 Overview](./overview)** or continue to
+**[Module 17 — CI/CD & DevOps](/docs/cicd-devops/overview)**.

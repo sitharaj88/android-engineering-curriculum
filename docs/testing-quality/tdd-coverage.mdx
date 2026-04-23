@@ -1,0 +1,594 @@
+---
+id: tdd-coverage
+title: TDD & Code Coverage
+sidebar_label: TDD & Coverage
+description: Test-Driven Development in practice — Red/Green/Refactor, when TDD pays off, coverage with Kover, mutation testing with PIT, and static analysis as a quality net.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# TDD & Code Coverage
+
+Tests without a methodology become an after-the-fact chore. TDD flips the
+order — write the failing test first, make it pass, refactor. When used
+on the right problems (non-trivial logic, parsers, state machines, math),
+TDD produces code that is both correct and cleanly designed. This chapter
+covers the methodology, coverage metrics, and the quality gates that
+enforce them.
+
+## Red / Green / Refactor — the loop
+
+```text
+  ┌────────────────────────────────────────────────────┐
+  │  RED                                                │
+  │  Write ONE failing test that describes a small     │
+  │  piece of desired behavior.                         │
+  └────────────────────────────────────────────────────┘
+                       ↓
+  ┌────────────────────────────────────────────────────┐
+  │  GREEN                                              │
+  │  Write the MINIMUM production code to make it       │
+  │  pass. Resist the urge to generalize yet.           │
+  └────────────────────────────────────────────────────┘
+                       ↓
+  ┌────────────────────────────────────────────────────┐
+  │  REFACTOR                                           │
+  │  Clean up both the production code AND the test.    │
+  │  Extract, rename, remove duplication. Tests still   │
+  │  green.                                             │
+  └────────────────────────────────────────────────────┘
+                       ↓
+                    REPEAT
+```
+
+The goal isn't "write tests first." The goal is **short feedback loops**
+and **only-what-you-need** code. Each cycle should take **1-5 minutes**.
+
+---
+
+## A TDD example — email validator
+
+### Iteration 1
+
+**RED**:
+
+```kotlin
+class EmailValidatorTest {
+    @Test fun `rejects blank`() {
+        assertIs<Outcome.Err<EmailError>>(Email.parse(""))
+    }
+}
+```
+
+Test fails: `Email` doesn't exist.
+
+**GREEN**:
+
+```kotlin
+@JvmInline
+value class Email(val raw: String) {
+    companion object {
+        fun parse(raw: String): Outcome<Email, EmailError> =
+            if (raw.isBlank()) Outcome.Err(EmailError.Blank) else Outcome.Ok(Email(raw))
+    }
+}
+
+sealed interface EmailError {
+    data object Blank : EmailError
+}
+```
+
+Test passes.
+
+### Iteration 2
+
+**RED**:
+
+```kotlin
+@Test fun `rejects missing at sign`() {
+    assertEquals(EmailError.InvalidFormat, (Email.parse("noatsign.com") as Outcome.Err).error)
+}
+```
+
+Fails — we don't check format yet.
+
+**GREEN**:
+
+```kotlin
+fun parse(raw: String): Outcome<Email, EmailError> = when {
+    raw.isBlank() -> Outcome.Err(EmailError.Blank)
+    !raw.contains("@") -> Outcome.Err(EmailError.InvalidFormat)
+    else -> Outcome.Ok(Email(raw))
+}
+
+sealed interface EmailError {
+    data object Blank : EmailError
+    data object InvalidFormat : EmailError
+}
+```
+
+### Iteration 3
+
+**RED**:
+
+```kotlin
+@Test fun `rejects missing dot in domain`() {
+    assertEquals(EmailError.InvalidFormat, (Email.parse("a@nodot") as Outcome.Err).error)
+}
+```
+
+Fails — "nodot" has @ but no dot.
+
+**GREEN**:
+
+```kotlin
+fun parse(raw: String): Outcome<Email, EmailError> {
+    if (raw.isBlank()) return Outcome.Err(EmailError.Blank)
+    if (!raw.matches(REGEX)) return Outcome.Err(EmailError.InvalidFormat)
+    return Outcome.Ok(Email(raw))
+}
+
+private val REGEX = Regex("""^[^@\s]+@[^@\s]+\.[^@\s]+$""")
+```
+
+### REFACTOR
+
+```kotlin
+@JvmInline
+value class Email private constructor(val raw: String) {
+    companion object {
+        private val REGEX = Regex("""^[^@\s]+@[^@\s]+\.[^@\s]+$""")
+
+        fun parse(raw: String): Outcome<Email, EmailError> {
+            val trimmed = raw.trim().lowercase()
+            return when {
+                trimmed.isBlank() -> Outcome.Err(EmailError.Blank)
+                !trimmed.matches(REGEX) -> Outcome.Err(EmailError.InvalidFormat)
+                else -> Outcome.Ok(Email(trimmed))
+            }
+        }
+    }
+}
+
+sealed interface EmailError {
+    data object Blank : EmailError
+    data object InvalidFormat : EmailError
+}
+```
+
+Tests stay green. Production code got clearer. Every line exists because
+a test demanded it — no speculative complexity.
+
+---
+
+## When TDD pays off
+
+<ComparisonCard
+  left={{
+    label: 'Great for TDD',
+    title: 'Where it shines',
+    variant: 'new',
+    points: [
+      'Parsers, validators, formatters',
+      'State machines (reducers, MVI)',
+      'Mappers (DTO ↔ Entity ↔ Domain)',
+      'Business rules with many cases',
+      'Algorithm implementations',
+      'Bug fixes (write failing test first, then fix)'
+    ]
+  }}
+  right={{
+    label: 'Less useful for TDD',
+    title: 'When to skip',
+    variant: 'old',
+    points: [
+      'Spike / proof of concept code',
+      'UI polish (visual tweaks)',
+      'Thin CRUD wrappers with no logic',
+      'Third-party library integration (test the integration, not the library)',
+      'Code that\'s going to be thrown away',
+      'Emergency hotfix on a broken branch'
+    ]
+  }}
+/>
+
+---
+
+## TDD with ViewModels
+
+ViewModels fit TDD perfectly — they're pure state transitions. Start
+with the failing test, add production code, iterate.
+
+```kotlin
+@ExtendWith(MainDispatcherRule::class)
+class LoginViewModelTest {
+
+    private val authRepo = FakeAuthRepository()
+    private val vm = LoginViewModel(authRepo)
+
+    @Test fun `initial state is empty`() = runTest {
+        vm.state.test {
+            val state = awaitItem()
+            assertEquals("", state.email)
+            assertEquals("", state.password)
+            assertFalse(state.canSubmit)
+        }
+    }
+
+    @Test fun `canSubmit becomes true when both filled`() = runTest {
+        vm.state.test {
+            awaitItem()
+            vm.onEmailChanged("a@x.com")
+            awaitItem()
+            vm.onPasswordChanged("secret123")
+            val final = awaitItem()
+            assertTrue(final.canSubmit)
+        }
+    }
+
+    @Test fun `submit success navigates home`() = runTest {
+        vm.onEmailChanged("a@x.com")
+        vm.onPasswordChanged("secret123")
+
+        vm.events.test {
+            vm.onSubmit()
+            assertEquals(NavigateHome, awaitItem())
+        }
+    }
+
+    @Test fun `submit wrong password shows error`() = runTest {
+        authRepo.failNext = AuthError.WrongPassword
+
+        vm.onEmailChanged("a@x.com")
+        vm.onPasswordChanged("wrong")
+
+        vm.state.test {
+            skipItems(3)             // initial + email + password
+            vm.onSubmit()
+            skipItems(1)             // submitting
+            val final = awaitItem()
+            assertEquals("Wrong password", final.error)
+        }
+    }
+}
+```
+
+One test per transition. The VM grows feature-by-feature as tests
+demand.
+
+---
+
+## Code coverage with Kover
+
+Kover is Kotlin-aware (handles inline classes, coroutines, sealed types)
+and lives in `org.jetbrains.kotlinx.kover`:
+
+```kotlin
+// build.gradle.kts (module or root)
+plugins {
+    id("org.jetbrains.kotlinx.kover") version "0.9.0"
+}
+
+kover {
+    reports {
+        filters {
+            excludes {
+                classes(
+                    "*Hilt_*", "*_Factory*", "*_MembersInjector",
+                    "*.databinding.*", "*.di.*Module*",
+                    "*.ComposableSingletons*"                    // generated Compose artifacts
+                )
+                packages("*.generated.*")
+                annotatedBy("androidx.compose.runtime.Composable")
+            }
+        }
+
+        verify {
+            rule("Project-wide minimum") {
+                minBound(60)
+            }
+            rule("Domain layer stricter") {
+                filters { includes { classes("*.domain.*") } }
+                minBound(85)
+            }
+            rule("Data layer stricter") {
+                filters { includes { classes("*.data.*") } }
+                minBound(80)
+            }
+        }
+    }
+}
+```
+
+```bash
+./gradlew koverHtmlReport       # HTML at build/reports/kover/html
+./gradlew koverXmlReport        # for CI integrations
+./gradlew koverVerify           # fails if below thresholds
+```
+
+### Reading a coverage report
+
+| Metric | Means | What it tells you |
+|--------|-------|-------------------|
+| Line | % of lines executed | Surface-level coverage |
+| Branch | % of if/when/try branches taken | How thoroughly logic is exercised |
+| Instruction | % of bytecode instructions | Most granular; hardest to push to 100% |
+
+**Target**: 80%+ line coverage on domain, 70%+ on data, lower for UI
+(you can't really unit-test Compose without a deeper strategy — see
+Paparazzi/Roborazzi).
+
+---
+
+## Coverage is a diagnostic, not a goal
+
+<Callout kind="danger" title="100% coverage trap">
+Optimizing for 100% forces nonsense tests:
+
+```kotlin
+@Test fun `getter returns field`() {
+    val user = User("u1", "Aarav")
+    assertEquals("u1", user.id)                // not testing behavior
+}
+```
+
+These tests add noise, don't catch bugs, and couple tests to trivial
+implementation. Aim for high coverage **where it matters** (business
+logic), accept lower elsewhere.
+</Callout>
+
+### What coverage CAN'T tell you
+
+Coverage measures **execution**, not **assertion quality**. A test that
+runs 50 lines but asserts nothing still "covers" those 50 lines. Line
+coverage doesn't know:
+- You asserted the wrong thing
+- You only covered the happy path
+- Your test accidentally always passes
+
+For deeper guarantees, use mutation testing.
+
+---
+
+## Mutation testing — coverage that matters
+
+**Mutation testing** verifies that your tests would actually fail if
+someone introduced a bug. A tool like **PIT** (pitest) systematically
+modifies your code (`+` → `-`, `>` → `>=`, `return true` → `return false`)
+and checks whether any test fails. A mutant that survives = a bug your
+tests wouldn't catch.
+
+```kotlin
+// build.gradle.kts
+plugins {
+    id("info.solidsoft.pitest") version "1.15.0"
+}
+
+pitest {
+    targetClasses.set(listOf("com.myapp.domain.*"))
+    excludedClasses.set(listOf("*Test*"))
+    threads.set(4)
+    outputFormats.set(listOf("XML", "HTML"))
+    timestampedReports.set(false)
+    junit5PluginVersion.set("1.2.1")
+}
+```
+
+```bash
+./gradlew pitest
+```
+
+Output: a report listing mutants killed (good) vs survived (bad). Aim for
+**75-85% mutation coverage** on core logic — higher than line coverage
+target because mutation is stricter.
+
+Mutation testing is slow. Run it weekly or on release branches, not on
+every commit.
+
+---
+
+## Static analysis — the complementary net
+
+Tests catch behavioral bugs. Static analysis catches **classes of bugs**
+across the whole codebase:
+
+### Detekt — Kotlin code smell detector
+
+```kotlin
+// build.gradle.kts
+plugins {
+    id("io.gitlab.arturbosch.detekt") version "1.23.7"
+}
+
+detekt {
+    config.setFrom("$rootDir/detekt-config.yml")
+    buildUponDefaultConfig = true
+    autoCorrect = true
+}
+```
+
+```yaml
+# detekt-config.yml — excerpts
+complexity:
+  LongMethod:
+    threshold: 60
+  CyclomaticComplexMethod:
+    threshold: 15
+  LongParameterList:
+    functionThreshold: 6
+    constructorThreshold: 7
+
+style:
+  MaxLineLength:
+    maxLineLength: 120
+  MagicNumber:
+    ignoreNumbers: ['-1', '0', '1', '2', '100', '1000']
+  ReturnCount:
+    max: 3
+
+performance:
+  SpreadOperator:
+    active: true
+```
+
+Detekt flags:
+- Methods over N lines
+- Complex `when`/`if` chains
+- Magic numbers
+- Swallowed exceptions
+- Unused parameters
+- Many Kotlin-specific smells
+
+### Android Lint — Android platform checks
+
+Ships with AGP. Catches:
+- Deprecated API usage
+- Missing permissions
+- Layout issues
+- Resource problems
+- Accessibility issues
+
+```kotlin
+android {
+    lint {
+        warningsAsErrors = true
+        abortOnError = true
+        disable += listOf("IconMissingDensityFolder")    // selectively
+        baseline = file("lint-baseline.xml")             // grandfather existing issues
+    }
+}
+```
+
+Create a baseline:
+
+```bash
+./gradlew lintDebug
+# inspect app/build/reports/lint-results-debug.html
+./gradlew updateLintBaseline                             # accept current state
+```
+
+### ktlint / Spotless — formatting
+
+```kotlin
+plugins {
+    id("com.diffplug.spotless") version "6.25.0"
+}
+
+spotless {
+    kotlin {
+        target("**/*.kt")
+        ktlint("1.3.1")
+        endWithNewline()
+        trimTrailingWhitespace()
+    }
+    kotlinGradle {
+        target("**/*.gradle.kts")
+        ktlint("1.3.1")
+    }
+}
+```
+
+```bash
+./gradlew spotlessCheck           # CI check
+./gradlew spotlessApply           # auto-fix locally
+```
+
+### Konsist — architectural tests
+
+Covered in [Module 15 — Modularization](/docs/modularization/overview).
+Enforce rules like "features never import other features" at compile
+time.
+
+---
+
+## Quality gate — CI pipeline
+
+A production quality gate runs all of these on every PR:
+
+```yaml
+# .github/workflows/pr.yml
+- name: Spotless
+  run: ./gradlew spotlessCheck
+
+- name: Detekt
+  run: ./gradlew detekt
+
+- name: Lint
+  run: ./gradlew lint
+
+- name: Konsist architecture tests
+  run: ./gradlew :core:testing:test --tests '*ArchitectureTest'
+
+- name: Unit tests
+  run: ./gradlew testDebugUnitTest
+
+- name: Coverage verify
+  run: ./gradlew koverVerify
+
+- name: Instrumentation tests
+  run: ./gradlew connectedDebugAndroidTest
+```
+
+Fail the build on any violation — no optional-green gates.
+
+---
+
+## Common TDD pitfalls
+
+<ComparisonCard
+  left={{
+    label: 'TDD anti-patterns',
+    title: 'What goes wrong',
+    variant: 'old',
+    points: [
+      'Writing 10 tests before any production code',
+      'Over-specified tests (assert implementation details)',
+      'TDDing UI polish / CSS equivalents',
+      'Shared mocks that tests all depend on',
+      'Testing getters / auto-generated data class methods',
+      'Skipping Refactor — tests green = done'
+    ]
+  }}
+  right={{
+    label: 'Good TDD',
+    title: 'Productive practice',
+    variant: 'new',
+    points: [
+      'One failing test at a time, one-production-change at a time',
+      'Assert observable behavior, not internal state',
+      'TDD business logic; explore visuals with preview',
+      'Each test sets up its own fakes',
+      'Test logic; trust data class generation',
+      'Spend ≥ 30% of each cycle refactoring'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="TDD & coverage rules">
+- **Red → Green → Refactor** in 1-5 minute cycles on non-trivial logic.
+- **TDD shines** for parsers, state machines, reducers, mappers, bug fixes.
+- **Skip TDD** for UI polish, spikes, thin wrappers.
+- **Kover** with per-layer thresholds (domain 85%, data 80%, UI 50%).
+- **Coverage is a diagnostic** — chase quality, not the number.
+- **Mutation testing** (PIT) for deeper confidence on core logic.
+- **Static analysis** (detekt + lint + ktlint) catches classes of bugs.
+- **Quality gate in CI** runs all of these on every PR.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'TDD a parser', description: 'Build a credit-card validator (Luhn check + brand detection) entirely TDD. Start with failing test, iterate.' },
+  { title: 'Bug-fix TDD', description: 'Pick a known bug in your codebase. Write a failing test that reproduces it. Fix the code. Test passes.' },
+  { title: 'Set up Kover', description: 'Add Kover with 70% project-wide + 85% domain threshold. Run koverVerify and fix any gaps.' },
+  { title: 'Run PIT', description: 'Install pitest. Run ./gradlew pitest on :domain. Inspect survived mutants — are they bugs your tests should catch?' },
+  { title: 'Detekt + Spotless', description: 'Add detekt + spotless to build. Fix every warning until ./gradlew check passes clean.' }
+]} />
+
+## Next
+
+Continue to **[Benchmark & Property-Based Testing](./benchmark-property-based)** for performance tests and advanced testing techniques.

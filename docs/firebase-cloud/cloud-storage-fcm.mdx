@@ -1,0 +1,550 @@
+---
+id: cloud-storage-fcm
+title: Cloud Storage & FCM
+sidebar_label: Cloud Storage & FCM
+description: Firebase Cloud Storage for files + FCM for push notifications. Uploads with progress, security rules, notification channels, and Android 13+ POST_NOTIFICATIONS.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Cloud Storage & FCM
+
+Cloud Storage handles user-generated files (images, video, documents);
+FCM delivers server-to-client push. Both are Firebase's high-volume
+services — this chapter covers the production patterns.
+
+## Cloud Storage
+
+### Setup
+
+```kotlin
+implementation("com.google.firebase:firebase-storage-ktx")
+
+val storage: FirebaseStorage = Firebase.storage
+```
+
+### Upload — simple
+
+```kotlin
+suspend fun uploadAvatar(userId: String, bytes: ByteArray): Uri {
+    val ref = storage.reference.child("avatars/$userId.jpg")
+    val metadata = storageMetadata {
+        contentType = "image/jpeg"
+        cacheControl = "public, max-age=86400"      // 1 day
+        setCustomMetadata("uploadedBy", userId)
+    }
+    ref.putBytes(bytes, metadata).await()
+    return ref.downloadUrl.await()
+}
+```
+
+### Upload with progress
+
+```kotlin
+sealed interface UploadProgress {
+    data class Progress(val bytesTransferred: Long, val total: Long) : UploadProgress
+    data class Completed(val uri: Uri) : UploadProgress
+    data class Failed(val cause: Throwable) : UploadProgress
+}
+
+fun uploadWithProgress(
+    userId: String,
+    fileUri: Uri
+): Flow<UploadProgress> = callbackFlow {
+    val ref = storage.reference.child("uploads/$userId/${System.currentTimeMillis()}")
+    val task = ref.putFile(fileUri)
+
+    task.addOnProgressListener { snap ->
+        trySend(UploadProgress.Progress(snap.bytesTransferred, snap.totalByteCount))
+    }
+    task.addOnSuccessListener {
+        ref.downloadUrl.addOnSuccessListener { uri ->
+            trySend(UploadProgress.Completed(uri))
+            close()
+        }.addOnFailureListener {
+            trySend(UploadProgress.Failed(it))
+            close()
+        }
+    }
+    task.addOnFailureListener { trySend(UploadProgress.Failed(it)); close() }
+
+    awaitClose { task.cancel() }
+}
+```
+
+### Download and caching
+
+```kotlin
+suspend fun downloadBytes(path: String): ByteArray =
+    storage.reference.child(path).getBytes(10 * 1024 * 1024L).await()  // 10 MB max
+
+// Or get a cached URL for Coil
+suspend fun downloadUrl(path: String): Uri =
+    storage.reference.child(path).downloadUrl.await()
+```
+
+For image loading, use **Coil with the Firebase Storage extension** so
+URLs are cached the same as any HTTP image:
+
+```kotlin
+AsyncImage(
+    model = storage.reference.child("avatars/$userId.jpg"),
+    contentDescription = null,
+    modifier = Modifier.clip(CircleShape).size(40.dp)
+)
+```
+
+Requires `io.coil-kt:coil-gcs` (or similar) adapter, or pre-resolve
+`.downloadUrl.await()` and pass that URL to Coil.
+
+### Large uploads — background + resume
+
+For files > 10 MB, use `UploadTask.getUploadSessionUri()` to resume:
+
+```kotlin
+val task = ref.putFile(uri)
+
+// Serialize URI to DataStore so we can resume after app kill
+val sessionUri = task.snapshot.uploadSessionUri
+sessionUri?.let { uploadSessionStore.save(it.toString()) }
+
+// On next app start
+val resumedTask = ref.putFile(uri, metadata, sessionUri)
+```
+
+Better: use **WorkManager** with a foreground service for resilient
+uploads. See [WorkManager deep dive](/docs/advanced-components/workmanager).
+
+### Security rules
+
+```
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Avatars — user can write own, anyone can read
+    match /avatars/{userId}.jpg {
+      allow read: if true;
+      allow write: if request.auth != null && request.auth.uid == userId &&
+                       request.resource.size < 5 * 1024 * 1024 &&
+                       request.resource.contentType.matches('image/.*');
+    }
+
+    // Private uploads
+    match /uploads/{userId}/{fileName} {
+      allow read, write: if request.auth.uid == userId;
+    }
+
+    // Admin-only bucket
+    match /admin/{path=**} {
+      allow read, write: if request.auth.token.role == 'admin';
+    }
+  }
+}
+```
+
+Rules enforce **file size, MIME type, and ownership** server-side. Never
+trust the client to self-limit.
+
+### Delete
+
+```kotlin
+suspend fun deleteAvatar(userId: String) {
+    storage.reference.child("avatars/$userId.jpg").delete().await()
+}
+```
+
+### Signed URLs — temporary anonymous access
+
+Client SDK doesn't generate signed URLs; do it from a Cloud Function:
+
+```javascript
+// Cloud Function
+const [url] = await bucket.file(path).getSignedUrl({
+  action: 'read',
+  expires: Date.now() + 15 * 60 * 1000           // 15 min
+});
+return url;
+```
+
+Useful for sharing a file via email / SMS where the recipient isn't
+signed in.
+
+---
+
+## Firebase Cloud Messaging (FCM)
+
+### Setup
+
+```kotlin
+implementation("com.google.firebase:firebase-messaging-ktx")
+```
+
+```xml
+<!-- AndroidManifest.xml -->
+<service
+    android:name=".push.AppFcmService"
+    android:exported="false">
+    <intent-filter>
+        <action android:name="com.google.firebase.MESSAGING_EVENT"/>
+    </intent-filter>
+</service>
+
+<!-- Default icon and color for data messages -->
+<meta-data
+    android:name="com.google.firebase.messaging.default_notification_icon"
+    android:resource="@drawable/ic_notification"/>
+<meta-data
+    android:name="com.google.firebase.messaging.default_notification_color"
+    android:resource="@color/notification_accent"/>
+
+<!-- Android 13+ runtime permission -->
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+```
+
+### Request POST_NOTIFICATIONS (Android 13+)
+
+```kotlin
+@Composable
+fun RequestNotificationPermission() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+
+    val context = LocalContext.current
+    val hasPermission = ContextCompat.checkSelfPermission(
+        context, Manifest.permission.POST_NOTIFICATIONS
+    ) == PackageManager.PERMISSION_GRANTED
+
+    if (hasPermission) return
+
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        // Persist the choice; update your push preferences
+    }
+
+    LaunchedEffect(Unit) {
+        launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+}
+```
+
+Ask **in context** — when the user enables notifications for a specific
+feature, not during onboarding.
+
+### FCM service
+
+```kotlin
+@AndroidEntryPoint
+class AppFcmService : FirebaseMessagingService() {
+
+    @Inject lateinit var tokenStore: PushTokenStore
+    @Inject lateinit var notificationRouter: NotificationRouter
+
+    override fun onNewToken(token: String) {
+        runBlocking { tokenStore.update(token) }
+        // Send to your backend via WorkManager — fire and forget
+        TokenSyncWorker.schedule(applicationContext, token)
+    }
+
+    override fun onMessageReceived(message: RemoteMessage) {
+        // Data payload — custom fields
+        val type = message.data["type"] ?: return
+        val entityId = message.data["entityId"] ?: return
+
+        // Notification payload (optional)
+        val title = message.notification?.title ?: message.data["title"] ?: "Notification"
+        val body = message.notification?.body ?: message.data["body"] ?: ""
+
+        notificationRouter.dispatch(type, entityId, title, body)
+    }
+}
+
+class NotificationRouter @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val notificationManager: NotificationManagerCompat
+) {
+    fun dispatch(type: String, entityId: String, title: String, body: String) {
+        val channelId = when (type) {
+            "message" -> Channels.MESSAGES
+            "mention" -> Channels.MENTIONS
+            "promo" -> Channels.PROMOTIONS
+            else -> Channels.DEFAULT
+        }
+
+        val intent = Intent(context, MainActivity::class.java).apply {
+            putExtra("deep_link", "/$type/$entityId")
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notif = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+
+        notificationManager.notify(entityId.hashCode(), notif)
+    }
+}
+```
+
+### Notification channels (Android 8+)
+
+```kotlin
+class NotificationChannelsInitializer @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    fun create() {
+        val manager = context.getSystemService(NotificationManager::class.java)
+
+        manager.createNotificationChannels(listOf(
+            NotificationChannel(Channels.MESSAGES, "Messages", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "New chat messages"
+                enableVibration(true)
+                lightColor = Color.BLUE
+            },
+            NotificationChannel(Channels.MENTIONS, "Mentions", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "When someone mentions you"
+            },
+            NotificationChannel(Channels.PROMOTIONS, "Promotions", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Deals and announcements"
+            },
+            NotificationChannel(Channels.DEFAULT, "Other", NotificationManager.IMPORTANCE_DEFAULT)
+        ))
+    }
+}
+
+object Channels {
+    const val MESSAGES = "messages"
+    const val MENTIONS = "mentions"
+    const val PROMOTIONS = "promotions"
+    const val DEFAULT = "default"
+}
+```
+
+Users can disable individual channels from system settings — a UX win for
+anyone who wants mentions but not promos.
+
+### Notification vs data messages
+
+| | Notification message | Data message |
+|-|----------------------|--------------|
+| FCM payload | `notification` key | `data` key only |
+| App in background | System shows notification; your code NOT called | Your `onMessageReceived` IS called |
+| App killed | System notification | Delivered when app next runs |
+| Customization | Limited | Full control |
+
+For serious apps, **send data-only messages** from the backend and build
+notifications in `onMessageReceived`. You get:
+- Conditional logic (suppress if app is foregrounded)
+- Rich content (images, actions, style)
+- Accurate metrics
+
+### Token management
+
+```kotlin
+@Singleton
+class PushTokenStore @Inject constructor(
+    private val dataStore: DataStore<Preferences>,
+    private val api: AppApi
+) {
+    private val key = stringPreferencesKey("fcm_token")
+
+    suspend fun current(): String? = dataStore.data.first()[key]
+
+    suspend fun update(token: String) {
+        dataStore.edit { it[key] = token }
+        runCatching { api.registerPushToken(token) }    // send to backend
+    }
+
+    suspend fun clearOnSignOut() {
+        FirebaseMessaging.getInstance().deleteToken().await()
+        dataStore.edit { it.remove(key) }
+    }
+}
+```
+
+Always call `deleteToken()` on sign-out — otherwise you'll send the
+previous user's notifications to the new user on the same device.
+
+### Topic subscriptions
+
+```kotlin
+FirebaseMessaging.getInstance().subscribeToTopic("product_updates")
+FirebaseMessaging.getInstance().unsubscribeFromTopic("product_updates")
+```
+
+Topics are for broadcast-style messages (news, marketing). Don't put
+user IDs in topics — they're limited in length and not private.
+
+### Direct token messaging
+
+Most per-user messages are sent to a specific token from the backend:
+
+```javascript
+// Node backend
+await admin.messaging().send({
+  token: userDeviceToken,
+  notification: { title, body },
+  data: { type: 'message', entityId: convId },
+  android: {
+    priority: 'high',
+    notification: {
+      channelId: 'messages',
+      clickAction: 'OPEN_CHAT'
+    }
+  }
+});
+```
+
+### Rich notifications — actions, reply, style
+
+```kotlin
+val replyIntent = PendingIntent.getBroadcast(
+    context, 0,
+    Intent(context, DirectReplyReceiver::class.java).apply {
+        action = "REPLY"; putExtra("convId", convId)
+    },
+    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_MUTABLE
+)
+
+val remoteInput = RemoteInput.Builder("reply_text").setLabel("Reply").build()
+val action = NotificationCompat.Action.Builder(R.drawable.ic_send, "Reply", replyIntent)
+    .addRemoteInput(remoteInput)
+    .setAllowGeneratedReplies(true)
+    .build()
+
+val notif = NotificationCompat.Builder(context, Channels.MESSAGES)
+    .setSmallIcon(R.drawable.ic_notification)
+    .setContentTitle("Aarav")
+    .setContentText("Hey — lunch?")
+    .setStyle(NotificationCompat.MessagingStyle(personSelf)
+        .addMessage("Hey — lunch?", System.currentTimeMillis(), personAarav))
+    .addAction(action)
+    .build()
+```
+
+**MessagingStyle** is what WhatsApp / Messages use — Android recognizes
+it and renders inline replies, person avatars, and smart suggestions.
+
+### In-app notification handling
+
+When the app is foregrounded, you may want to show an in-app banner
+instead of a system notification:
+
+```kotlin
+override fun onMessageReceived(message: RemoteMessage) {
+    if (AppLifecycleState.isForeground && message.data["type"] == "message") {
+        // Show in-app UI instead of system notification
+        inAppBanner.show(message.data["title"] ?: "")
+    } else {
+        notificationRouter.dispatch(...)
+    }
+}
+```
+
+---
+
+## Testing push
+
+Use the **Firebase Console → Cloud Messaging → Send test message** to send
+to a specific FCM token. Or via curl:
+
+```bash
+curl -X POST https://fcm.googleapis.com/v1/projects/YOUR_PROJECT/messages:send \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": {
+      "token": "TOKEN_FROM_LOGCAT",
+      "data": { "type": "message", "entityId": "c1", "title": "Test", "body": "Hello" }
+    }
+  }'
+```
+
+For CI integration tests, Firebase Emulator suite doesn't include FCM —
+test the notification construction logic in unit tests and push delivery
+on real devices.
+
+---
+
+## Deep links from notifications
+
+```kotlin
+override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    val deepLink = intent.getStringExtra("deep_link") ?: return
+    navController.navigate(parseDeepLink(deepLink))
+}
+```
+
+Or use App Links + `navDeepLink` — see
+[Navigation Masterclass](/docs/jetpack-compose/navigation).
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Mistakes to avoid',
+    variant: 'old',
+    points: [
+      'Uploading large files without WorkManager / progress',
+      'No security rules on Storage (world-writable)',
+      'Sending notification messages when you need control',
+      'Requesting POST_NOTIFICATIONS on first launch',
+      'One channel for everything (users can\'t mute)',
+      'Keeping old FCM tokens after sign-out'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production patterns',
+    variant: 'new',
+    points: [
+      'WorkManager foreground service for large uploads',
+      'Rules limiting size, type, and owner',
+      'Data-only messages + build notification client-side',
+      'Request permission in context (feature-level opt-in)',
+      'Category-specific channels (messages, mentions, promos)',
+      'deleteToken() + backend deregister on sign-out'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Cloud Storage & FCM rules">
+- **Storage rules** enforce file size, MIME type, and ownership.
+- **Upload with progress** via `putFile` listeners; WorkManager for resume.
+- **Notification channels** since Android 8 — one per meaningful category.
+- **POST_NOTIFICATIONS** runtime permission on Android 13+, asked in context.
+- **Data-only messages** give you full control; build the notification in `onMessageReceived`.
+- **`deleteToken()`** on sign-out is mandatory.
+- **MessagingStyle** for chat-style notifications with inline reply.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Upload with progress', description: 'Build uploadWithProgress as a Flow<UploadProgress>. Show a progress bar in Compose. Cancel on screen leave.' },
+  { title: 'Storage rules', description: 'Write security rules for /uploads/{userId}/ that limit file size to 10 MB and allow only the owner to write.' },
+  { title: 'Notification channels', description: 'Create 3 channels (messages, mentions, promos). Confirm users can disable one independently from system settings.' },
+  { title: 'Data-only message', description: 'Send a data-only FCM message from the console. Build the notification in onMessageReceived with deep-link intent.' },
+  { title: 'Direct reply', description: 'Add an inline reply RemoteInput + BroadcastReceiver that posts the reply to Firestore. Confirm you can reply without opening the app.' }
+]} />
+
+## Next
+
+Continue to **[Remote Config & App Check](./remote-config-app-check)** for feature flags, A/B testing, and anti-abuse.

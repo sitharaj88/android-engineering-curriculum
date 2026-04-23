@@ -1,0 +1,597 @@
+---
+id: accessibility
+title: Accessibility Deep Dive
+sidebar_label: Accessibility
+description: WCAG 2.2 AA compliance, TalkBack, Switch Access, Voice Access, Compose semantics, automated a11y audits, and the testing playbook.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Accessibility Deep Dive
+
+Accessibility isn't a checklist — it's how blind, low-vision, motor-
+impaired, and cognitively-disabled users interact with your app. Done
+right, it also makes the app better for *everyone* (keyboard nav works,
+screens respond to system font scale, TV-style D-pad navigation).
+
+Android's accessibility stack is built on **semantics nodes** — an
+abstract tree that screen readers, switch access, and voice control all
+consume. Compose semantics integrate directly.
+
+## The four WCAG 2.2 AA non-negotiables
+
+<StepList steps={[
+  { title: 'Every interactive element is labelled', description: 'Buttons, IconButtons, clickable Boxes need a content description or visible text. TextFields need associated labels.' },
+  { title: 'Touch targets are ≥ 48x48 dp', description: 'The WCAG 2.1 AA minimum. Use Modifier.minimumInteractiveComponentSize() — not manual padding.' },
+  { title: 'Color contrast ≥ 4.5:1 (body text), 3:1 (large text + graphics)', description: 'WCAG 2.1 AA. Material 3 M3 \"onSurface\" tokens comply; custom palettes must be audited.' },
+  { title: 'End-to-end flows work with TalkBack', description: 'A blind user must complete sign-in, primary journey, and sign-out using TalkBack alone.' }
+]} />
+
+---
+
+## Compose semantics basics
+
+```kotlin
+@Composable
+fun AccessibleIconButton(
+    onClick: () -> Unit,
+    icon: ImageVector,
+    label: String,                        // required content description
+    modifier: Modifier = Modifier
+) {
+    IconButton(
+        onClick = onClick,
+        modifier = modifier.semantics { contentDescription = label }
+    ) {
+        Icon(icon, contentDescription = null)    // parent owns the description
+    }
+}
+```
+
+### Merging descendants
+
+For a complex composable that should be announced as one unit:
+
+```kotlin
+@Composable
+fun ProductCard(product: Product, onClick: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .semantics(mergeDescendants = true) {
+                contentDescription = "${product.name}, ${product.priceLabel}, in stock"
+                role = Role.Button
+            }
+    ) {
+        AsyncImage(product.imageUrl, contentDescription = null)
+        Text(product.name)
+        Text(product.priceLabel)
+    }
+}
+```
+
+Without `mergeDescendants = true`, TalkBack reads each child separately —
+"image, Wireless Earbuds, $99, in stock" — clunky. With merge — one
+fluent announcement.
+
+### Clearing and setting semantics
+
+```kotlin
+Modifier.clearAndSetSemantics {
+    contentDescription = "Close dialog"
+    role = Role.Button
+}
+```
+
+Removes any descendant semantics and sets only what you specify. Use
+sparingly — typically for custom composites where auto-merge isn't
+precise enough.
+
+### Live regions
+
+For dynamic content (cart badge updates, notification count):
+
+```kotlin
+Text(
+    text = "$count items",
+    modifier = Modifier.semantics {
+        liveRegion = LiveRegionMode.Polite
+    }
+)
+```
+
+- `Polite` — announced when TalkBack is idle
+- `Assertive` — interrupts current announcement (use sparingly)
+
+### Custom actions
+
+```kotlin
+Row(
+    modifier = Modifier.semantics {
+        customActions = listOf(
+            CustomAccessibilityAction("Archive") { onArchive(); true },
+            CustomAccessibilityAction("Delete") { onDelete(); true },
+            CustomAccessibilityAction("Mark as read") { onMarkRead(); true }
+        )
+    }
+) { /* swipeable row */ }
+```
+
+Swipe gestures that work for sighted users (archive/delete/read) become
+TalkBack menu items — "Actions available: Archive, Delete, Mark as read".
+
+### Role
+
+```kotlin
+Modifier.semantics {
+    role = Role.Button          // or Checkbox, RadioButton, Switch, Tab, DropdownList, Image
+}
+```
+
+`Role` tells TalkBack what the element *is* — affects hint ("double-tap
+to activate"), announcements on focus change.
+
+### Headings
+
+```kotlin
+Text(
+    text = "Profile",
+    style = MaterialTheme.typography.headlineSmall,
+    modifier = Modifier.semantics { heading() }
+)
+```
+
+TalkBack users can navigate by headings with a gesture. Mark section
+titles, subheadings — makes long pages scannable.
+
+### State descriptions
+
+```kotlin
+Switch(
+    checked = darkMode,
+    onCheckedChange = { darkMode = it },
+    modifier = Modifier.semantics {
+        stateDescription = if (darkMode) "Dark theme enabled" else "Light theme enabled"
+    }
+)
+```
+
+Overrides the default on/off announcement with descriptive text.
+
+---
+
+## Touch targets
+
+```kotlin
+// Automatic — applies 48dp minimum
+IconButton(onClick = { }) { Icon(Icons.Default.Close, null) }
+
+// Manual for custom composables
+Box(
+    modifier = Modifier
+        .minimumInteractiveComponentSize()
+        .clickable(onClick = onClick)
+        .size(24.dp)        // visual size
+) { /* ... */ }
+```
+
+`minimumInteractiveComponentSize` adds invisible padding to reach 48dp
+without changing visual appearance. Every clickable composable should
+use it (Material components already do).
+
+---
+
+## Color contrast
+
+### Material 3 is compliant by default
+
+`MaterialTheme.colorScheme.onSurface` on `surface` hits 4.5:1. Tokens
+automatically pass WCAG AA.
+
+### Custom colors — audit
+
+```kotlin
+fun Color.contrastRatio(other: Color): Float {
+    val l1 = luminance() + 0.05f
+    val l2 = other.luminance() + 0.05f
+    return max(l1, l2) / min(l1, l2)
+}
+
+// Test in your theme setup
+check(customText.contrastRatio(customBackground) >= 4.5f) {
+    "Contrast too low: ${customText.contrastRatio(customBackground)}"
+}
+```
+
+### Tools
+
+- [Android Studio Accessibility Scanner plugin](https://accessibility.googleblog.com/)
+- [WebAIM Contrast Checker](https://webaim.org/resources/contrastchecker/)
+- Figma plugins: Able, Stark
+
+---
+
+## Font scaling
+
+Users can scale font up to 2.0× (sometimes higher). Layouts must
+accommodate:
+
+```kotlin
+// ❌ Fixed height clips at large fonts
+Text("Long message", modifier = Modifier.height(24.dp))
+
+// ✅ heightIn(min) grows with font
+Text(
+    "Long message",
+    style = MaterialTheme.typography.bodyLarge,
+    modifier = Modifier.heightIn(min = 24.dp)
+)
+```
+
+### Always test at 2.0×
+
+```kotlin
+@Preview(fontScale = 2f, showBackground = true)
+@Composable
+fun LargeFontPreview() {
+    AppTheme { MyScreen() }
+}
+```
+
+---
+
+## TalkBack testing
+
+### Enable on device
+
+`Settings → Accessibility → TalkBack → On`. Or enable with a single button
+(`Settings → Accessibility → Accessibility shortcuts → TalkBack`).
+
+### Gestures
+
+- **Swipe right** — next focusable element
+- **Swipe left** — previous element
+- **Double-tap** — activate
+- **Three-finger swipe up/down** — adjust reading granularity (words, chars, headings)
+- **Swipe down-then-up** — open local context menu (custom actions)
+
+### Reading order
+
+TalkBack reads in **semantic tree order**, which is usually the same as
+visual top-to-bottom. If it's wrong, fix via:
+
+```kotlin
+Modifier.semantics {
+    // Override traversal order within a Row / Box
+    traversalIndex = 1.0f
+}
+```
+
+### Heading navigation
+
+Users can enable "Headings" as the navigation granularity and skim
+through a page by heading only. Your `heading()` semantics annotations
+enable this.
+
+---
+
+## Switch Access
+
+For motor-impaired users who navigate via 1-2 physical switches:
+
+- **Every action must be reachable by sequential focus**
+- **Visible focus indicator** must be obvious
+- **Auto-scan speed** should be tunable (system setting)
+
+```kotlin
+// Compose — focus indication
+Modifier.focusable(
+    interactionSource = interactionSource,
+    enabled = true
+)
+    .onFocusChanged { focused ->
+        if (focused) scrollIntoView()
+    }
+```
+
+### Focus order
+
+For custom layouts, control the traversal order:
+
+```kotlin
+Modifier.focusProperties {
+    next = FocusRequester(submitBtnRef)
+    right = FocusRequester(cancelBtnRef)
+    up = FocusRequester(prevFieldRef)
+}
+```
+
+---
+
+## Voice Access
+
+Voice Access adds numbered labels to on-screen interactive elements —
+users can say "tap 3" to activate. Requires:
+
+- **Each interactive element has a labelled name** (from contentDescription or text)
+- **Unique labels** (two buttons both labelled "Edit" confuse voice matching)
+
+---
+
+## `dp` vs `sp` — the density correctness rule
+
+```kotlin
+Text(fontSize = 16.sp)          // ✅ scales with user font size
+Box(modifier = Modifier.size(24.dp))    // ✅ scales with screen density
+
+Text(fontSize = 16.dp)           // ❌ doesn't scale with font setting
+```
+
+Always `sp` for text, `dp` for everything else.
+
+---
+
+## `WindowInsets` — safe areas
+
+```kotlin
+Column(
+    modifier = Modifier
+        .fillMaxSize()
+        .windowInsetsPadding(WindowInsets.safeDrawing)   // avoid status bar, nav bar, IME
+        .padding(16.dp)
+) { /* ... */ }
+```
+
+Content that's behind the status bar or keyboard is inaccessible. Modern
+apps use `WindowInsets.safeDrawing` or specific insets (`statusBars`,
+`imeHint`, `navigationBars`).
+
+---
+
+## Automated audits
+
+### Google Accessibility Test Framework
+
+```kotlin
+// androidTest
+@HiltAndroidTest
+class ProfileA11yTest {
+    @get:Rule(order = 0) val hiltRule = HiltAndroidRule(this)
+    @get:Rule(order = 1) val compose = createAndroidComposeRule<HiltTestActivity>()
+
+    @Test
+    fun profile_screen_passes_a11y_audit() {
+        compose.setContent { AppTheme { ProfileScreen() } }
+        compose.onRoot().performAccessibilityAudit()
+    }
+}
+```
+
+Checks:
+- Touch target size
+- Contrast ratio
+- Content description presence
+- Redundant descriptions
+- Clickable span text
+
+Run on every screen. Audit failures block PR merge.
+
+### Compose-native assertions
+
+```kotlin
+@Test fun all_buttons_have_labels() {
+    compose.setContent { ProfileScreen() }
+
+    compose.onAllNodesWithRole(Role.Button)
+        .assertAll(hasContentDescription() or hasText())
+}
+
+@Test fun touch_targets_meet_minimum() {
+    compose.setContent { ProfileScreen() }
+
+    compose.onAllNodes(hasClickAction())
+        .fetchSemanticsNodes()
+        .forEach { node ->
+            val size = node.size
+            assertTrue(size.width >= 48.dp.toPx(density) && size.height >= 48.dp.toPx(density)) {
+                "Element ${node.config} has size ${size.width}x${size.height}, expected min 48dp"
+            }
+        }
+}
+```
+
+### Accessibility Scanner app
+
+Install from Play Store. Runs on your device, captures screenshots, and
+reports violations:
+- Small touch targets
+- Low contrast
+- Missing labels
+- Duplicate descriptions
+
+Run it on every screen of your app before release.
+
+---
+
+## Designing for accessibility from day one
+
+### In mockups
+
+- Mark each element with its intended screen-reader announcement
+- Specify semantic role (button, heading, image, etc.)
+- Define touch targets explicitly (not just visual size)
+- Include dark mode + large-font-scale variants
+
+### In code review
+
+- **No unlabelled IconButton** — fail the PR
+- **No `contentDescription = ""` without clearAndSet** — questionable
+- **Custom composite → check `mergeDescendants`** — does it read as one unit?
+- **Animation → respects reduce-motion** — see below
+
+### Per-feature checklist
+
+<StepList steps={[
+  { title: 'Navigate the screen with TalkBack', description: 'From the entry point to success, using only swipes and double-taps.' },
+  { title: 'Test at font scale 2.0×', description: 'Nothing clips; scrollable areas scroll; form fields expand.' },
+  { title: 'Test in dark mode', description: 'All text still meets 4.5:1 contrast; no pure white / black text.' },
+  { title: 'Test in RTL (ar-XB)', description: 'Layouts flip correctly; directional icons mirror; no hardcoded left/right.' },
+  { title: 'Run accessibility audit', description: 'performAccessibilityAudit() or Accessibility Scanner — no violations.' },
+  { title: 'Test with external keyboard', description: 'Tab through every focusable element; focus indicator is visible.' }
+]} />
+
+---
+
+## Animations and reduce-motion
+
+Some users have vestibular disorders; Android has a system setting to
+reduce motion:
+
+```kotlin
+@Composable
+fun motionAwareAnimationSpec(baseDurationMs: Int): AnimationSpec<Float> {
+    val context = LocalContext.current
+    val animatorScale = Settings.Global.getFloat(
+        context.contentResolver,
+        Settings.Global.ANIMATOR_DURATION_SCALE,
+        1f
+    )
+
+    return if (animatorScale < 0.01f) {
+        snap()                    // no animation
+    } else {
+        tween((baseDurationMs * animatorScale).toInt())
+    }
+}
+```
+
+Use in any `animate*AsState` that isn't purely functional (not progress
+indicators — those are useful information, not decoration).
+
+---
+
+## Images
+
+```kotlin
+// Decorative image — no announcement
+Image(painter, contentDescription = null)
+
+// Informative image — describe the content
+Image(painter, contentDescription = "Line chart showing orders up 12% this month")
+
+// Interactive image (tappable) — describe the action
+Image(
+    painter,
+    contentDescription = "Open order details",
+    modifier = Modifier.clickable { /* ... */ }
+)
+```
+
+**Never** put visual description when the image is decorative — it just
+adds noise ("image, image, image" in TalkBack is user-hostile).
+
+---
+
+## Forms and error messages
+
+```kotlin
+OutlinedTextField(
+    value = email,
+    onValueChange = onEmailChange,
+    label = { Text("Email") },
+    isError = emailError != null,
+    supportingText = emailError?.let {
+        { Text(it, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite }) }
+    },
+    keyboardOptions = KeyboardOptions(
+        keyboardType = KeyboardType.Email,
+        imeAction = ImeAction.Next
+    )
+)
+```
+
+Error messages should be **live regions** so TalkBack announces them
+when they appear — users know immediately why the field is invalid.
+
+---
+
+## Accessibility service testing
+
+### Espresso accessibility checks (legacy Views)
+
+```kotlin
+@Before
+fun enableA11yChecks() {
+    AccessibilityChecks.enable()
+        .setRunChecksFromRootView(true)
+        .setThrowExceptionFor(AccessibilityCheckResultType.ERROR)
+}
+```
+
+Every Espresso `onView().perform()` now runs accessibility checks
+implicitly. Fails the test on violations.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'A11y mistakes',
+    variant: 'old',
+    points: [
+      'IconButton without contentDescription',
+      'Custom composite without mergeDescendants',
+      'Hardcoded dp for text (doesn\'t respect font scale)',
+      'Fixed heights that clip at 2x font',
+      'Left / right padding instead of start / end',
+      'Decorative images with contentDescription filled in',
+      'No TalkBack testing before release'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Accessible by default',
+    variant: 'new',
+    points: [
+      'Every IconButton has a meaningful label',
+      'Cards use mergeDescendants for one announcement',
+      'Text uses .sp; containers use heightIn(min=)',
+      'Layouts scale gracefully at 2x font',
+      'Modifier.padding(start, end) + AutoMirrored icons',
+      'Decorative images: contentDescription = null',
+      'Every screen tested with TalkBack before merge'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Accessibility rules">
+- **WCAG 2.2 AA** is the bar: labels, ≥4.5:1 contrast, ≥48dp targets, TalkBack-complete.
+- **Compose semantics** (`contentDescription`, `role`, `mergeDescendants`, `liveRegion`, `customActions`) are first-class.
+- **`minimumInteractiveComponentSize`** on every clickable composable.
+- **Audit contrast** on custom palettes; Material 3 tokens are compliant.
+- **Test at font scale 2.0×** — that's where clipping happens.
+- **Automated audits** (`performAccessibilityAudit`) on every screen in CI.
+- **Design accessibility from day one** — not at release time.
+- **Reduce-motion respect** for vestibular users.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'TalkBack one flow', description: 'Enable TalkBack. Walk through your primary journey (sign-in → main action → success) using only gestures. Fix every confusing announcement.' },
+  { title: 'Audit on screens', description: 'Add performAccessibilityAudit() to 5 screen tests. Fix every violation.' },
+  { title: 'Large-font preview', description: 'Add @Preview(fontScale = 2f) to 10 screens. Fix every clipped layout.' },
+  { title: 'Custom action', description: 'For a swipeable row (archive/delete), add CustomAccessibilityAction so TalkBack users can trigger both actions.' },
+  { title: 'Contrast audit', description: 'For every custom color pair in your app, compute contrast ratio. Any below 4.5:1 gets updated to meet WCAG AA.' }
+]} />
+
+## Next
+
+Return to **[Module 19 Overview](./overview)** or continue to
+**[Module 20 — Career & Interview Prep](/docs/career-interview/overview)**.

@@ -1,0 +1,632 @@
+---
+id: wear-health
+title: Wear OS & Health Connect
+sidebar_label: Wear OS & Health
+description: Wear OS 5 with Compose for Wear, tiles, complications, ongoing activities, and Health Connect for unified fitness/health data across apps.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Wear OS & Health Connect
+
+Wear OS is now fully Compose-first. The phone-watch pair is the dominant
+fitness app shape — real-time metrics on the wrist, rollups + history on
+the phone. Health Connect (required since Android 14 for health data)
+is the unified API every fitness / health app uses. This chapter covers
+both.
+
+## Wear OS 5 essentials
+
+Wear OS 5 is based on Android 14; the SDK mostly overlaps with phone
+Android. The differences:
+
+- **Tiny screens** — 200-450px circular or square
+- **Brief interactions** — 5-second attention budget, not 5 minutes
+- **Battery-critical** — sensors and screen-on drain the watch fast
+- **Standalone or phone-paired** — apps can work either way
+- **Cellular variants** — some watches have their own SIM
+
+### Dependencies
+
+```kotlin
+// libs.versions.toml
+wear-compose      = "1.4.1"
+wear-tiles        = "1.4.1"
+wear-tooling      = "1.0.0"
+wear-ongoing      = "1.0.0"
+health-services   = "1.1.0-alpha03"
+
+wear-compose-foundation    = { module = "androidx.wear.compose:compose-foundation", version.ref = "wear-compose" }
+wear-compose-material3     = { module = "androidx.wear.compose:compose-material3", version.ref = "wear-compose" }
+wear-compose-navigation    = { module = "androidx.wear.compose:compose-navigation", version.ref = "wear-compose" }
+wear-tiles                 = { module = "androidx.wear.tiles:tiles", version.ref = "wear-tiles" }
+wear-tiles-tooling         = { module = "androidx.wear.tiles:tiles-tooling", version.ref = "wear-tiles" }
+wear-ongoing               = { module = "androidx.wear:wear-ongoing", version.ref = "wear-ongoing" }
+health-services-client     = { module = "androidx.health.services:health-services-client", version.ref = "health-services" }
+```
+
+### Project layout
+
+```text
+my-app/
+├── app/                         — phone app
+├── wear/                        — watch app
+├── shared/                      — KMP shared module (or at least shared Kotlin)
+└── baseline-profile/
+```
+
+```xml
+<!-- wear/src/main/AndroidManifest.xml -->
+<manifest>
+    <uses-feature android:name="android.hardware.type.watch"/>
+
+    <application
+        android:theme="@android:style/Theme.DeviceDefault"
+        android:allowBackup="false">
+
+        <uses-library
+            android:name="com.google.android.wearable"
+            android:required="true"/>
+
+        <meta-data
+            android:name="com.google.android.wearable.standalone"
+            android:value="true"/>    <!-- works without a paired phone -->
+    </application>
+</manifest>
+```
+
+---
+
+## Compose for Wear OS
+
+Wear Compose is a parallel Material library tuned for round screens:
+
+```kotlin
+// Main entry
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            WearApp()
+        }
+    }
+}
+
+@Composable
+fun WearApp() {
+    WearAppTheme {
+        val navController = rememberSwipeDismissableNavController()
+
+        SwipeDismissableNavHost(
+            navController = navController,
+            startDestination = "main"
+        ) {
+            composable("main") { MainScreen(onStart = { navController.navigate("workout") }) }
+            composable("workout") { WorkoutScreen() }
+        }
+    }
+}
+```
+
+### Curved text + round-aware layout
+
+```kotlin
+@Composable
+fun MainScreen(onStart: () -> Unit) {
+    Scaffold(
+        timeText = { TimeText() },
+        vignette = { Vignette(vignettePosition = VignettePosition.TopAndBottom) },
+        positionIndicator = { /* scroll indicator */ }
+    ) {
+        ScalingLazyColumn(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.fillMaxSize()
+        ) {
+            item { Text("Start workout", style = MaterialTheme.typography.titleMedium) }
+            item {
+                Chip(
+                    onClick = onStart,
+                    label = { Text("Running") },
+                    icon = { Icon(Icons.Default.DirectionsRun, null) }
+                )
+            }
+            item {
+                Chip(
+                    onClick = onStart,
+                    label = { Text("Cycling") },
+                    icon = { Icon(Icons.Default.DirectionsBike, null) }
+                )
+            }
+        }
+    }
+}
+```
+
+Key Wear Compose widgets:
+
+| Widget                             | Purpose                                              |
+|------------------------------------|------------------------------------------------------|
+| `ScalingLazyColumn`                | List that scales items toward/away from center       |
+| `Chip` / `CompactChip`             | Primary interactive item, round-screen optimized    |
+| `Button`                            | Circular icon button                                 |
+| `ToggleButton`                      | Toggle                                               |
+| `Scaffold`                          | Wear-specific scaffold with time text + vignette    |
+| `TimeText`                          | Curved time display at top                          |
+| `Vignette`                          | Edge darkening for legibility                       |
+| `PositionIndicator`                 | Scroll position on the edge                         |
+| `SwipeDismissableNavHost`           | Back-by-swipe navigation                            |
+| `PickerGroup`                       | Scrolling selector (time, numbers)                  |
+| `CircularProgressIndicator`         | Edge-tracking progress                              |
+
+---
+
+## Tiles — glanceable UI from the carousel
+
+Tiles appear in the user's tile carousel (swipe from watchface). They
+update periodically and launch your app on tap. Modern Wear apps ship at
+least one tile.
+
+```kotlin
+class WorkoutTileService : TileService() {
+
+    override fun onTileRequest(request: TileRequest): ListenableFuture<Tile> {
+        val state = loadCurrentWorkoutState()
+
+        return Futures.immediateFuture(Tile.Builder()
+            .setResourcesVersion(RESOURCES_VERSION)
+            .setFreshnessIntervalMillis(60_000)         // refresh once per minute
+            .setTileTimeline(Timeline.fromLayoutElement(
+                layout(state)
+            ))
+            .build())
+    }
+
+    override fun onTileResourcesRequest(request: ResourcesRequest): ListenableFuture<Resources> = /* ... */
+
+    private fun layout(state: WorkoutState): LayoutElement = Box.Builder()
+        .addContent(
+            Text.Builder(this, "Distance")
+                .setFontStyle(FontStyle.Builder().setSize(sp(12f)).build())
+                .build()
+        )
+        .addContent(
+            Text.Builder(this, "${state.distanceKm} km")
+                .setFontStyle(FontStyle.Builder().setSize(sp(24f)).build())
+                .build()
+        )
+        .setModifiers(
+            Modifiers.Builder()
+                .setClickable(Clickable.Builder()
+                    .setOnClick(LaunchAction.Builder()
+                        .setAndroidActivity(AndroidActivity.Builder()
+                            .setClassName(MainActivity::class.java.name)
+                            .setPackageName(packageName)
+                            .build())
+                        .build())
+                    .build())
+                .build()
+        )
+        .build()
+}
+```
+
+```xml
+<!-- AndroidManifest.xml -->
+<service
+    android:name=".tile.WorkoutTileService"
+    android:label="@string/tile_workout_label"
+    android:icon="@drawable/ic_tile_preview"
+    android:exported="true"
+    android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+    <intent-filter>
+        <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER"/>
+    </intent-filter>
+    <meta-data
+        android:name="androidx.wear.tiles.PREVIEW"
+        android:resource="@drawable/tile_preview"/>
+</service>
+```
+
+Use the new **Glance-based Tile API** (alpha) for Compose-style tile
+authoring if you prefer declarative tiles.
+
+---
+
+## Complications — data on watch faces
+
+Complications are small data slots on watch faces (time, steps, battery).
+Your app can provide complications that any watch face can display:
+
+```kotlin
+class StepsComplicationService : ComplicationDataSourceService() {
+
+    override suspend fun onComplicationRequest(request: ComplicationRequest): ComplicationData? =
+        when (request.complicationType) {
+            ComplicationType.SHORT_TEXT -> {
+                val steps = getCurrentSteps()
+                ShortTextComplicationData.Builder(
+                    text = PlainComplicationText.Builder("$steps").build(),
+                    contentDescription = PlainComplicationText.Builder("$steps steps today").build()
+                )
+                    .setTitle(PlainComplicationText.Builder("Steps").build())
+                    .setTapAction(openAppPendingIntent())
+                    .build()
+            }
+            else -> null
+        }
+
+    override fun getPreviewData(type: ComplicationType): ComplicationData? = /* sample for picker */
+}
+```
+
+```xml
+<service
+    android:name=".complication.StepsComplicationService"
+    android:icon="@drawable/ic_steps"
+    android:label="@string/comp_steps_label"
+    android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER"
+    android:exported="true">
+    <intent-filter>
+        <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST"/>
+    </intent-filter>
+    <meta-data
+        android:name="android.support.wearable.complications.SUPPORTED_TYPES"
+        android:value="SHORT_TEXT,RANGED_VALUE"/>
+    <meta-data
+        android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS"
+        android:value="300"/>
+</service>
+```
+
+---
+
+## Ongoing activities — the persistent workout notification
+
+When a user starts a workout, it should appear:
+- On the watch — a "persistent" widget in the recents/dock
+- On the phone — an ongoing notification, extendable to Pixel Launcher
+
+```kotlin
+val ongoing = OngoingActivity.Builder(
+    context,
+    NOTIF_ID,
+    NotificationCompat.Builder(context, CH_WORKOUT)
+        .setSmallIcon(R.drawable.ic_workout)
+        .setContentTitle("Workout in progress")
+        .setContentIntent(openAppPendingIntent)
+)
+    .setAnimatedIcon(R.drawable.ic_workout_animated)
+    .setStaticIcon(R.drawable.ic_workout)
+    .setTouchIntent(openAppPendingIntent)
+    .setStatus(Status.Builder()
+        .addTemplate("Distance: #DISTANCE# km")
+        .addPart("DISTANCE", Status.TextPart("2.4"))
+        .build())
+    .build()
+
+ongoing.apply(context)
+```
+
+Users see continuous workout info from anywhere on the watch — doesn't
+disappear when they leave your app.
+
+---
+
+## Health Services — sensors and exercise tracking
+
+For workout tracking, Health Services provides **high-level exercise
+APIs** with battery-optimized sensor fusion:
+
+```kotlin
+class WorkoutService : LifecycleService() {
+
+    private val healthServicesClient = HealthServices.getClient(this)
+    private val exerciseClient = healthServicesClient.exerciseClient
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        startForeground(NOTIF_ID, ongoingNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
+
+        lifecycleScope.launch {
+            startExercise()
+        }
+        return START_STICKY
+    }
+
+    private suspend fun startExercise() {
+        val config = ExerciseConfig.builder(ExerciseType.RUNNING)
+            .setDataTypes(setOf(
+                DataType.HEART_RATE_BPM,
+                DataType.STEPS,
+                DataType.DISTANCE,
+                DataType.CALORIES,
+                DataType.SPEED
+            ))
+            .setIsAutoPauseAndResumeEnabled(true)
+            .setIsGpsEnabled(true)
+            .build()
+
+        exerciseClient.setUpdateCallback(object : ExerciseUpdateCallback {
+            override fun onExerciseUpdateReceived(update: ExerciseUpdate) {
+                val hr = update.latestMetrics.getData(DataType.HEART_RATE_BPM).firstOrNull()?.value
+                val distance = update.latestMetrics.getData(DataType.DISTANCE).firstOrNull()?.value
+                workoutStore.update(hr, distance)
+            }
+            override fun onLapSummaryReceived(summary: ExerciseLapSummary) { }
+            override fun onAvailabilityChanged(dataType: DataType<*, *>, availability: Availability) { }
+            override fun onRegistered() { }
+            override fun onRegistrationFailed(t: Throwable) { }
+        })
+
+        exerciseClient.startExercise(config)
+    }
+
+    override fun onDestroy() {
+        lifecycleScope.launch { exerciseClient.endExercise() }
+        super.onDestroy()
+    }
+}
+```
+
+```xml
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_HEALTH"/>
+<uses-permission android:name="android.permission.BODY_SENSORS"/>
+<uses-permission android:name="android.permission.ACTIVITY_RECOGNITION"/>
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+```
+
+Health Services does the sensor fusion + battery optimization (GPS
+duty-cycling, heart-rate batching) for you. Don't raw-access `SensorManager`
+for workouts; use Health Services.
+
+---
+
+## Watch ↔ phone communication
+
+### Data Layer API
+
+For syncing state between watch and phone:
+
+```kotlin
+val dataClient = Wearable.getDataClient(context)
+
+// From phone: publish
+val request = PutDataMapRequest.create("/settings").apply {
+    dataMap.putString("theme", "dark")
+    dataMap.putLong("timestamp", System.currentTimeMillis())
+}.asPutDataRequest().setUrgent()
+
+dataClient.putDataItem(request)
+
+// On watch: observe
+class SettingsListener : WearableListenerService() {
+    override fun onDataChanged(events: DataEventBuffer) {
+        events.forEach { event ->
+            if (event.type == DataEvent.TYPE_CHANGED && event.dataItem.uri.path == "/settings") {
+                val map = DataMapItem.fromDataItem(event.dataItem).dataMap
+                updateTheme(map.getString("theme"))
+            }
+        }
+    }
+}
+```
+
+### MessageClient — one-shot events
+
+```kotlin
+val messageClient = Wearable.getMessageClient(context)
+
+// Send
+messageClient.sendMessage(nodeId, "/workout/start", payloadBytes)
+
+// Receive
+class WorkoutMessageListener : WearableListenerService() {
+    override fun onMessageReceived(event: MessageEvent) {
+        if (event.path == "/workout/start") startWorkout(event.data)
+    }
+}
+```
+
+Use Data Layer for state (sync), MessageClient for events (user started
+a workout, phone should open the workout screen).
+
+---
+
+## Health Connect — the unified fitness API
+
+Health Connect is Google's API for sharing health data across apps.
+Instead of each app reading sensors, one system store holds all data;
+apps read and write with granular permissions.
+
+### Setup
+
+```kotlin
+// libs.versions.toml
+health-connect = "1.1.0-alpha11"
+
+health-connect-client = { module = "androidx.health.connect:connect-client", version.ref = "health-connect" }
+```
+
+```xml
+<!-- AndroidManifest.xml -->
+<queries>
+    <package android:name="com.google.android.apps.healthdata"/>
+</queries>
+
+<!-- Permissions per data type -->
+<uses-permission android:name="android.permission.health.READ_STEPS"/>
+<uses-permission android:name="android.permission.health.WRITE_STEPS"/>
+<uses-permission android:name="android.permission.health.READ_HEART_RATE"/>
+<uses-permission android:name="android.permission.health.WRITE_HEART_RATE"/>
+<uses-permission android:name="android.permission.health.READ_EXERCISE"/>
+<uses-permission android:name="android.permission.health.WRITE_EXERCISE"/>
+```
+
+### Check and request permissions
+
+```kotlin
+class HealthConnectManager @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    val client: HealthConnectClient? by lazy {
+        if (HealthConnectClient.getSdkStatus(context) == HealthConnectClient.SDK_AVAILABLE) {
+            HealthConnectClient.getOrCreate(context)
+        } else null
+    }
+
+    val permissions = setOf(
+        HealthPermission.getReadPermission(StepsRecord::class),
+        HealthPermission.getWritePermission(StepsRecord::class),
+        HealthPermission.getReadPermission(HeartRateRecord::class),
+        HealthPermission.getWritePermission(ExerciseSessionRecord::class)
+    )
+
+    suspend fun hasAllPermissions(): Boolean {
+        val granted = client?.permissionController?.getGrantedPermissions() ?: return false
+        return permissions.all { it in granted }
+    }
+}
+
+// Request via launcher
+val launcher = rememberLauncherForActivityResult(
+    PermissionController.createRequestPermissionResultContract()
+) { granted ->
+    if (granted.containsAll(manager.permissions)) { /* proceed */ }
+}
+
+launcher.launch(manager.permissions)
+```
+
+### Writing an exercise session
+
+```kotlin
+suspend fun saveWorkout(workout: Workout) {
+    val client = manager.client ?: return
+
+    val session = ExerciseSessionRecord(
+        startTime = workout.startInstant,
+        startZoneOffset = ZoneOffset.UTC,
+        endTime = workout.endInstant,
+        endZoneOffset = ZoneOffset.UTC,
+        exerciseType = ExerciseSessionRecord.EXERCISE_TYPE_RUNNING,
+        title = workout.title,
+        notes = workout.notes,
+        metadata = Metadata.manualEntry()
+    )
+
+    val heartRate = HeartRateRecord(
+        startTime = workout.startInstant, startZoneOffset = ZoneOffset.UTC,
+        endTime = workout.endInstant, endZoneOffset = ZoneOffset.UTC,
+        samples = workout.hrSamples.map {
+            HeartRateRecord.Sample(time = it.time, beatsPerMinute = it.bpm.toLong())
+        }
+    )
+
+    client.insertRecords(listOf(session, heartRate))
+}
+```
+
+### Reading steps
+
+```kotlin
+suspend fun totalStepsToday(): Long {
+    val client = manager.client ?: return 0
+    val start = LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toInstant()
+    val end = Instant.now()
+
+    val response = client.aggregate(
+        AggregateRequest(
+            metrics = setOf(StepsRecord.COUNT_TOTAL),
+            timeRangeFilter = TimeRangeFilter.between(start, end)
+        )
+    )
+    return response[StepsRecord.COUNT_TOTAL] ?: 0
+}
+```
+
+### Data types
+
+Health Connect covers:
+
+- **Activity**: steps, distance, speed, calories, wheelchair pushes
+- **Vitals**: heart rate, blood pressure, body temperature, oxygen saturation
+- **Exercise**: session, laps, segments
+- **Sleep**: session, stages
+- **Nutrition**: calories, macros, hydration
+- **Body**: weight, body fat %, height
+- **Reproductive**: menstruation, cervical mucus
+
+Each data type has its own permission and its own write contract.
+
+---
+
+## Privacy considerations
+
+- **Explain every permission**: Play Store requires a rationale screen before
+  requesting health permissions
+- **Data minimization**: only request what you'll use
+- **Export + delete flows** are legally required (GDPR, HIPAA)
+- **Never log** raw health data to Crashlytics or analytics
+- **Encrypt on device** via SQLCipher or EncryptedSharedPreferences (see
+  [Encrypted Storage](/docs/data-persistence/encrypted-storage))
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Wear / Health mistakes',
+    variant: 'old',
+    points: [
+      'Raw SensorManager for workouts (battery hog)',
+      'One-shot notifications instead of ongoing activity',
+      'No tile — app loses carousel discoverability',
+      'Phone-like layouts on watch',
+      'Reading raw sensors when Health Connect has the data',
+      'Health data going to analytics SDKs'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Modern Wear + Health',
+    variant: 'new',
+    points: [
+      'Health Services for exercise (auto-pause, sensor fusion)',
+      'OngoingActivity for persistent workout UI',
+      'At least one tile for glanceable access',
+      'ScalingLazyColumn + Wear Material 3',
+      'Health Connect for cross-app data',
+      'Health data stays in encrypted local storage'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Wear & Health rules">
+- **Compose for Wear** — ScalingLazyColumn, Scaffold with TimeText, SwipeDismissableNavHost.
+- **Tiles** for glanceable UI; **Complications** for data slots on watch faces.
+- **Ongoing Activity** for persistent workout / timer UI.
+- **Health Services** for exercise tracking with battery-optimized sensor fusion.
+- **Data Layer API** for state sync; **MessageClient** for events between phone and watch.
+- **Health Connect** is the unified health data store — required for Android 14+ fitness apps.
+- **Privacy first**: rationale screens, data minimization, encrypted local storage.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Wear workout screen', description: 'Build a workout screen in Wear Compose with Scaffold + TimeText + ScalingLazyColumn. Render heart rate, distance, and duration.' },
+  { title: 'Tile with live data', description: 'Create a TileService showing the user\'s step count today. Set a 5-minute freshness interval.' },
+  { title: 'Health Services exercise', description: 'Start an exercise session via ExerciseClient with HEART_RATE + DISTANCE data types. Collect updates for 1 minute and log the samples.' },
+  { title: 'Health Connect write', description: 'After a workout, write an ExerciseSessionRecord + HeartRateRecord to Health Connect. Verify in the Health Connect app that your workout appears.' },
+  { title: 'Phone-watch sync', description: 'Send a /workout/start message from phone to watch. The watch app receives and starts a workout session.' }
+]} />
+
+## Next
+
+Continue to **[Android TV, Auto, BLE & XR](./tv-auto-ble-xr)** for the rest of Google's platform ecosystem.

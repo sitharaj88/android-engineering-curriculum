@@ -1,0 +1,542 @@
+---
+id: graphics-rendering
+title: Graphics & Rendering
+sidebar_label: Graphics & Rendering
+description: Canvas API, AGSL runtime shaders, drawWithCache, AnimatedVectorDrawable, and the Skia rendering pipeline on Android.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Graphics & Rendering
+
+Compose's built-in composables cover 95% of UI. The remaining 5% —
+custom charts, particle effects, bespoke loading animations, real-time
+visualizations — needs the **graphics primitives**: `Canvas`, `Paint`,
+`Path`, and Android 13+ **AGSL runtime shaders**.
+
+## The rendering pipeline
+
+```text
+┌──────────────────────────────────────────────┐
+│  Your @Composable                             │
+│    Canvas { drawCircle(...) }                 │
+├──────────────────────────────────────────────┤
+│  Compose graphics layer                       │
+│    → Skia commands                            │
+├──────────────────────────────────────────────┤
+│  Skia (C++ rendering engine)                  │
+│    → HWUI / Vulkan                            │
+├──────────────────────────────────────────────┤
+│  SurfaceFlinger → GPU                         │
+└──────────────────────────────────────────────┘
+```
+
+Modern Android uses **Vulkan or OpenGL ES** through **HWUI** (hardware
+UI). Skia is the vector-graphics engine; you interact with it via
+Canvas / Paint.
+
+---
+
+## Canvas basics
+
+```kotlin
+@Composable
+fun SimpleChart(data: List<Float>, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier.fillMaxSize()) {
+        val max = data.max()
+        val step = size.width / (data.size - 1)
+
+        // Line
+        val path = Path().apply {
+            data.forEachIndexed { i, v ->
+                val x = i * step
+                val y = size.height - (v / max * size.height)
+                if (i == 0) moveTo(x, y) else lineTo(x, y)
+            }
+        }
+        drawPath(
+            path = path,
+            color = Color(0xFF10B981),
+            style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
+        )
+
+        // Dots
+        data.forEachIndexed { i, v ->
+            val x = i * step
+            val y = size.height - (v / max * size.height)
+            drawCircle(color = Color(0xFF10B981), radius = 4.dp.toPx(), center = Offset(x, y))
+        }
+    }
+}
+```
+
+### Draw operations
+
+| Operation                                | Purpose                                    |
+|------------------------------------------|--------------------------------------------|
+| `drawLine`                               | Straight line                               |
+| `drawRect` / `drawRoundRect`             | Rectangles, rounded rects                   |
+| `drawCircle` / `drawOval`                | Circles, ovals                              |
+| `drawPath`                               | Arbitrary bezier / line paths              |
+| `drawArc`                                | Arc slices                                  |
+| `drawPoints`                             | Point cloud                                 |
+| `drawImage`                              | Bitmap / image                              |
+| `drawText` (Compose)                     | Text with typography                        |
+
+### Paint / style
+
+```kotlin
+drawCircle(
+    color = Color.Blue,
+    radius = 50f,
+    style = Fill                             // or Stroke(width)
+)
+
+drawRect(
+    brush = Brush.linearGradient(listOf(Color.Blue, Color.Red)),
+    size = size
+)
+
+drawPath(path, color = Color.Green, style = Stroke(
+    width = 4.dp.toPx(),
+    cap = StrokeCap.Round,
+    join = StrokeJoin.Round,
+    pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 5f))
+))
+```
+
+---
+
+## `drawWithCache` — cache paths and brushes
+
+Every recomposition re-draws. If you recompute a complex Path per frame,
+you waste CPU. Cache with `drawWithCache`:
+
+```kotlin
+@Composable
+fun Waveform(samples: FloatArray, modifier: Modifier = Modifier) {
+    Box(
+        modifier
+            .fillMaxWidth()
+            .height(64.dp)
+            .drawWithCache {
+                // Computed ONCE per size change, not per recomposition
+                val path = Path().apply {
+                    val step = size.width / samples.size
+                    samples.forEachIndexed { i, v ->
+                        val x = i * step
+                        val y = size.height / 2 - v * size.height / 2
+                        if (i == 0) moveTo(x, y) else lineTo(x, y)
+                    }
+                }
+                val gradient = Brush.verticalGradient(
+                    listOf(Color(0xFF10B981), Color(0xFF059669))
+                )
+
+                onDrawBehind {
+                    drawPath(path, brush = gradient, style = Stroke(2.dp.toPx()))
+                }
+            }
+    )
+}
+```
+
+`drawWithCache` re-runs its lambda only when `size` or captured state
+changes. The `onDrawBehind { ... }` is what runs every frame — kept
+minimal.
+
+---
+
+## `graphicsLayer` — GPU transforms
+
+For transforms (rotation, scale, translation, alpha), `graphicsLayer { }`
+runs on the GPU without re-measuring / re-laying out:
+
+```kotlin
+Modifier.graphicsLayer {
+    rotationZ = rotation
+    scaleX = scale
+    scaleY = scale
+    alpha = 0.5f
+    shadowElevation = 8.dp.toPx()
+    shape = RoundedCornerShape(8.dp)
+    clip = true
+}
+```
+
+`.rotate()` and `.scale()` modifiers re-layout on change; `graphicsLayer`
+doesn't. For any animated transform, use `graphicsLayer`.
+
+### Hoisting animation off the main thread
+
+```kotlin
+val progress by animateFloatAsState(target, label = "progress")
+
+Box(
+    Modifier.graphicsLayer {
+        alpha = progress                     // reads the State — still on main
+    }
+)
+
+// Better — hoist read to a lambda
+Box(
+    Modifier.graphicsLayer {
+        alpha = progress                     // same as above; the optimization applies to
+                                              // the GPU transform, not the state read
+    }
+)
+```
+
+The key benefit: applying the transform doesn't force composition
+invalidation. Cheap.
+
+---
+
+## AGSL — runtime shaders (Android 13+)
+
+Android 13 introduced **AGSL** (Android Graphics Shading Language) — a
+GLSL-like language for fragment shaders that runs on Skia. Use it for:
+- Custom gradients, noise, blur
+- Real-time effects (ripple, chromatic aberration)
+- Color transformations
+
+```kotlin
+val shader = RuntimeShader("""
+    uniform float2 resolution;
+    uniform float time;
+    
+    half4 main(float2 fragCoord) {
+        float2 uv = fragCoord / resolution;
+        half3 color = half3(uv.x, uv.y, 0.5 + 0.5 * sin(time));
+        return half4(color, 1.0);
+    }
+""")
+
+@Composable
+fun AnimatedShader(modifier: Modifier = Modifier) {
+    val time = remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            withInfiniteAnimationFrameMillis { ms ->
+                time.floatValue = ms / 1000f
+            }
+        }
+    }
+
+    Canvas(modifier.fillMaxSize()) {
+        shader.setFloatUniform("resolution", size.width, size.height)
+        shader.setFloatUniform("time", time.floatValue)
+
+        val brush = ShaderBrush(shader)
+        drawRect(brush)
+    }
+}
+```
+
+### AGSL use cases
+
+```kotlin
+// Noise-based mesh gradient
+val noiseShader = """
+    uniform float2 resolution;
+    uniform float scale;
+    
+    half random(float2 p) {
+        return fract(sin(dot(p, float2(12.9898, 78.233))) * 43758.5453);
+    }
+    
+    half4 main(float2 fragCoord) {
+        float2 uv = fragCoord / resolution * scale;
+        float n = random(floor(uv));
+        return half4(half3(n), 1.0);
+    }
+"""
+
+// Blur (simplified — use RenderEffect.createBlurEffect for real blur)
+val blurShader = """
+    uniform shader content;
+    uniform float radius;
+    
+    half4 main(float2 fragCoord) {
+        half4 sum = half4(0.0);
+        for (float x = -radius; x <= radius; x += 1.0) {
+            for (float y = -radius; y <= radius; y += 1.0) {
+                sum += content.eval(fragCoord + float2(x, y));
+            }
+        }
+        return sum / pow(2.0 * radius + 1.0, 2.0);
+    }
+"""
+```
+
+### RenderEffect — GPU post-processing
+
+For blur (more efficient than writing your own):
+
+```kotlin
+Modifier.graphicsLayer {
+    if (Build.VERSION.SDK_INT >= 31) {
+        renderEffect = RenderEffect.createBlurEffect(
+            20f, 20f,                                    // radius X, Y
+            Shader.TileMode.DECAL
+        ).asComposeRenderEffect()
+    }
+}
+```
+
+Apply blur to a composable subtree — the GPU handles it. Used in iOS-style
+frosted-glass backgrounds, glass morphism effects.
+
+---
+
+## Animated vector drawables
+
+For icon state transitions (hamburger ↔ X, play ↔ pause), use
+`AnimatedVectorDrawable`:
+
+```xml
+<!-- res/drawable/avd_menu_to_close.xml -->
+<animated-vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/ic_menu">
+    <target
+        android:name="top_line"
+        android:animation="@animator/top_rotate"/>
+    <target
+        android:name="bottom_line"
+        android:animation="@animator/bottom_rotate"/>
+</animated-vector>
+```
+
+```kotlin
+val avd = AnimatedImageVector.animatedVectorResource(R.drawable.avd_menu_to_close)
+val atEnd = remember { mutableStateOf(false) }
+
+Image(
+    painter = rememberAnimatedVectorPainter(avd, atEnd.value),
+    contentDescription = null,
+    modifier = Modifier.clickable { atEnd.value = !atEnd.value }
+)
+```
+
+Perfect for microinteractions — small, vector-based, efficient.
+
+---
+
+## Performance — reading the tea leaves
+
+### Android Studio — Layout Inspector recomposition counts
+
+Enable in Layout Inspector → "Show recomposition counts." Each composable
+shows composition count vs skip count. Hot paths (items in lists, scroll-
+bound elements) should show high skip counts — if not, investigate
+stability.
+
+### Perfetto trace
+
+```kotlin
+Trace.beginSection("ChartRender")
+try {
+    renderChart()
+} finally {
+    Trace.endSection()
+}
+```
+
+```bash
+./gradlew :app:assembleDebug
+adb shell perfetto -o /data/misc/perfetto-traces/trace.pftrace -c - <<EOF
+duration_ms: 10000
+buffers { size_kb: 63488 }
+data_sources {
+    config {
+        name: "android.gpu.memory"
+        target_buffer: 0
+    }
+}
+EOF
+```
+
+Open in ui.perfetto.dev — see per-frame timing, GPU work, main thread
+blocking.
+
+### GPU overdraw
+
+`Developer Options → Debug GPU overdraw → show overdraw areas`. Green =
+1x, red = 4x+. Anything red is wasted pixels.
+
+Common causes:
+- Full-screen background + opaque cards on top (2x overdraw)
+- Gradient backgrounds behind solid cards
+- Unnecessary `background(Color.White)` on every screen
+
+Fix: remove redundant backgrounds; use `clipToBounds()` for composites.
+
+---
+
+## Bitmap management
+
+### Memory-aware bitmap decoding
+
+```kotlin
+fun decodeSampledBitmap(path: String, reqWidth: Int, reqHeight: Int): Bitmap? {
+    // First pass — get dimensions only
+    val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, options)
+
+    // Compute sample size
+    options.inSampleSize = calculateSampleSize(options, reqWidth, reqHeight)
+    options.inJustDecodeBounds = false
+    options.inPreferredConfig = Bitmap.Config.ARGB_8888     // or RGB_565 for 50% memory
+
+    return BitmapFactory.decodeFile(path, options)
+}
+
+fun calculateSampleSize(options: BitmapFactory.Options, reqW: Int, reqH: Int): Int {
+    val (h, w) = options.outHeight to options.outWidth
+    var sample = 1
+    while (h / sample > reqH && w / sample > reqW) sample *= 2
+    return sample
+}
+```
+
+**Coil / Glide handle this automatically.** Don't roll your own bitmap
+loading unless you have a specific reason.
+
+### Bitmap pools
+
+For frequent allocations (video frames, real-time effects):
+
+```kotlin
+class BitmapPool(private val maxSize: Int = 8) {
+    private val pool = ArrayDeque<Bitmap>()
+
+    fun acquire(width: Int, height: Int, config: Bitmap.Config): Bitmap {
+        synchronized(pool) {
+            val iter = pool.iterator()
+            while (iter.hasNext()) {
+                val b = iter.next()
+                if (b.width == width && b.height == height && b.config == config) {
+                    iter.remove()
+                    return b
+                }
+            }
+        }
+        return Bitmap.createBitmap(width, height, config)
+    }
+
+    fun release(bitmap: Bitmap) {
+        synchronized(pool) {
+            if (pool.size < maxSize) {
+                bitmap.eraseColor(Color.TRANSPARENT)
+                pool.addLast(bitmap)
+            } else {
+                bitmap.recycle()
+            }
+        }
+    }
+}
+```
+
+Use for custom Canvas / CameraX pipelines where you'd otherwise allocate
+thousands of bitmaps per minute.
+
+---
+
+## Custom layouts — one layer deeper
+
+If you're drawing complex UI with Compose, sometimes a custom `Layout`
+modifier beats multiple `Canvas` calls:
+
+```kotlin
+@Composable
+fun CircularMenu(items: List<String>, modifier: Modifier = Modifier) {
+    Layout(
+        content = {
+            items.forEach { item ->
+                Box(Modifier.padding(8.dp)) { Text(item) }
+            }
+        },
+        modifier = modifier
+    ) { measurables, constraints ->
+        val placeables = measurables.map { it.measure(constraints) }
+        val radius = constraints.maxWidth / 3
+
+        layout(constraints.maxWidth, constraints.maxWidth) {
+            val centerX = constraints.maxWidth / 2
+            val centerY = constraints.maxWidth / 2
+            placeables.forEachIndexed { i, p ->
+                val angle = 2 * PI * i / placeables.size
+                val x = centerX + (cos(angle) * radius).toInt() - p.width / 2
+                val y = centerY + (sin(angle) * radius).toInt() - p.height / 2
+                p.placeRelative(x, y)
+            }
+        }
+    }
+}
+```
+
+See [Compose Custom Layouts & Gestures](/docs/jetpack-compose/custom-layouts-gestures)
+for the deep dive.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Graphics mistakes',
+    variant: 'old',
+    points: [
+      'Path computed per frame in Canvas',
+      'Modifier.rotate() / scale() for animations (re-layout)',
+      'background() on every composable (overdraw)',
+      'Bitmap allocations per frame',
+      'Writing own blur instead of RenderEffect',
+      'Ignoring recomposition counts in Layout Inspector'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Fast graphics',
+    variant: 'new',
+    points: [
+      'drawWithCache memoizes paths per size',
+      'graphicsLayer { } for transforms (GPU)',
+      'Remove redundant backgrounds; clipToBounds',
+      'Bitmap pools for high-rate allocation',
+      'RenderEffect.createBlurEffect on Android 12+',
+      'Profile with Layout Inspector + Perfetto'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Graphics rules">
+- **Canvas + `drawWithCache`** for custom drawings — memoize paths and brushes.
+- **`graphicsLayer`** for animated transforms; avoids re-layout.
+- **AGSL runtime shaders** (Android 13+) for custom fragment effects.
+- **`RenderEffect`** for blur and other GPU post-processing.
+- **AnimatedVectorDrawable** for state-transition icons.
+- **Bitmap management** via pools for high-rate allocation; Coil / Glide for most cases.
+- **Profile with Layout Inspector recomposition counts + Perfetto + Overdraw**.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Waveform visualizer', description: 'Build a live audio waveform with drawWithCache. Measure framerate in Perfetto.' },
+  { title: 'AGSL gradient', description: 'Write a noise-based mesh gradient using AGSL. Feed screen size + time as uniforms.' },
+  { title: 'Blur effect', description: 'Use RenderEffect.createBlurEffect to blur a background in an iOS-style modal. Measure CPU vs GPU load.' },
+  { title: 'Animated icon', description: 'Create an AnimatedVectorDrawable for a hamburger-to-X menu icon. Use it with rememberAnimatedVectorPainter in Compose.' },
+  { title: 'Overdraw audit', description: 'Enable "Debug GPU overdraw" in Developer Options. Walk through your app. Fix every red (4x+) region.' }
+]} />
+
+## Next
+
+Continue to **[Media3 / ExoPlayer](./media3-exoplayer)** for video /
+audio playback, or **[Battery & Power](./battery-power)** for resource
+efficiency.

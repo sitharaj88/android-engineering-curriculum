@@ -1,0 +1,554 @@
+---
+id: services-notifications
+title: Services & Notifications
+sidebar_label: Services & Notifications
+description: Foreground services, bound services, Android 14 foreground service types, notification channels, rich notifications (MessagingStyle, actions, direct reply), and deep links.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Services & Notifications
+
+Services run code outside of an Activity. Modern Android heavily
+restricts them — a background service running a loop is no longer
+allowed. This chapter covers the correct use cases, Android 14's
+mandatory foreground service types, and the notification surface.
+
+## The three service types
+
+| Service type          | Lives as long as         | Common use                            |
+|-----------------------|--------------------------|---------------------------------------|
+| **Foreground**        | User-visible notification | Media, location tracking, uploads     |
+| **Bound**             | At least one client connected | In-process IPC, continuous state |
+| **Background (legacy)** | Restricted since Android 8 | Mostly use WorkManager instead      |
+
+For **fire-and-forget background work**, use WorkManager. Services exist
+for **user-visible ongoing operations** or **IPC**.
+
+---
+
+## Foreground Services
+
+### Declaring
+
+```xml
+<!-- AndroidManifest.xml -->
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+
+<!-- Android 14+: declare a type that matches your use case -->
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+<application>
+    <service
+        android:name=".TrackingService"
+        android:foregroundServiceType="location"
+        android:exported="false"/>
+</application>
+```
+
+Android 14 (API 34) requires **declaring the service type** in the
+manifest **and** passing it to `startForeground`. Mismatches crash at
+runtime.
+
+### Foreground service types (Android 14)
+
+| Type              | For                                                    |
+|-------------------|--------------------------------------------------------|
+| `location`        | GPS, fused location                                    |
+| `mediaPlayback`   | Music/video playback with MediaSession                 |
+| `mediaProjection` | Screen recording                                       |
+| `camera`          | Camera use outside of the app UI                       |
+| `microphone`      | Continuous audio capture                               |
+| `phoneCall`       | Voice/video calls                                      |
+| `dataSync`        | Backup, upload, sync (generic)                         |
+| `connectedDevice` | Bluetooth, Wear OS, USB                                |
+| `health`          | Fitness tracking, workout sessions                     |
+| `remoteMessaging` | Real-time messaging, presence                          |
+| `shortService`    | Brief critical operation (max 3 minutes)               |
+| `specialUse`      | Only if none of the above; must justify to Play        |
+| `systemExempted`  | System apps only                                       |
+
+Picking the wrong type fails Play review for an update.
+
+### Starting a foreground service
+
+```kotlin
+class TrackingService : LifecycleService() {
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+
+        val notification = buildTrackingNotification()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIF_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            )
+        } else {
+            startForeground(NOTIF_ID, notification)
+        }
+
+        lifecycleScope.launch {
+            locationClient.updates().collect { location ->
+                trackingRepository.record(location)
+                updateNotification(location)
+            }
+        }
+
+        return START_STICKY
+    }
+
+    private fun buildTrackingNotification(): Notification {
+        val stopIntent = Intent(this, TrackingService::class.java).apply { action = ACTION_STOP }
+        val stopPi = PendingIntent.getService(this, 0, stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
+        return NotificationCompat.Builder(this, CHANNEL_TRACKING)
+            .setSmallIcon(R.drawable.ic_tracking)
+            .setContentTitle("Recording workout")
+            .setContentText("Tap to return")
+            .setContentIntent(/* open activity */)
+            .addAction(R.drawable.ic_stop, "Stop", stopPi)
+            .setOngoing(true)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .build()
+    }
+
+    override fun onBind(intent: Intent): IBinder? {
+        super.onBind(intent)
+        return null
+    }
+}
+
+// Launch from Activity/ViewModel
+fun startTracking(context: Context) {
+    val intent = Intent(context, TrackingService::class.java)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        context.startForegroundService(intent)
+    } else {
+        context.startService(intent)
+    }
+}
+```
+
+### Android 12+ background start restrictions
+
+Starting a foreground service **from the background** (no visible Activity,
+no recent user interaction) throws `ForegroundServiceStartNotAllowedException`
+on Android 12+. Exceptions:
+
+- User-initiated via PendingIntent (tapped a notification)
+- Foreground service already running, restarted by system
+- Came from `postDelayed(Handler)` if scheduled while app was foreground (narrow window)
+
+**The fix**: use WorkManager expedited work for background-triggered
+operations. Start foreground services from user-visible UI only.
+
+### `START_STICKY` vs `START_NOT_STICKY`
+
+```kotlin
+return START_STICKY        // system restarts service with null intent
+return START_NOT_STICKY    // system doesn't restart (prefer this for most cases)
+return START_REDELIVER_INTENT  // restart with the original intent
+```
+
+For most foreground services, `START_NOT_STICKY` is safer — the user or
+your app re-starts it explicitly. `START_STICKY` silent-restarts can
+surprise users.
+
+### Stopping
+
+```kotlin
+if (intent?.action == ACTION_STOP) {
+    stopForeground(STOP_FOREGROUND_REMOVE)
+    stopSelf()
+    return START_NOT_STICKY
+}
+```
+
+---
+
+## Bound Services
+
+```kotlin
+class AudioTranscoderService : Service() {
+
+    private val binder = LocalBinder()
+    inner class LocalBinder : Binder() {
+        fun getService(): AudioTranscoderService = this@AudioTranscoderService
+    }
+
+    override fun onBind(intent: Intent): IBinder = binder
+
+    suspend fun transcode(uri: Uri, format: AudioFormat): Uri = withContext(Dispatchers.Default) {
+        /* heavy work */
+    }
+}
+
+// Activity side
+private var transcoder: AudioTranscoderService? = null
+private val connection = object : ServiceConnection {
+    override fun onServiceConnected(name: ComponentName, service: IBinder) {
+        transcoder = (service as AudioTranscoderService.LocalBinder).getService()
+    }
+    override fun onServiceDisconnected(name: ComponentName) {
+        transcoder = null
+    }
+}
+
+override fun onStart() {
+    super.onStart()
+    bindService(Intent(this, AudioTranscoderService::class.java), connection, BIND_AUTO_CREATE)
+}
+
+override fun onStop() {
+    super.onStop()
+    unbindService(connection)
+    transcoder = null
+}
+```
+
+Bound services are useful when:
+- A single instance with in-memory state needs to be shared
+- IPC across processes (via AIDL)
+- Long-running object lives past an Activity but ties to client lifecycles
+
+For most use cases, prefer a `@Singleton` with Hilt over a bound service
+— simpler and lifecycle-friendly.
+
+---
+
+## Notifications — the full surface
+
+### Channels (Android 8+)
+
+Create at first launch; users control each one independently from system
+settings:
+
+```kotlin
+@Singleton
+class NotificationChannels @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    fun ensureCreated() {
+        val mgr = context.getSystemService(NotificationManager::class.java)
+
+        mgr.createNotificationChannels(listOf(
+            channel(CH_MESSAGES,    "Messages",    NotificationManager.IMPORTANCE_HIGH,    "Chat messages and DMs"),
+            channel(CH_MENTIONS,    "Mentions",    NotificationManager.IMPORTANCE_HIGH,    "When someone @mentions you"),
+            channel(CH_UPLOADS,     "Uploads",     NotificationManager.IMPORTANCE_LOW,     "Upload progress"),
+            channel(CH_PROMOTIONS,  "Promotions",  NotificationManager.IMPORTANCE_LOW,     "Offers and announcements"),
+            channel(CH_TRACKING,    "Tracking",    NotificationManager.IMPORTANCE_LOW,     "Workout and delivery tracking")
+        ))
+    }
+
+    private fun channel(id: String, name: String, importance: Int, description: String) =
+        NotificationChannel(id, name, importance).apply { this.description = description }
+}
+```
+
+### Importance → user experience
+
+| Level                     | Alert                              | Lock screen    |
+|---------------------------|------------------------------------|----------------|
+| `IMPORTANCE_HIGH`         | Sound + heads-up + vibrate         | Public         |
+| `IMPORTANCE_DEFAULT`      | Sound, no heads-up                 | Public         |
+| `IMPORTANCE_LOW`          | No sound                           | Public         |
+| `IMPORTANCE_MIN`          | Silent, no icon in status bar      | Public         |
+| `IMPORTANCE_NONE`         | Blocked                             | Hidden         |
+
+Use `LOW` for progress and ambient info. Reserve `HIGH` for things the
+user opted in to (messages, calls).
+
+### Deep link from notification
+
+```kotlin
+fun buildMessageNotification(context: Context, message: ChatMessage): Notification {
+    val args = bundleOf("convId" to message.convId)
+    val deepLinkIntent = NavDeepLinkBuilder(context)
+        .setGraph(R.navigation.nav_graph)
+        .setDestination(R.id.conversation_dest)
+        .setArguments(args)
+        .createPendingIntent()
+
+    return NotificationCompat.Builder(context, CH_MESSAGES)
+        .setSmallIcon(R.drawable.ic_notif)
+        .setContentTitle(message.senderName)
+        .setContentText(message.body)
+        .setContentIntent(deepLinkIntent)
+        .setAutoCancel(true)
+        .build()
+}
+```
+
+### MessagingStyle — for chat apps
+
+```kotlin
+val self = Person.Builder().setName("You").setKey("me").build()
+val author = Person.Builder()
+    .setName(message.senderName)
+    .setKey(message.senderId)
+    .setIcon(IconCompat.createWithBitmap(avatar))
+    .build()
+
+val style = NotificationCompat.MessagingStyle(self)
+    .setConversationTitle(message.convTitle)
+    .setGroupConversation(true)
+    // Add previous messages for thread context
+    .addMessage("Hi", message.previousMessageAt, author)
+    .addMessage(message.body, message.sentAt, author)
+
+val notification = NotificationCompat.Builder(context, CH_MESSAGES)
+    .setSmallIcon(R.drawable.ic_notif)
+    .setStyle(style)
+    .setShortcutId(message.convId)                     // linked to a ShortcutInfo for conversations
+    .setLocusId(LocusIdCompat(message.convId))
+    .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+    .build()
+```
+
+Android renders MessagingStyle with per-author avatars, inline replies,
+and surfaces it in the Conversations section.
+
+### Direct reply
+
+```kotlin
+val remoteInput = RemoteInput.Builder("reply_text")
+    .setLabel("Reply")
+    .build()
+
+val replyPending = PendingIntent.getBroadcast(
+    context, message.convId.hashCode(),
+    Intent(context, DirectReplyReceiver::class.java).apply {
+        action = ACTION_DIRECT_REPLY
+        putExtra(EXTRA_CONV_ID, message.convId)
+    },
+    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_MUTABLE
+)
+
+val replyAction = NotificationCompat.Action.Builder(R.drawable.ic_send, "Reply", replyPending)
+    .addRemoteInput(remoteInput)
+    .setAllowGeneratedReplies(true)
+    .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_REPLY)
+    .build()
+```
+
+```kotlin
+class DirectReplyReceiver : BroadcastReceiver() {
+    @Inject lateinit var messageRepo: MessageRepository
+
+    override fun onReceive(context: Context, intent: Intent) {
+        val convId = intent.getStringExtra(EXTRA_CONV_ID) ?: return
+        val text = RemoteInput.getResultsFromIntent(intent)?.getCharSequence("reply_text") ?: return
+
+        CoroutineScope(Dispatchers.IO).launch {
+            messageRepo.send(convId, text.toString())
+
+            // Update the notification to show the reply was sent
+            val updated = /* rebuild with the new message added to MessagingStyle */
+            NotificationManagerCompat.from(context).notify(convId.hashCode(), updated)
+        }
+    }
+}
+```
+
+### Actions
+
+```kotlin
+.addAction(R.drawable.ic_archive, "Archive", archivePendingIntent)
+.addAction(R.drawable.ic_delete, "Delete", deletePendingIntent)
+```
+
+### BigTextStyle and BigPictureStyle
+
+```kotlin
+// Expandable text
+.setStyle(NotificationCompat.BigTextStyle().bigText(fullArticleBody))
+
+// Expandable image
+.setStyle(NotificationCompat.BigPictureStyle()
+    .bigPicture(photoBitmap)
+    .setSummaryText("New photo from Aarav"))
+```
+
+### InboxStyle — multiple notifications rolled up
+
+```kotlin
+.setStyle(NotificationCompat.InboxStyle()
+    .addLine("Aarav: hey")
+    .addLine("Diya: meeting at 3?")
+    .addLine("Kabir: lunch?")
+    .setSummaryText("3 new messages"))
+```
+
+### Progress
+
+```kotlin
+// Indeterminate
+.setProgress(0, 0, true)
+
+// Determinate (current, max)
+.setProgress(100, 45, false)
+```
+
+### Groups & summaries
+
+```kotlin
+val groupKey = "message_group"
+
+val indiv = NotificationCompat.Builder(context, CH_MESSAGES)
+    .setSmallIcon(R.drawable.ic_notif)
+    .setContentTitle("Aarav")
+    .setContentText("hey")
+    .setGroup(groupKey)
+    .build()
+
+val summary = NotificationCompat.Builder(context, CH_MESSAGES)
+    .setSmallIcon(R.drawable.ic_notif)
+    .setContentTitle("3 new messages")
+    .setStyle(NotificationCompat.InboxStyle()
+        .addLine("Aarav: hey")
+        .addLine("Diya: meeting?")
+        .setSummaryText("3 new messages"))
+    .setGroup(groupKey)
+    .setGroupSummary(true)
+    .build()
+
+NotificationManagerCompat.from(context).apply {
+    notify(MESSAGE_ID_1, indiv)
+    notify(SUMMARY_ID, summary)
+}
+```
+
+Android bundles grouped notifications visually.
+
+### Bubbles (Android 11+)
+
+For continuous conversations, Bubbles let the notification become a
+floating chat head:
+
+```kotlin
+val bubbleMeta = NotificationCompat.BubbleMetadata.Builder(
+    bubblePendingIntent,                              // PendingIntent opening the bubble
+    IconCompat.createWithBitmap(avatar)
+)
+    .setDesiredHeight(600)
+    .setAutoExpandBubble(false)
+    .setSuppressNotification(true)
+    .build()
+
+val notif = NotificationCompat.Builder(context, CH_MESSAGES)
+    .setStyle(messagingStyle)
+    .setBubbleMetadata(bubbleMeta)
+    .setShortcutId(convId)                            // required
+    .setLocusId(LocusIdCompat(convId))
+    .build()
+```
+
+Required: a `ShortcutInfoCompat` with `setLongLived(true)` published via
+`ShortcutManagerCompat`. See the Conversation shortcuts API.
+
+### Styling tips
+
+- `setColorized(true)` + `setColor(accent)` — filled background (Android 10+)
+- `setLargeIcon(avatar)` — round picture on the right
+- `setSubText(badge)` — small text beside the timestamp
+- `setTimeoutAfter(ms)` — auto-dismiss after duration
+
+---
+
+## POST_NOTIFICATIONS runtime permission (Android 13+)
+
+```kotlin
+@Composable
+fun RequestPostNotificationsPermission(onResult: (Boolean) -> Unit) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+        LaunchedEffect(Unit) { onResult(true) }
+        return
+    }
+
+    val context = LocalContext.current
+    if (ContextCompat.checkSelfPermission(
+            context, Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+    ) {
+        LaunchedEffect(Unit) { onResult(true) }
+        return
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> onResult(granted) }
+
+    LaunchedEffect(Unit) { launcher.launch(Manifest.permission.POST_NOTIFICATIONS) }
+}
+```
+
+Ask **in context** (after the user opts into chat notifications, for
+example) — not on first launch.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Service/notification mistakes',
+    variant: 'old',
+    points: [
+      'Using a Service for fire-and-forget work (use WorkManager)',
+      'Starting a foreground service from the background on Android 12+',
+      'No notification channel — Android 8+ requires one',
+      'Missing foregroundServiceType on Android 14',
+      'Asking POST_NOTIFICATIONS on first launch',
+      'One channel for everything'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production patterns',
+    variant: 'new',
+    points: [
+      'WorkManager for fire-and-forget; FG service for ongoing visible work',
+      'Start FG services only from user-visible UI',
+      'Declare and create channels in onCreate of Application',
+      'Match foregroundServiceType to manifest + permission',
+      'Context-based permission request, with rationale',
+      'Per-category channels so users can mute independently'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Service / notification rules">
+- **Foreground services** for user-visible ongoing work (location, media, long uploads).
+- **Android 14** requires the correct `foregroundServiceType` in manifest AND `startForeground()`.
+- **Background FG starts are banned** on Android 12+ except from user-initiated intents.
+- **Notification channels** per category since Android 8; users control each.
+- **MessagingStyle + shortcut + LocusId** unlocks inline reply and bubbles.
+- **`POST_NOTIFICATIONS`** is runtime permission since Android 13.
+- **Prefer WorkManager** for fire-and-forget work; services for ongoing visible operations.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Location tracking service', description: 'Build a foreground service with foregroundServiceType=\"location\". Include a Stop action that calls stopForeground.' },
+  { title: 'Category channels', description: 'Create 4 notification channels (messages, mentions, uploads, promos) with varied importance. Verify users can mute one independently.' },
+  { title: 'Direct reply', description: 'Add a RemoteInput + BroadcastReceiver to a message notification. Send the reply without opening the app.' },
+  { title: 'MessagingStyle', description: 'Render a chat notification with Person avatars, conversation title, and thread history using MessagingStyle.' },
+  { title: 'Runtime permission', description: 'Add RequestPostNotificationsPermission in a Compose onboarding step. Show rationale if the user denied once.' }
+]} />
+
+## Next
+
+Continue to **[Permissions & Biometric](./permissions-biometric)** for runtime permissions, or **[CameraX & Sensors](./camerax-sensors)** for camera and sensor work.

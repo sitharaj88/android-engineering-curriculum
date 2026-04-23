@@ -1,0 +1,507 @@
+---
+id: system-design-walkthroughs
+title: Android System Design Walkthroughs
+sidebar_label: System Design
+description: Four complete Android system-design interview walkthroughs — chat, Instagram feed, ride-hailing, and offline-first notes. Requirements, architecture, edge cases.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Android System Design Walkthroughs
+
+System design is the highest-variance round in senior Android
+interviews. Most engineers know the components (ViewModel, Room, Retrofit)
+but haven't practiced **designing a full system end-to-end**. This
+chapter walks through four classic Android system-design prompts with the
+five-step framework from [Module 20 overview](./overview).
+
+## The five-step framework
+
+```text
+1. Scope (5 min)       — clarify requirements, assumptions, success metrics
+2. High-level          — sketch the architecture (layers, modules, services)
+3. Data model + sync   — what's stored where; how writes / reads flow
+4. Failure modes       — offline, race conditions, concurrency, scale
+5. Observability       — what metrics define success; rollout plan
+```
+
+Senior signal: spend **half** the time on steps 4-5. Juniors design the
+happy path; staff engineers stress-test it.
+
+---
+
+## Walkthrough 1 — Offline-first chat app
+
+### 1. Scope
+
+**Clarifying questions:**
+
+- **1-on-1 or group?** → 1-on-1 first; group chat is stretch.
+- **Scale?** → 100M DAU, 1B messages/day, P99 1s send-to-deliver.
+- **Offline?** → Full offline: send, read, react when disconnected.
+- **Media?** → Photos + short video + voice notes.
+- **E2E encryption?** → Signal Protocol; assume 3rd-party library (libsignal).
+- **Success metrics** → P99 send latency < 1s, delivery success ≥ 99.9%,
+  cold-start to inbox < 1s, crash-free ≥ 99.5%.
+- **Out of scope** → Calling, ephemeral messages, stickers.
+
+### 2. High-level architecture
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│  UI Layer (Compose)                                            │
+│    InboxScreen · ConversationScreen · ComposerScreen           │
+├────────────────────────────────────────────────────────────────┤
+│  Presentation (MVVM / MVI)                                     │
+│    InboxViewModel · ConversationViewModel (with state machine) │
+├────────────────────────────────────────────────────────────────┤
+│  Domain                                                        │
+│    SendMessageUseCase · ObserveConversationUseCase             │
+│    Entities: Message, Conversation, Reaction, Presence         │
+├────────────────────────────────────────────────────────────────┤
+│  Data                                                          │
+│    MessageRepository (single source of truth: Room)            │
+│      ↓                 ↓                   ↓                   │
+│    Room             OutboxQueue         ChatSocket             │
+│    (encrypted       (WorkManager)       (WebSocket + resume)   │
+│     via SQLCipher)                                             │
+│      ↑                                                         │
+│    SyncWorker ← cursor-based sync ← backend                    │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 3. Data model
+
+```kotlin
+@Entity(tableName = "messages", indices = [Index("conversationId", "sentAt")])
+data class MessageEntity(
+    @PrimaryKey val id: String,             // client-generated UUID
+    val conversationId: String,
+    val authorId: String,
+    val body: String,                        // encrypted before storage
+    val sentAt: Long,                        // client clock
+    val serverAt: Long?,                     // nullable until acked
+    val status: MessageStatus,               // DRAFT → SENDING → SENT → DELIVERED → READ | FAILED
+    val attempts: Int = 0,
+    val replyToId: String? = null,
+    val attachmentUri: String? = null
+)
+
+@Entity(tableName = "conversations")
+data class ConversationEntity(
+    @PrimaryKey val id: String,
+    val lastMessageId: String?,
+    val unreadCount: Int,
+    val participantIds: String,              // CSV
+    val updatedAt: Long
+)
+
+@Entity(primaryKeys = ["messageId", "userId", "emoji"])
+data class ReactionEntity(
+    val messageId: String,
+    val userId: String,
+    val emoji: String
+)
+```
+
+**Offline send flow:**
+
+```text
+User types → Room INSERT (status=SENDING, id=UUID)
+     ↓ instant UI update (optimistic)
+OutboxWorker picks up SENDING messages
+     ↓
+ChatSocket.send(msg) → server replies { id, serverAt }
+     ↓
+Room UPDATE status=SENT, serverAt=?
+     ↓
+Server fans out → other device receives via WebSocket
+     ↓
+Recipient ack → status=DELIVERED / READ
+```
+
+### 4. Failure modes (the senior signal)
+
+| Failure                                    | Response                                                     |
+|--------------------------------------------|--------------------------------------------------------------|
+| Process dies mid-send                      | OutboxWorker retries on next start with same UUID (idempotency) |
+| WebSocket disconnects                      | Exponential backoff + resume cursor (last event ID)          |
+| Duplicate message IDs                      | Server dedupes via idempotency key                           |
+| Deleted message while offline              | Tombstone event; apply on next sync                          |
+| Schema migration                           | Room migration + server-side version compatibility           |
+| Battery-constrained devices                | Debounce typing indicator, coalesce read receipts            |
+| Low-memory kill during video upload        | WorkManager foreground with partial-upload resume            |
+| Clock skew (client sentAt vs server)       | Server normalizes sentAt to server receipt time              |
+| Participant removed from group             | Server rejects subsequent writes; client gets 403 → mark     |
+| Network partition (split-brain)            | Client always wins for own sends; conflicts resolved LWW     |
+
+### 5. Observability + rollout
+
+**SLIs:**
+- Send success rate ≥ 99.5%
+- Send P95 latency < 1s
+- Deliver P95 latency < 3s
+- Conversation cold-load < 500ms
+- Crash-free sessions ≥ 99.5%
+
+**Custom Crashlytics keys:** `conversation_id`, `message_id`, `network_state`.
+
+**Rollout:** 1% → 5% → 25% → 100% over a week; automatic halt on
+crash-free regression below 99.5%.
+
+**Feature flag:** `chat_v2_enabled` for gradual opt-in.
+
+### Why this is a good answer
+
+- Five steps, each ~5 min
+- Data model is concrete (field names, indexes)
+- **Failure modes list is ~half the answer** — staff signal
+- Observability feeds into rollout discipline
+
+---
+
+## Walkthrough 2 — Instagram-style photo feed
+
+### 1. Scope
+
+- **Scale:** 500M DAU, each scrolling ~100 posts per session.
+- **Content:** Photos + short video; following + Explore / discover feeds.
+- **Offline:** Cache recent posts; post offline not required.
+- **Interactions:** Like, comment count, share button.
+- **Success:** Cold start < 1s, scroll jank < 1% frames, engagement
+  (like rate) stable.
+- **Out of scope:** Posting, DMs.
+
+### 2. High-level
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  Feed (LazyColumn + Paging 3)                                │
+├──────────────────────────────────────────────────────────────┤
+│  FeedViewModel                                                │
+│    - Observes PagingData<Post>                                │
+│    - Emits prefetch requests for visible items                │
+├──────────────────────────────────────────────────────────────┤
+│  FeedRepository                                               │
+│    - Pager<String, PostEntity>(RemoteMediator)                │
+│    - Cache-aside via Room                                     │
+├──────────────────────────────────────────────────────────────┤
+│  Remote: GraphQL for structured data (Apollo)                 │
+│  Media: CDN with adaptive images (srcset by density)          │
+│  Prefetch: Coil ImageLoader warmed with next 3 posts         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 3. Data + paging
+
+```kotlin
+@Entity(tableName = "posts", indices = [Index("feedPosition")])
+data class PostEntity(
+    @PrimaryKey val id: String,
+    val authorId: String,
+    val authorName: String,        // denormalized
+    val authorAvatar: String,      // denormalized
+    val mediaUrl: String,
+    val mediaAspect: Float,        // for layout stability
+    val caption: String,
+    val likeCount: Int,
+    val commentCount: Int,
+    val liked: Boolean,
+    val createdAt: Long,
+    val feedPosition: Long         // server-assigned cursor
+)
+
+@OptIn(ExperimentalPagingApi::class)
+class FeedRemoteMediator(
+    private val api: FeedApi,
+    private val db: AppDatabase
+) : RemoteMediator<Int, PostEntity>() {
+
+    override suspend fun load(loadType: LoadType, state: PagingState<Int, PostEntity>): MediatorResult {
+        val cursor = when (loadType) {
+            LoadType.REFRESH -> null
+            LoadType.APPEND -> db.remoteKeyDao().last()?.nextCursor ?: return MediatorResult.Success(true)
+            LoadType.PREPEND -> return MediatorResult.Success(endOfPaginationReached = true)
+        }
+
+        return try {
+            val page = api.feed(cursor, limit = state.config.pageSize)
+            db.withTransaction {
+                if (loadType == LoadType.REFRESH) db.postDao().clear()
+                db.postDao().insertAll(page.items.map(PostDto::toEntity))
+                db.remoteKeyDao().insert(RemoteKey(nextCursor = page.nextCursor))
+            }
+            MediatorResult.Success(endOfPaginationReached = page.nextCursor == null)
+        } catch (e: Exception) {
+            MediatorResult.Error(e)
+        }
+    }
+}
+```
+
+### 4. Failure modes
+
+- **Slow network** → Show cached feed, skeleton placeholders, retry
+  interval on pull-to-refresh
+- **Image failure** → Per-image fallback (blurhash → dominant color → icon)
+- **Stale feed** → `nextCursor` becomes invalid after 24h; server 410 →
+  trigger refresh
+- **Like race condition** → Optimistic with rollback (Module 04 + Data
+  Patterns)
+- **Scroll jank** → Stable item keys, `@Immutable` PostEntity, Paparazzi
+  snapshot tests
+- **OOM from image cache** → Coil's MemoryCache configured to 15% of heap
+- **Comment count drift** → Real-time listener over WebSocket for visible
+  posts; batched elsewhere
+
+### 5. Observability
+
+- Feed load P95 < 500ms (post cache hit)
+- Scroll jank rate < 0.5%
+- Per-post impression logs sampled at 1%
+- Experiment: A/B ranking algorithm via server-provided feed cursor
+
+---
+
+## Walkthrough 3 — Ride-hailing customer app
+
+### 1. Scope
+
+- **Geography:** Global, multi-city
+- **Workflow:** Request → match → pickup → ride → payment
+- **Real-time:** Driver location updates every 2s during ride
+- **Payment:** Credit card, wallet
+- **Offline:** Read-only after ride starts; request requires network
+- **Success:** 99.5% ride start, map frame rate 60fps, battery < 10%/ride
+
+### 2. High-level
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  Home (Map + search bar) · RequestRide · DriverMatched ·     │
+│  InTrip · RideComplete · Payment · History                   │
+├──────────────────────────────────────────────────────────────┤
+│  RideViewModel — FSM (MVI): Idle → Requesting → Matched →   │
+│                             PickingUp → InTrip → Complete    │
+├──────────────────────────────────────────────────────────────┤
+│  RideRepository                                               │
+│    - Real-time ride state via gRPC bidirectional stream      │
+│    - Cached trip history (Room)                              │
+│    - Outbox for ratings / feedback (offline-submittable)     │
+├──────────────────────────────────────────────────────────────┤
+│  LocationClient (fused provider) · MapView · PaymentManager  │
+│    (Google Pay + card via Play Billing)                      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 3. Ride state machine
+
+```kotlin
+sealed interface RideState {
+    data object Idle : RideState
+    data class Requesting(val pickup: LatLng, val dest: LatLng) : RideState
+    data class Matched(val driver: Driver, val etaMinutes: Int) : RideState
+    data class InTrip(val driver: Driver, val currentLocation: LatLng, val etaMinutes: Int) : RideState
+    data class Completed(val trip: Trip, val amountCents: Long) : RideState
+    data class Cancelled(val reason: String) : RideState
+}
+
+sealed interface RideIntent {
+    data class Request(val pickup: LatLng, val dest: LatLng, val rideType: RideType) : RideIntent
+    data object Cancel : RideIntent
+    data class Rate(val stars: Int, val tip: Long = 0) : RideIntent
+}
+```
+
+Reducer: pure function over (State, Intent, Event) → (State, SideEffect).
+Easy to test: for each state, what does each intent do?
+
+### 4. Failure modes
+
+| Failure                             | Response                                             |
+|-------------------------------------|------------------------------------------------------|
+| Driver cancels after match          | RideState → Requesting; rematch automatically       |
+| Network lost during InTrip          | Keep showing last known state; use LocationClient's dead reckoning |
+| Driver location updates delay      | Interpolate toward last known position; show "driver may be delayed" |
+| Low battery during trip             | Reduce location updates to 10s; keep ride visible   |
+| Payment decline                     | Prompt alternate payment; offer wallet balance      |
+| Map tile load fails                 | Show cached tiles + offline indicator                |
+| Phone killed mid-trip               | Ride persists in backend; notification re-opens app |
+| Rating while offline                | Outbox + WorkManager flush when connected           |
+| Driver GPS jumping                 | Smooth with exponential moving average              |
+
+### 5. Observability + cost
+
+- Real-time driver location stream: P95 server-to-client < 800ms
+- Ride complete success rate ≥ 99.5%
+- Battery drain per 30-min ride < 8%
+- Map tile cache hit rate > 85%
+
+**Cost considerations:**
+- Location updates cost backend bandwidth → sample at 2s, interpolate client-side
+- Map tiles via CDN with 24h cache
+- gRPC with protobuf saves 5× bytes vs REST+JSON
+
+---
+
+## Walkthrough 4 — Offline-first notes app
+
+### 1. Scope
+
+- **Scale:** 10M DAU, 50 notes/user avg
+- **Offline:** Complete offline capability; edit, search, sync
+- **Collaboration:** Eventually multi-user; start solo
+- **Rich text:** Bold, italic, lists; not WYSIWYG editor
+- **Sync:** Across 2-3 devices per user (phone + tablet + web)
+- **Success:** Edit → sync P95 < 5s; no data loss ever
+
+### 2. High-level
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  UI: NoteListScreen · EditorScreen (Compose)                 │
+├──────────────────────────────────────────────────────────────┤
+│  EditorViewModel — TextFieldState for edit, outbox for sync │
+├──────────────────────────────────────────────────────────────┤
+│  NoteRepository                                               │
+│    Single source of truth: Room                               │
+│    Outbox table for pending ops                               │
+│    SyncWorker (periodic + expedited on connectivity)          │
+├──────────────────────────────────────────────────────────────┤
+│  Conflict resolution: CRDT (Yjs) OR operational transform    │
+│    (simpler: last-write-wins with server-side merge prompts) │
+├──────────────────────────────────────────────────────────────┤
+│  Search: Room FTS5 over note body                             │
+│  Encryption: SQLCipher; keys in Keystore                     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 3. Data model + sync
+
+```kotlin
+@Entity @Fts4(contentEntity = NoteEntity::class)
+data class NoteFts(@PrimaryKey val rowId: Long, val title: String, val body: String)
+
+@Entity(tableName = "notes")
+data class NoteEntity(
+    @PrimaryKey val id: String,
+    val title: String,
+    val body: String,                      // plain text or markdown
+    val createdAt: Long,
+    val updatedAt: Long,
+    val version: Long,                     // monotonic per note, for sync
+    val syncState: SyncState               // LOCAL, SYNCED, CONFLICT
+)
+
+@Entity(tableName = "outbox")
+data class OutboxEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val noteId: String,
+    val operation: String,                 // CREATE, UPDATE, DELETE
+    val payload: String,                   // serialized op
+    val attempt: Int = 0,
+    val createdAt: Long = System.currentTimeMillis()
+)
+```
+
+### Edit flow
+
+```text
+User types in EditorScreen
+    ↓
+TextFieldState → debounced (300ms) → Room UPDATE (version + 1, syncState = LOCAL)
+    ↓ + Outbox INSERT
+SyncWorker (triggered on update, or periodically)
+    ↓ POST to backend with expected version
+Backend 200 OK → Room UPDATE syncState = SYNCED; Outbox DELETE
+Backend 409 Conflict → Room UPDATE syncState = CONFLICT; show merge UI
+```
+
+### 4. Failure modes
+
+- **Process killed during edit** → Debounced writes may be lost;
+  minimize by flushing every 2s or on backgrounding
+- **Two devices edit same note** → Conflict detected via version mismatch;
+  prompt user with 3-way merge
+- **Network slow** → Queue grows; user sees "Sync pending" indicator
+- **Account locked** → Writes fail 403; user sees "Sign in again"
+- **Device reset** → Re-install → backend restores notes; no data in
+  cloud = data loss (backup important)
+- **Large note (10MB)** → Chunk-based upload; reconstruct server-side
+- **Search index stale** → Rebuild FTS table after bulk import
+- **Clock drift** → Client uses `updatedAt` from server on sync to avoid
+  future timestamps
+
+### 5. Observability + privacy
+
+- Sync success rate ≥ 99.9%
+- Edit-to-sync P95 < 5s
+- Search P95 < 200ms on 10k note corpus
+- **Privacy:** Notes encrypted on device; backend has body (not
+  E2E-encrypted by default); user can opt into E2E via passphrase-derived
+  key
+
+---
+
+## Patterns across all four
+
+| Pattern                                   | Appears in                         |
+|-------------------------------------------|------------------------------------|
+| Offline-first single source of truth     | Chat, Ride-hailing history, Notes |
+| Outbox + WorkManager                      | Chat sends, Notes sync, ratings   |
+| Idempotency via client UUIDs              | All four                           |
+| Optimistic UI with rollback               | Feed like, Chat send, Notes      |
+| State machine for complex flows          | Ride (FSM), Checkout, Chat        |
+| Real-time updates via WebSocket / gRPC    | Chat, Ride, Feed comment counts  |
+| Paging 3 with RemoteMediator             | Feed, Chat history, Notes list   |
+| Room FTS for search                       | Chat, Notes                       |
+| Encrypted storage (Keystore + SQLCipher)  | Chat, Notes                       |
+
+Notice these are the **same primitives**. System design isn't memorizing
+four different designs — it's **recognizing the right combination of
+patterns** for the prompt.
+
+---
+
+## Time management (60-min interview)
+
+```text
+  0-5 min   Scope (questions, assumptions)
+  5-15 min  High-level architecture (diagram)
+ 15-30 min  Data model + core flows
+ 30-50 min  Failure modes + trade-offs (the longest section)
+ 50-60 min  Observability + rollout
+           Q&A (30-60 sec per question)
+```
+
+If the interviewer prompts mid-architecture, **let them drive**. They're
+often probing for staff-level signal: "what if the server returns 500?",
+"how do you handle version skew?"
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="System design rules">
+- **Five steps**: scope → architecture → data → failure modes → observability.
+- **Half the answer is failure modes.** Juniors design happy paths; staff engineers stress-test.
+- **Show the state machine** — ride, chat, checkout are classic FSMs.
+- **Idempotency + outbox + optimistic UI** are the offline-first triad.
+- **Denormalize for reads** (author name in feed post, last-message in conversation).
+- **Cost-aware design**: polling vs push, sampling, batch updates.
+- **Observability from day 1**: SLIs → alerts → staged rollout → halt on regression.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Design Google Maps', description: 'Apply the five steps. Scope, high-level, data model (tile cache + offline regions), failure modes (GPS jumps, tile load fails), observability.' },
+  { title: 'Design TikTok', description: 'Focus on infinite video scroll: prefetching, memory budget, network adaptation, view completion tracking.' },
+  { title: 'Design Zoom', description: 'Real-time video call: codec selection, bandwidth adaptation, audio-only fallback, reconnection flows.' },
+  { title: 'Mock interview', description: 'Ask a peer to give you a prompt + 60 min. Time yourself through the five steps. Record; review your pacing and depth.' }
+]} />
+
+## Next
+
+Return to **[Module 20 Overview](./overview)** or continue to building
+your portfolio projects.

@@ -1,0 +1,620 @@
+---
+id: compose-multiplatform
+title: Compose Multiplatform
+sidebar_label: Compose Multiplatform
+description: Jetpack Compose on iOS, Desktop, Web (Wasm) — shared composable UI, resources, platform-specific integrations, and when CMP is the right choice.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Compose Multiplatform
+
+Compose Multiplatform (CMP) takes Jetpack Compose — Android's declarative
+UI toolkit — and ports it to **iOS, Desktop (JVM), and Web (Wasm)**.
+Combined with KMP for shared logic, you can write a complete app
+(business logic + UI) once and ship to every platform. As of 2025, CMP
+is production-ready for Android + Desktop, stable for iOS, and alpha for
+Web.
+
+## What CMP shares
+
+<ComparisonCard
+  left={{
+    label: 'Shared via CMP',
+    title: 'One codebase',
+    variant: 'new',
+    points: [
+      'All composables (UI tree)',
+      'Compose state, side effects, animations',
+      'Material 3 theme, typography, shapes',
+      'Resources (strings, images, fonts)',
+      'Navigation (Navigation Compose)',
+      'Compose-based business logic'
+    ]
+  }}
+  right={{
+    label: 'Still platform-specific',
+    title: 'Where CMP doesn\'t help',
+    variant: 'old',
+    points: [
+      'System-level APIs (camera, sensors, biometric)',
+      'Push notifications (FCM on Android; APNs on iOS)',
+      'Platform services (Google Play, Health Connect, SiriKit)',
+      'Native look-and-feel bridging (can force Material on iOS)',
+      'App Store / Play Console release workflow',
+      'App lifecycle details'
+    ]
+  }}
+/>
+
+---
+
+## Setup
+
+```kotlin
+// build.gradle.kts (shared module)
+plugins {
+    alias(libs.plugins.kotlin.multiplatform)
+    alias(libs.plugins.android.library)
+    alias(libs.plugins.jetbrains.compose)
+    alias(libs.plugins.compose.compiler)
+}
+
+kotlin {
+    androidTarget { /* ... */ }
+
+    listOf(iosX64(), iosArm64(), iosSimulatorArm64()).forEach {
+        it.binaries.framework {
+            baseName = "ComposeApp"
+            isStatic = true
+        }
+    }
+
+    jvm("desktop")
+
+    sourceSets {
+        commonMain.dependencies {
+            implementation(compose.runtime)
+            implementation(compose.foundation)
+            implementation(compose.material3)
+            implementation(compose.ui)
+            implementation(compose.components.resources)
+            implementation(compose.components.uiToolingPreview)
+            implementation(libs.navigation.compose)
+        }
+        androidMain.dependencies {
+            implementation(libs.androidx.activity.compose)
+        }
+        val desktopMain by getting {
+            dependencies {
+                implementation(compose.desktop.currentOs)
+            }
+        }
+    }
+}
+```
+
+---
+
+## The `App()` entry point
+
+```kotlin
+// shared/src/commonMain/kotlin/App.kt
+@Composable
+fun App() {
+    MaterialTheme {
+        val navController = rememberNavController()
+
+        Surface {
+            NavHost(navController = navController, startDestination = "home") {
+                composable("home") { HomeScreen(onItemClick = { id -> navController.navigate("detail/$id") }) }
+                composable("detail/{id}") { backStackEntry ->
+                    DetailScreen(id = backStackEntry.arguments?.getString("id") ?: "")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun HomeScreen(onItemClick: (String) -> Unit) {
+    LazyColumn {
+        items(products) { product ->
+            Card(
+                onClick = { onItemClick(product.id) },
+                modifier = Modifier.fillMaxWidth().padding(8.dp)
+            ) { Text(product.name, modifier = Modifier.padding(16.dp)) }
+        }
+    }
+}
+```
+
+This `App()` runs **identically** on Android, iOS, Desktop, and Web.
+
+---
+
+## Platform entry points
+
+### Android
+
+```kotlin
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            App()
+        }
+    }
+}
+```
+
+### iOS
+
+```swift
+// iosApp/iosApp/iOSApp.swift
+import SwiftUI
+import ComposeApp
+
+@main
+struct iOSApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ComposeView()
+                .ignoresSafeArea(.keyboard)
+        }
+    }
+}
+
+struct ComposeView: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> UIViewController {
+        MainViewControllerKt.MainViewController()
+    }
+    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {}
+}
+```
+
+```kotlin
+// shared/src/iosMain/kotlin/MainViewController.kt
+import androidx.compose.ui.window.ComposeUIViewController
+
+fun MainViewController() = ComposeUIViewController { App() }
+```
+
+### Desktop
+
+```kotlin
+// desktopApp/src/jvmMain/kotlin/Main.kt
+fun main() = application {
+    Window(
+        onCloseRequest = ::exitApplication,
+        title = "My App",
+        state = rememberWindowState(width = 1200.dp, height = 800.dp)
+    ) {
+        App()
+    }
+}
+```
+
+### Web (Wasm — alpha)
+
+```kotlin
+// webApp/src/wasmJsMain/kotlin/Main.kt
+fun main() {
+    ComposeViewport(document.body!!) {
+        App()
+    }
+}
+```
+
+---
+
+## Resources
+
+CMP has its own resource system (since 1.6):
+
+```text
+shared/src/commonMain/composeResources/
+├── drawable/
+│   ├── ic_cart.xml
+│   └── hero.png
+├── values/
+│   └── strings.xml
+├── font/
+│   └── inter_regular.ttf
+└── files/
+    └── sample.json
+```
+
+```kotlin
+// commonMain
+import myapp.shared.generated.resources.Res
+import myapp.shared.generated.resources.greeting
+import myapp.shared.generated.resources.ic_cart
+
+@Composable
+fun Greeting(name: String) {
+    Text(stringResource(Res.string.greeting, name))
+    Icon(painterResource(Res.drawable.ic_cart), contentDescription = null)
+}
+```
+
+The plugin generates a `Res` object with compile-time-safe accessors.
+
+### Localized strings
+
+```text
+shared/src/commonMain/composeResources/
+├── values/
+│   └── strings.xml                   — default (English)
+├── values-es/
+│   └── strings.xml                   — Spanish
+├── values-hi/
+│   └── strings.xml                   — Hindi
+└── values-ar/
+    └── strings.xml                   — Arabic
+```
+
+Uses Android's resource-qualifier system; works on every platform.
+
+---
+
+## Platform differences to know
+
+### Back navigation
+
+- **Android** has a hardware/system back button
+- **iOS** has no back button — use a toolbar navigation button
+- **Desktop** uses the window's close button + browser-style back
+
+```kotlin
+// commonMain — don't use Android's BackHandler here
+@Composable
+fun DetailScreen(onBack: () -> Unit) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Detail") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                    }
+                }
+            )
+        }
+    ) { /* ... */ }
+}
+
+// Android uses BackHandler in the Activity to connect system back
+// iOS / Desktop rely on the UI button
+```
+
+### Keyboard
+
+Different keyboard semantics per platform. Use `KeyboardOptions` +
+`KeyboardActions` — the same API works everywhere, Compose adapts.
+
+### Scroll
+
+- Android uses finger scrolling
+- iOS has momentum scrolling that Compose respects
+- Desktop uses mouse wheel + drag
+- Web uses wheel events
+
+All handled by Compose's scroll machinery — your code is the same.
+
+### System UI
+
+Notification channels, status bars, window insets differ. Bridge via
+`expect/actual`:
+
+```kotlin
+// commonMain
+expect fun setStatusBarColor(color: Color)
+
+// androidMain — WindowCompat.getInsetsController(...)
+// iosMain — no-op or read from app delegate
+// desktop — no-op
+```
+
+---
+
+## Sharing UI state
+
+Your shared `ViewModel` or `Presenter` drives the UI identically:
+
+```kotlin
+// commonMain
+class ProductPresenter(
+    private val repository: ProductRepository,
+    scope: CoroutineScope
+) {
+    val state: StateFlow<ProductState> = /* ... */
+
+    fun onRefresh() = scope.launch { repository.refresh() }
+}
+
+@Composable
+fun ProductRoute(presenter: ProductPresenter) {
+    val state by presenter.state.collectAsState()
+    ProductScreen(state = state, onRefresh = presenter::onRefresh)
+}
+```
+
+Works on every platform. No `hiltViewModel()` / `ObservableObject` per
+platform.
+
+---
+
+## Navigation on CMP
+
+### Navigation Compose (shared)
+
+```kotlin
+// commonMain
+implementation("org.jetbrains.androidx.navigation:navigation-compose:2.8.0-alpha11")
+
+@Composable
+fun App() {
+    val navController = rememberNavController()
+    NavHost(navController, startDestination = "home") {
+        composable("home") { HomeScreen(/* ... */) }
+        composable("detail/{id}") { /* ... */ }
+    }
+}
+```
+
+Type-safe routes (Kotlin serialization) also work, same as Android.
+
+### Decompose — alternative
+
+[Decompose](https://arkivanov.github.io/Decompose/) is a popular
+alternative with stronger multiplatform ergonomics — stateful navigation
+that survives process death more gracefully.
+
+---
+
+## ViewModels on CMP
+
+Android's `ViewModel` is Android-only. For CMP:
+
+- Use a **shared presenter** class scoped via DI (Koin)
+- Or use `androidx.lifecycle:lifecycle-viewmodel-compose` (on Compose 1.6+,
+  works on CMP targets) for a cross-platform `ViewModel`
+
+```kotlin
+// commonMain — cross-platform ViewModel
+class ProductViewModel(
+    private val repository: ProductRepository
+) : ViewModel() {
+    val state: StateFlow<ProductState> = /* ... */
+
+    override fun onCleared() {
+        super.onCleared()
+        // scope cancels automatically
+    }
+}
+```
+
+---
+
+## Debugging and tooling
+
+### Android Studio
+
+Works fully. Breakpoints in `commonMain` hit from any target.
+
+### Compose preview on CMP
+
+```kotlin
+@Preview
+@Composable
+fun GreetingPreview() {
+    MaterialTheme {
+        Greeting("Aarav")
+    }
+}
+```
+
+- Android: works in the Android Studio preview pane
+- iOS / Desktop: preview via the desktop run (less fluid but works)
+
+### Hot reload
+
+Desktop supports hot reload via JetBrains Toolbox / IDEA. iOS doesn't
+yet — each change requires a rebuild. Expect iOS hot reload in future
+versions.
+
+---
+
+## When CMP is the right choice
+
+<ComparisonCard
+  left={{
+    label: 'Good fit',
+    title: 'When CMP shines',
+    variant: 'new',
+    points: [
+      'Design-system-heavy apps (one component library)',
+      'Non-native-feeling apps (Material design on iOS is fine)',
+      'Multi-platform B2B / internal tools',
+      'Games or apps with custom UI (not Apple HIG)',
+      'Teams with strong Compose skills',
+      'Scenarios where Android + Desktop is primary'
+    ]
+  }}
+  right={{
+    label: 'Bad fit',
+    title: 'When to stay native',
+    variant: 'old',
+    points: [
+      'iOS-first apps (iOS users expect HIG)',
+      'Apps needing deep native iOS integration (SiriKit, WidgetKit)',
+      'Flagship consumer apps where UX parity with native matters',
+      'Small teams without iOS Xcode / Swift experience',
+      'Web-first apps (Flutter Web / React are more mature)',
+      'Teams unwilling to debug Kotlin/Native issues'
+    ]
+  }}
+/>
+
+---
+
+## Real-world adoption
+
+As of 2025:
+- **Instacart**, **McDonald's**, **Philips**, **9GAG**, **Toursprung** ship CMP on iOS
+- **JetBrains Toolbox**, **Android Studio** themselves use Compose Desktop
+- Active development — versioning stabilizes quickly
+
+Production-ready for:
+- **Android + Desktop** — fully stable
+- **iOS** — stable (1.6+)
+- **Web (Wasm)** — alpha; promising but not production
+
+---
+
+## Interop — when you need platform views
+
+Compose Multiplatform lets you embed native views:
+
+### Android — AndroidView
+
+Same as Jetpack Compose on Android. See [Compose Interop](/docs/jetpack-compose/interop).
+
+### iOS — UIKitView
+
+```kotlin
+// iosMain
+@OptIn(ExperimentalForeignApi::class)
+@Composable
+fun AppleMapView(coordinate: Coordinate) {
+    UIKitView(
+        factory = {
+            val mapView = MKMapView()
+            val region = MKCoordinateRegionMakeWithDistance(
+                CLLocationCoordinate2DMake(coordinate.lat, coordinate.lng),
+                500.0, 500.0
+            )
+            mapView.setRegion(region, animated = false)
+            mapView
+        },
+        modifier = Modifier.fillMaxSize()
+    )
+}
+```
+
+### Desktop — SwingPanel
+
+```kotlin
+// desktopMain
+SwingPanel(
+    factory = { JMyCustomPanel() },
+    modifier = Modifier.fillMaxSize()
+)
+```
+
+---
+
+## Distribution
+
+### Android
+
+Same as a regular Android app. Play Store + AAB.
+
+### iOS
+
+Build the framework, integrate into Xcode project, upload via App Store
+Connect. TestFlight for beta.
+
+### Desktop
+
+```kotlin
+plugins {
+    id("org.jetbrains.compose")
+}
+
+compose.desktop {
+    application {
+        mainClass = "MainKt"
+        nativeDistributions {
+            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
+            packageName = "My App"
+            packageVersion = "1.0.0"
+        }
+    }
+}
+```
+
+`./gradlew packageDmg` — macOS installer. `packageMsi` for Windows,
+`packageDeb` for Linux.
+
+### Web (Wasm)
+
+```bash
+./gradlew wasmJsBrowserDistribution
+# Output: webApp/build/dist/wasmJs/productionExecutable/
+```
+
+Deploy to any static host. Modern browsers support Wasm; older ones
+require polyfills.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'CMP mistakes',
+    variant: 'old',
+    points: [
+      'Android-specific APIs (BackHandler, Activity) in commonMain',
+      'Hardcoded paths / resource IDs',
+      'Ignoring iOS HIG for iOS-targeted apps',
+      'No test coverage on iOS / Desktop (assuming it "just works")',
+      'java.time.* / java.io.File in commonMain',
+      'Using Jetpack Hilt in shared code'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Modern CMP',
+    variant: 'new',
+    points: [
+      'Platform-specific code in androidMain / iosMain only',
+      'composeResources for shared assets',
+      'Design a UX that works acceptably on all target platforms',
+      'Run tests per target (./gradlew allTests)',
+      'kotlinx-datetime, okio or platform expect/actual',
+      'Koin / Kotlin-Inject for DI'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="CMP rules">
+- **CMP shares Compose UI + state + resources across Android, iOS, Desktop, Web.**
+- **Business logic + UI** can both live in `commonMain`.
+- **Platform entry points**: Activity → `App()`, `ComposeUIViewController`, `Window`, `ComposeViewport`.
+- **Resources** via `composeResources/` + generated `Res` class.
+- **Navigation Compose** works cross-platform; Decompose is a strong alternative.
+- **Production-ready for Android + Desktop**; stable for iOS; alpha for Web.
+- **Not a native replacement** — iOS users expecting HIG won't love Material design everywhere.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Hello CMP', description: 'Bootstrap a shared module with Android + iOS + Desktop targets. Add an App() composable that shows a list of items; run on all three.' },
+  { title: 'Shared resources', description: 'Move one string and one image into composeResources/. Access via Res.string.* and Res.drawable.* across all platforms.' },
+  { title: 'Cross-platform navigation', description: 'Add Navigation Compose to your shared module. Wire up a 2-screen flow (list → detail) that works on every target.' },
+  { title: 'Platform integration', description: 'Add an expect/actual for \"showToast(message)\". Implement via Toast on Android, UIAlertController on iOS, println on desktop.' },
+  { title: 'Package a desktop app', description: 'Run ./gradlew packageDmg (or packageMsi / packageDeb). Install the resulting app and confirm it runs.' }
+]} />
+
+## Next
+
+Continue to **[Wear OS & Health Connect](./wear-health)** for wearable integration, or **[Android TV, Auto, BLE & XR](./tv-auto-ble-xr)** for the full platform landscape.

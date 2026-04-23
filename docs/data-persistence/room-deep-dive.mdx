@@ -1,0 +1,676 @@
+---
+id: room-deep-dive
+title: Room Deep Dive
+sidebar_label: Room Deep Dive
+description: Everything about Room — entities, DAOs, relations, migrations, FTS, transactions, KSP, multi-instance invalidation, WAL, and performance tuning.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Room Deep Dive
+
+Room is the SQL layer of every modern Android app. Under the hood it's a
+compile-time wrapper over SQLite — not an ORM, not a magic mapper, just a
+careful binding that generates type-safe DAOs. Done right, Room is fast,
+reactive, and safe across multi-process apps. Done wrong, it's a hotspot
+of dropped frames and race conditions.
+
+## Setup with KSP
+
+```kotlin
+// libs.versions.toml
+[versions]
+room = "2.6.1"
+ksp = "2.1.0-1.0.29"
+
+[libraries]
+room-runtime  = { module = "androidx.room:room-runtime",  version.ref = "room" }
+room-ktx      = { module = "androidx.room:room-ktx",      version.ref = "room" }
+room-compiler = { module = "androidx.room:room-compiler", version.ref = "room" }
+room-paging   = { module = "androidx.room:room-paging",   version.ref = "room" }
+room-testing  = { module = "androidx.room:room-testing",  version.ref = "room" }
+
+[plugins]
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+```
+
+```kotlin
+// build.gradle.kts (module)
+plugins {
+    alias(libs.plugins.ksp)
+}
+
+dependencies {
+    implementation(libs.room.runtime)
+    implementation(libs.room.ktx)
+    implementation(libs.room.paging)
+    ksp(libs.room.compiler)
+    androidTestImplementation(libs.room.testing)
+}
+
+// Export schemas so migrations can diff them
+room {
+    schemaDirectory("$projectDir/schemas")
+}
+```
+
+<Callout kind="warning" title="Use KSP, not kapt">
+KSP is 2× faster than `kapt` for Room and is the officially recommended
+processor since Room 2.6. Switching is one plugin swap — there's no
+reason to use kapt for new projects.
+</Callout>
+
+---
+
+## Entities — mapping to tables
+
+```kotlin
+@Entity(
+    tableName = "messages",
+    indices = [
+        Index(value = ["conversationId", "sentAt"]),              // composite index
+        Index(value = ["clientId"], unique = true)                // unique constraint
+    ],
+    foreignKeys = [
+        ForeignKey(
+            entity = ConversationEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["conversationId"],
+            onDelete = ForeignKey.CASCADE                          // delete children when parent gone
+        )
+    ]
+)
+data class MessageEntity(
+    @PrimaryKey val id: String,
+    val conversationId: String,
+    val authorId: String,
+    val body: String,
+    val sentAt: Long,
+    @ColumnInfo(name = "server_at") val serverAt: Long? = null,
+    @ColumnInfo(defaultValue = "SENDING") val status: String = "SENDING",
+    val clientId: String = id,
+    @ColumnInfo(typeAffinity = ColumnInfo.BLOB) val attachmentBytes: ByteArray? = null
+) {
+    override fun equals(other: Any?): Boolean { /* ByteArray-safe equals */ return super.equals(other) }
+    override fun hashCode(): Int = id.hashCode()
+}
+```
+
+Notable options:
+
+| Option                  | Effect                                                     |
+|-------------------------|------------------------------------------------------------|
+| `tableName`             | Override the default (class name)                          |
+| `indices`               | Secondary indexes — critical for query performance        |
+| `foreignKeys`           | Enforce referential integrity + cascade                   |
+| `primaryKeys` on `@Entity` | Composite primary key (multiple columns)                 |
+| `ignoredColumns`        | Hide fields from SQL (e.g., derived properties)           |
+
+### `@PrimaryKey(autoGenerate = true)` — auto-increment
+
+```kotlin
+@Entity
+data class NoteEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val title: String,
+    val body: String
+)
+```
+
+Prefer **client-generated UUIDs** for anything that syncs to a backend —
+auto-increment creates ID collisions when merging rows from multiple
+devices.
+
+### Type converters
+
+Room supports primitives + `String` + `ByteArray` natively. For everything
+else, provide a converter:
+
+```kotlin
+class RoomConverters {
+    @TypeConverter
+    fun instantToLong(instant: Instant?): Long? = instant?.toEpochMilli()
+
+    @TypeConverter
+    fun longToInstant(value: Long?): Instant? = value?.let(Instant::ofEpochMilli)
+
+    @TypeConverter
+    fun stringListToCsv(list: List<String>?): String? = list?.joinToString(",")
+
+    @TypeConverter
+    fun csvToStringList(csv: String?): List<String>? = csv?.split(",")?.filter { it.isNotBlank() }
+
+    @TypeConverter
+    fun tagsToJson(tags: Tags?): String? = tags?.let { Json.encodeToString(it) }
+
+    @TypeConverter
+    fun jsonToTags(json: String?): Tags? = json?.let { Json.decodeFromString<Tags>(it) }
+}
+
+@Database(entities = [...], version = 1)
+@TypeConverters(RoomConverters::class)
+abstract class AppDatabase : RoomDatabase()
+```
+
+<Callout kind="tip" title="Per-DAO converters with Room 2.3+">
+`@TypeConverters` can be placed on a `@Dao` or individual method, scoping
+converters to where they apply — cleaner than a global list.
+</Callout>
+
+---
+
+## DAOs — the query surface
+
+```kotlin
+@Dao
+interface MessageDao {
+
+    // Queries
+    @Query("SELECT * FROM messages WHERE conversationId = :cid ORDER BY sentAt DESC")
+    fun observeByConversation(cid: String): Flow<List<MessageEntity>>
+
+    @Query("SELECT * FROM messages WHERE id = :id")
+    suspend fun getById(id: String): MessageEntity?
+
+    @Query("SELECT COUNT(*) FROM messages WHERE conversationId = :cid AND status = 'FAILED'")
+    fun observeFailedCount(cid: String): Flow<Int>
+
+    // Inserts
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(message: MessageEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(messages: List<MessageEntity>)
+
+    // Updates
+    @Update
+    suspend fun update(message: MessageEntity)
+
+    @Query("UPDATE messages SET status = :status, server_at = :serverAt WHERE id = :id")
+    suspend fun markSent(id: String, serverAt: Long, status: String = "SENT")
+
+    // Deletes
+    @Delete
+    suspend fun delete(message: MessageEntity)
+
+    @Query("DELETE FROM messages WHERE conversationId = :cid AND sentAt < :before")
+    suspend fun pruneOlderThan(cid: String, before: Long): Int
+
+    // Paging 3
+    @Query("SELECT * FROM messages WHERE conversationId = :cid ORDER BY sentAt DESC")
+    fun pagingSource(cid: String): PagingSource<Int, MessageEntity>
+}
+```
+
+### Return types — pick the right one
+
+| Return type                    | Semantics                                              |
+|--------------------------------|--------------------------------------------------------|
+| `suspend fun get(...): T`     | One-shot read; suspends on IO pool                    |
+| `Flow<T>`                      | Observable stream; emits when table changes            |
+| `PagingSource<Int, T>`         | Paging 3 integration                                   |
+| `LiveData<T>`                  | Legacy; prefer Flow                                    |
+| `List<T>` (non-suspend)        | Blocks caller thread — don't use                       |
+
+### Projections — return only what you need
+
+```kotlin
+data class MessagePreview(
+    val id: String,
+    val conversationId: String,
+    val body: String
+)
+
+@Query("SELECT id, conversationId, body FROM messages WHERE conversationId = :cid")
+fun previews(cid: String): Flow<List<MessagePreview>>
+```
+
+Projections are faster than `SELECT *` — smaller cursor, fewer allocations.
+Room maps columns to the data class by **name**.
+
+---
+
+## Relations — joining tables without writing SQL
+
+### One-to-one
+
+```kotlin
+@Entity data class UserEntity(@PrimaryKey val id: String, val name: String)
+
+@Entity data class UserProfileEntity(
+    @PrimaryKey val userId: String,
+    val bio: String,
+    val avatarUrl: String?
+)
+
+data class UserWithProfile(
+    @Embedded val user: UserEntity,
+    @Relation(parentColumn = "id", entityColumn = "userId")
+    val profile: UserProfileEntity?
+)
+
+@Dao interface UserDao {
+    @Transaction
+    @Query("SELECT * FROM UserEntity WHERE id = :id")
+    suspend fun getWithProfile(id: String): UserWithProfile?
+}
+```
+
+### One-to-many
+
+```kotlin
+data class ConversationWithMessages(
+    @Embedded val conversation: ConversationEntity,
+    @Relation(parentColumn = "id", entityColumn = "conversationId")
+    val messages: List<MessageEntity>
+)
+```
+
+### Many-to-many (junction table)
+
+```kotlin
+@Entity(primaryKeys = ["userId", "tagId"])
+data class UserTagCrossRef(val userId: String, val tagId: String)
+
+data class UserWithTags(
+    @Embedded val user: UserEntity,
+    @Relation(
+        parentColumn = "id",
+        entityColumn = "id",
+        associateBy = Junction(
+            value = UserTagCrossRef::class,
+            parentColumn = "userId",
+            childColumn = "tagId"
+        )
+    )
+    val tags: List<TagEntity>
+)
+```
+
+<Callout kind="warning" title="Always annotate parent query with @Transaction">
+When using `@Relation`, mark the DAO method `@Transaction`. Without it,
+the parent and children are queried on separate connections — and can
+observe an inconsistent snapshot if a write lands between.
+</Callout>
+
+---
+
+## Multi-map queries (Room 2.5+)
+
+```kotlin
+@Query("""
+    SELECT u.*, p.*
+    FROM UserEntity u
+    INNER JOIN PostEntity p ON p.authorId = u.id
+""")
+suspend fun userPostsMap(): Map<UserEntity, List<PostEntity>>
+```
+
+Cleaner than `@Relation` when you want a flat join result.
+
+---
+
+## Transactions
+
+Wrap multi-step writes in a transaction to guarantee atomicity:
+
+```kotlin
+@Dao
+interface OrderDao {
+    @Insert suspend fun insertOrder(order: OrderEntity)
+    @Insert suspend fun insertItems(items: List<OrderItemEntity>)
+    @Query("UPDATE inventory SET qty = qty - :amount WHERE productId = :id")
+    suspend fun decrementInventory(id: String, amount: Int)
+
+    @Transaction
+    suspend fun placeOrder(order: OrderEntity, items: List<OrderItemEntity>) {
+        insertOrder(order)
+        insertItems(items)
+        items.forEach { decrementInventory(it.productId, it.quantity) }
+    }
+}
+```
+
+### `withTransaction` — transaction across multiple DAOs
+
+```kotlin
+database.withTransaction {
+    orderDao.insertOrder(order)
+    paymentDao.insertPayment(payment)
+    cartDao.clear()
+}
+```
+
+If any step throws, the whole transaction rolls back. `withTransaction` is
+a suspending extension — safe to call other suspend functions inside.
+
+---
+
+## Migrations
+
+Never ship a Room database without a migration story. Enable schema export
+and write migrations for every version bump:
+
+```kotlin
+@Database(
+    entities = [MessageEntity::class, ConversationEntity::class],
+    version = 3,
+    exportSchema = true
+)
+abstract class AppDatabase : RoomDatabase() {
+    companion object {
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN client_id TEXT NOT NULL DEFAULT ''")
+                db.execSQL("CREATE UNIQUE INDEX index_messages_client_id ON messages(client_id)")
+            }
+        }
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS reactions (messageId TEXT NOT NULL, emoji TEXT NOT NULL, PRIMARY KEY(messageId, emoji))")
+            }
+        }
+    }
+}
+
+// Apply in the builder
+Room.databaseBuilder(context, AppDatabase::class.java, "app.db")
+    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+    .build()
+```
+
+### Testing migrations
+
+`@AutoMigration` (Room 2.4+) can handle simple renames/column adds
+automatically:
+
+```kotlin
+@Database(
+    entities = [...],
+    version = 3,
+    autoMigrations = [
+        AutoMigration(from = 2, to = 3)
+    ]
+)
+abstract class AppDatabase : RoomDatabase()
+```
+
+For destructive changes, use `@RenameColumn`, `@DeleteColumn`, or provide
+`AutoMigrationSpec`. And always test:
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class MigrationTest {
+    @get:Rule val helper = MigrationTestHelper(
+        InstrumentationRegistry.getInstrumentation(),
+        AppDatabase::class.java.canonicalName
+    )
+
+    @Test fun migrate_1_to_2() {
+        helper.createDatabase("test.db", 1).use { db ->
+            db.execSQL("INSERT INTO messages VALUES ('m1', 'c1', 'u1', 'hi', 123, null, 'SENT')")
+        }
+        val migrated = helper.runMigrationsAndValidate("test.db", 2, true, AppDatabase.MIGRATION_1_2)
+        migrated.query("SELECT client_id FROM messages WHERE id = 'm1'").use {
+            it.moveToFirst()
+            assertEquals("", it.getString(0))   // default value applied
+        }
+    }
+}
+```
+
+<Callout kind="danger" title="Never fallbackToDestructiveMigration() in prod">
+`fallbackToDestructiveMigration()` drops all tables if no migration path
+exists. Fine for debug builds — a **data-loss bug** in release. Use it
+behind `BuildConfig.DEBUG` or not at all.
+</Callout>
+
+---
+
+## Full-text search (FTS)
+
+```kotlin
+@Entity
+@Fts4(contentEntity = MessageEntity::class)
+data class MessageFts(
+    @PrimaryKey @ColumnInfo(name = "rowid") val rowId: Long,
+    val body: String
+)
+
+@Dao
+interface MessageSearchDao {
+    @Query("""
+        SELECT m.* FROM messages m
+        JOIN MessageFts f ON m.rowid = f.rowid
+        WHERE MessageFts MATCH :query
+        ORDER BY rank
+    """)
+    fun search(query: String): Flow<List<MessageEntity>>
+}
+```
+
+FTS4/FTS5 virtual tables index tokens from a source column. Queries use
+`MATCH` (not `LIKE`) with boolean and prefix operators:
+
+- `"hello world"` — exact phrase
+- `hello OR world`
+- `hel*` — prefix match
+
+FTS is orders of magnitude faster than `LIKE '%query%'` for user-facing
+search.
+
+---
+
+## Concurrency, threading, and the WAL
+
+Room uses SQLite's **Write-Ahead Logging** (WAL) by default on Android —
+reads and writes don't block each other. You can still hit contention:
+
+```kotlin
+@Database(...)
+abstract class AppDatabase : RoomDatabase() {
+    companion object {
+        fun build(context: Context): AppDatabase = Room.databaseBuilder(context, AppDatabase::class.java, "app.db")
+            .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)          // default, but explicit
+            .setQueryExecutor(Executors.newFixedThreadPool(4))        // read queries
+            .setTransactionExecutor(Executors.newSingleThreadExecutor()) // writes serialized
+            .build()
+    }
+}
+```
+
+**Rules**:
+
+1. Suspend functions run on the query/transaction executor (not the main
+   thread). Never call them on `Dispatchers.Main` directly.
+2. `Flow` queries re-run on the query executor when the table is
+   invalidated.
+3. Transactions serialize — one at a time.
+4. `.createFromAsset("prepopulated.db")` or `.createFromFile(...)` for
+   pre-seeded databases on first launch.
+
+---
+
+## Invalidation and reactive queries
+
+Room observes writes and invalidates matching queries. Any `Flow<T>`-
+returning DAO method re-emits when the underlying table changes.
+
+### Cross-process invalidation — multi-instance
+
+Two processes (e.g., main app + WorkManager worker) using the same DB file
+need invalidation across process boundaries:
+
+```kotlin
+Room.databaseBuilder(context, AppDatabase::class.java, "app.db")
+    .enableMultiInstanceInvalidation()
+    .build()
+```
+
+Without this, a write in process B won't re-emit a Flow collected in
+process A. For apps with background services writing to the DB, this is
+mandatory.
+
+---
+
+## Paging 3 integration
+
+```kotlin
+@Dao
+interface MessageDao {
+    @Query("SELECT * FROM messages WHERE conversationId = :cid ORDER BY sentAt DESC")
+    fun pagingSource(cid: String): PagingSource<Int, MessageEntity>
+}
+
+@Composable
+fun MessageList(viewModel: MessageViewModel = hiltViewModel()) {
+    val messages = viewModel.messagesPaging.collectAsLazyPagingItems()
+    LazyColumn {
+        items(
+            count = messages.itemCount,
+            key = messages.itemKey { it.id },
+            contentType = messages.itemContentType { "message" }
+        ) { index ->
+            messages[index]?.let { MessageRow(it) }
+        }
+    }
+}
+```
+
+For network-backed paging, use `RemoteMediator` — see
+[News Aggregator project](/docs/projects/news-aggregator) for the full
+pattern.
+
+---
+
+## Query optimization checklist
+
+<StepList steps={[
+  { title: 'Index the WHERE columns', description: 'Every column in a WHERE clause or ORDER BY should have an index. Use @Index([\"col1\", \"col2\"]) for composite queries.' },
+  { title: 'Project only the columns you need', description: 'SELECT id, title instead of SELECT * — returns smaller cursors and avoids deserializing blobs.' },
+  { title: 'Use EXPLAIN QUERY PLAN', description: 'Run SELECT EXPLAIN QUERY PLAN ... via RoomDatabase.query(...) during development. Any SCAN on a large table is a missing index.' },
+  { title: 'Limit results', description: 'Always LIMIT large queries. The UI can\'t render 100k rows anyway.' },
+  { title: 'Batch inserts in a transaction', description: 'A thousand inserts in a loop = a thousand commits. Wrap in @Transaction or withTransaction for 100× speedup.' },
+  { title: 'Avoid N+1 queries in @Relation', description: 'Large one-to-many relations materialize children for every parent. Consider pagination or deferred child loading.' }
+]} />
+
+---
+
+## Multi-database setups
+
+```kotlin
+// Separate databases per domain or user
+class DatabaseModule @Inject constructor(@ApplicationContext private val context: Context) {
+    private val cache = mutableMapOf<UserId, AppDatabase>()
+
+    fun forUser(userId: UserId): AppDatabase = cache.getOrPut(userId) {
+        Room.databaseBuilder(context, AppDatabase::class.java, "user-${userId.raw}.db")
+            .addMigrations(*AllMigrations)
+            .build()
+    }
+}
+```
+
+Useful for:
+- Per-user data isolation (sign out = close + delete one DB)
+- GDPR data deletion — just delete the file
+- Large caches you want to evict independently
+
+---
+
+## Testing Room
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class MessageDaoTest {
+    private lateinit var db: AppDatabase
+    private lateinit var dao: MessageDao
+
+    @Before fun setup() {
+        db = Room.inMemoryDatabaseBuilder(
+            ApplicationProvider.getApplicationContext(),
+            AppDatabase::class.java
+        ).allowMainThreadQueries().build()
+        dao = db.messageDao()
+    }
+
+    @After fun tearDown() { db.close() }
+
+    @Test fun insert_and_query() = runTest {
+        dao.upsert(MessageEntity(id = "m1", conversationId = "c1", /* ... */))
+        val result = dao.getById("m1")
+        assertNotNull(result)
+    }
+
+    @Test fun observe_emits_on_insert() = runTest {
+        dao.observeByConversation("c1").test {
+            assertEquals(emptyList(), awaitItem())
+            dao.upsert(sampleMessage)
+            assertEquals(listOf(sampleMessage), awaitItem())
+        }
+    }
+}
+```
+
+In-memory DB is **orders of magnitude faster** than on-disk for tests.
+Never use `allowMainThreadQueries()` in production.
+
+---
+
+## Common pitfalls
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Room problems',
+    variant: 'old',
+    points: [
+      'fallbackToDestructiveMigration() in production',
+      'SELECT * when you need 3 columns',
+      'No index on frequently queried columns',
+      'Missing @Transaction on @Relation queries',
+      'Auto-increment IDs synced across devices',
+      'Opening a fresh DB instance per use (leaks connections)'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Proven patterns',
+    variant: 'new',
+    points: [
+      'Explicit migrations for every version bump',
+      'Projections with targeted columns',
+      '@Index on WHERE/ORDER BY columns',
+      '@Transaction + @Relation for consistent snapshots',
+      'Client-generated UUIDs for synced entities',
+      'Single @Singleton AppDatabase via Hilt'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Room rules">
+- **KSP over kapt** — 2× faster builds.
+- **Export schemas** + **write migrations** for every version; test them.
+- **Indexes** on WHERE/ORDER BY columns; projections instead of `SELECT *`.
+- **`@Transaction`** around multi-step writes and `@Relation` queries.
+- **WAL + single-threaded writes + pooled reads** — Room's default, don't fight it.
+- **`enableMultiInstanceInvalidation()`** for multi-process apps.
+- **In-memory DB** for tests; never `allowMainThreadQueries()` in prod.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Write a migration', description: 'Add a new column to an existing entity. Write Migration(N, N+1). Use MigrationTestHelper to verify existing rows get the default value.' },
+  { title: 'Add FTS', description: 'Create a @Fts4 virtual table over your messages. Implement a search(query) DAO method using MATCH.' },
+  { title: 'Model a relation', description: 'Convert two @Query joins into an @Embedded + @Relation data class. Confirm the parent query is @Transaction-annotated.' },
+  { title: 'Batch insert benchmark', description: 'Insert 10,000 rows one-at-a-time, then inside withTransaction. Measure the difference — should be 50-100×.' }
+]} />
+
+## Next
+
+Continue to **[DataStore](./datastore)** for the Preferences and Proto variants, or **[Encrypted Storage](./encrypted-storage)** for securing Room and preferences.

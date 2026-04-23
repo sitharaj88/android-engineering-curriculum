@@ -1,0 +1,57 @@
+---
+id: overview
+title: Graphics, Media & Performance Primitives
+sidebar_label: Overview
+description: Canvas, AGSL shaders, Media3/ExoPlayer, battery optimization — the platform primitives for visuals and resource efficiency.
+slug: /graphics-media
+---
+
+import { Callout, FeatureGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Reference:</strong> Platform primitives</span>
+  <span><strong>Topics:</strong> 3 chapters</span>
+  <span><strong>Prerequisites:</strong> Compose + lifecycle fundamentals</span>
+</div>
+
+# Graphics, Media & Performance Primitives
+
+Three topics that don't fit neatly into the numbered modules but every
+serious Android app needs: **custom graphics** (Canvas, AGSL shaders),
+**media playback** (Media3 / ExoPlayer), and **battery / power
+optimization**. Each is a full chapter here.
+
+<FeatureGrid columns={3} features={[
+  { icon: '🎨', title: 'Graphics & Rendering', description: 'Canvas, AGSL shaders, drawWithCache, animated vector drawables, and custom drawing for performance.' },
+  { icon: '▶️', title: 'Media3 / ExoPlayer', description: 'The full media stack — playback, DRM, adaptive streaming, MediaSession, lockscreen + Android Auto.' },
+  { icon: '🔋', title: 'Battery & Power', description: 'Doze, App Standby, background execution limits, Battery Historian, and the optimization playbook.' }
+]} />
+
+## When you'll reach for these
+
+- **Graphics**: bespoke data visualization, game UI, custom chart
+  libraries, realtime video effects, branded loading animations that
+  Lottie can't handle.
+- **Media3**: music/video/audio playback, podcasts, livestreams,
+  recorded content, any app with audio that must survive screen off /
+  background.
+- **Battery**: every fitness / tracking / streaming app — once you have
+  real users, the one-star reviews about battery drain come fast unless
+  you've been disciplined from day one.
+
+## How these relate to existing modules
+
+- [Jetpack Compose — Custom Layouts & Gestures](/docs/jetpack-compose/custom-layouts-gestures) covers
+  Compose Canvas and basic drawing. This section goes deeper into
+  Skia API, AGSL, and native rendering.
+- [Advanced Components — CameraX & Sensors](/docs/advanced-components/camerax-sensors) covers camera
+  pipelines. Media3 extends into video playback.
+- [Module 10 — Performance](/docs/performance/overview) covers startup,
+  macrobenchmark, and baseline profiles. This section covers battery
+  specifically.
+
+## Chapters
+
+- **[Graphics & Rendering](/docs/graphics-media/graphics-rendering)** — Canvas, AGSL, drawWithCache, Skia, AnimatedVectorDrawable
+- **[Media3 / ExoPlayer](/docs/graphics-media/media3-exoplayer)** — playback, DRM, adaptive streaming, MediaSession, Android Auto integration
+- **[Battery & Power Optimization](/docs/graphics-media/battery-power)** — Doze, App Standby, JobScheduler vs WorkManager, Battery Historian, profiling

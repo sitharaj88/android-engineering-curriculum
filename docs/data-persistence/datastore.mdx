@@ -1,0 +1,539 @@
+---
+id: datastore
+title: DataStore — Preferences & Proto
+sidebar_label: DataStore
+description: DataStore deep dive — Preferences DataStore, Proto DataStore, migration from SharedPreferences, serializers, multi-process access, and testing.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# DataStore — Preferences & Proto
+
+DataStore is the modern replacement for `SharedPreferences`. Two variants:
+
+- **Preferences DataStore** — key-value, no schema. Drop-in replacement
+  for SharedPreferences with coroutine-native, type-safe reads.
+- **Proto DataStore** — typed schema via Protobuf. Single source of truth
+  for complex preferences.
+
+Both are built on **coroutines + Flow**, with atomic writes and no
+deadlocks. If you're still using `SharedPreferences`, migrate.
+
+## Why SharedPreferences is broken
+
+<ComparisonCard
+  left={{
+    label: 'SharedPreferences',
+    title: 'The legacy pain',
+    variant: 'old',
+    points: [
+      'apply() is asynchronous but gives no signal when done',
+      'commit() blocks the caller (main thread hazard)',
+      'Reads are synchronous — block on first access',
+      'Strong-keyed but not strongly typed',
+      'No schema — rename a key, lose the data',
+      'Not coroutine-native'
+    ]
+  }}
+  right={{
+    label: 'DataStore',
+    title: 'The modern replacement',
+    variant: 'new',
+    points: [
+      'All writes suspend and return when durable',
+      'Reads exposed as Flow<Preferences>',
+      'Coroutine-safe by design — no ANRs',
+      'Proto variant gives full type safety + schema',
+      'Atomic writes (file-level rename)',
+      'Integrates cleanly with ViewModel + Compose'
+    ]
+  }}
+/>
+
+---
+
+## Preferences DataStore
+
+### Setup
+
+```kotlin
+// libs.versions.toml
+datastore = "1.1.1"
+
+datastore-preferences = { module = "androidx.datastore:datastore-preferences", version.ref = "datastore" }
+datastore-preferences-core = { module = "androidx.datastore:datastore-preferences-core", version.ref = "datastore" }
+```
+
+```kotlin
+// Application-scoped DataStore (recommended)
+val Context.settingsDataStore: DataStore<Preferences> by preferencesDataStore(
+    name = "settings",
+    produceMigrations = { context ->
+        listOf(SharedPreferencesMigration(context, "legacy_prefs"))
+    }
+)
+```
+
+### Hilt wiring
+
+```kotlin
+@Module @InstallIn(SingletonComponent::class)
+object DataStoreModule {
+    @Provides @Singleton
+    fun provideSettingsDataStore(@ApplicationContext context: Context): DataStore<Preferences> =
+        context.settingsDataStore
+}
+```
+
+### Reading
+
+```kotlin
+class SettingsRepository @Inject constructor(
+    private val dataStore: DataStore<Preferences>
+) {
+    private object Keys {
+        val THEME = stringPreferencesKey("theme")
+        val NOTIFICATIONS_ENABLED = booleanPreferencesKey("notifications_enabled")
+        val FONT_SCALE = floatPreferencesKey("font_scale")
+        val FAVORITE_TAGS = stringSetPreferencesKey("favorite_tags")
+    }
+
+    val theme: Flow<Theme> = dataStore.data
+        .catch { e ->
+            if (e is IOException) emit(emptyPreferences()) else throw e
+        }
+        .map { prefs ->
+            when (prefs[Keys.THEME]) {
+                "dark" -> Theme.Dark
+                "light" -> Theme.Light
+                else -> Theme.System
+            }
+        }
+
+    val allSettings: Flow<Settings> = dataStore.data.map { prefs ->
+        Settings(
+            theme = prefs[Keys.THEME]?.let(Theme::valueOf) ?: Theme.System,
+            notificationsEnabled = prefs[Keys.NOTIFICATIONS_ENABLED] ?: true,
+            fontScale = prefs[Keys.FONT_SCALE] ?: 1.0f,
+            favoriteTags = prefs[Keys.FAVORITE_TAGS] ?: emptySet()
+        )
+    }
+
+    suspend fun setTheme(theme: Theme) {
+        dataStore.edit { prefs -> prefs[Keys.THEME] = theme.name }
+    }
+
+    suspend fun setNotifications(enabled: Boolean) {
+        dataStore.edit { prefs -> prefs[Keys.NOTIFICATIONS_ENABLED] = enabled }
+    }
+}
+```
+
+<Callout kind="warning" title="Always catch IOException from dataStore.data">
+The first read may fail if the file is corrupt or unreadable. The
+standard idiom is `.catch { if (it is IOException) emit(emptyPreferences()) else throw it }`
+which gives you default values on failure.
+</Callout>
+
+### Key types
+
+| Helper                               | Stores            |
+|--------------------------------------|-------------------|
+| `intPreferencesKey`                  | `Int`             |
+| `longPreferencesKey`                 | `Long`            |
+| `floatPreferencesKey`                | `Float`           |
+| `doublePreferencesKey`               | `Double`          |
+| `booleanPreferencesKey`              | `Boolean`         |
+| `stringPreferencesKey`               | `String`          |
+| `stringSetPreferencesKey`            | `Set<String>`     |
+| `byteArrayPreferencesKey` (1.1+)     | `ByteArray`       |
+
+For anything else (lists, maps, complex objects), use **Proto DataStore**
+— don't JSON-encode into a string key.
+
+---
+
+## Proto DataStore
+
+### When to use
+
+- Complex user settings (notification preferences per category, nested objects)
+- Schema versioning (add a new field; migrate existing data automatically)
+- Strongly-typed preferences across the codebase
+- Shared models with a backend over the wire (same .proto file)
+
+### Define the schema
+
+```protobuf
+// src/main/proto/user_preferences.proto
+syntax = "proto3";
+
+option java_package = "com.myapp.data.prefs";
+option java_multiple_files = true;
+
+message UserPreferences {
+    Theme theme = 1;
+    bool notifications_enabled = 2;
+    float font_scale = 3;
+    repeated string favorite_tags = 4;
+    NotificationSettings notification_settings = 5;
+
+    enum Theme {
+        SYSTEM = 0;
+        LIGHT = 1;
+        DARK = 2;
+    }
+}
+
+message NotificationSettings {
+    bool messages = 1;
+    bool mentions = 2;
+    bool promotions = 3;
+    int32 quiet_hours_start = 4;    // minutes since midnight
+    int32 quiet_hours_end = 5;
+}
+```
+
+### Build config
+
+```kotlin
+plugins {
+    id("com.google.protobuf") version "0.9.4"
+}
+
+protobuf {
+    protoc { artifact = "com.google.protobuf:protoc:4.28.0" }
+    generateProtoTasks {
+        all().forEach { task ->
+            task.builtins {
+                create("java") { option("lite") }
+                create("kotlin") { option("lite") }
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation("androidx.datastore:datastore:1.1.1")
+    implementation("com.google.protobuf:protobuf-kotlin-lite:4.28.0")
+}
+```
+
+### Serializer
+
+```kotlin
+object UserPreferencesSerializer : Serializer<UserPreferences> {
+    override val defaultValue: UserPreferences = UserPreferences.newBuilder()
+        .setTheme(UserPreferences.Theme.SYSTEM)
+        .setNotificationsEnabled(true)
+        .setFontScale(1.0f)
+        .setNotificationSettings(
+            NotificationSettings.newBuilder()
+                .setMessages(true)
+                .setMentions(true)
+                .setPromotions(false)
+                .build()
+        )
+        .build()
+
+    override suspend fun readFrom(input: InputStream): UserPreferences = try {
+        UserPreferences.parseFrom(input)
+    } catch (e: InvalidProtocolBufferException) {
+        throw CorruptionException("Unable to read UserPreferences", e)
+    }
+
+    override suspend fun writeTo(t: UserPreferences, output: OutputStream) {
+        t.writeTo(output)
+    }
+}
+```
+
+### DataStore instance
+
+```kotlin
+val Context.userPreferencesDataStore: DataStore<UserPreferences> by dataStore(
+    fileName = "user_preferences.pb",
+    serializer = UserPreferencesSerializer,
+    corruptionHandler = ReplaceFileCorruptionHandler { UserPreferencesSerializer.defaultValue }
+)
+```
+
+### Repository
+
+```kotlin
+class UserPreferencesRepository @Inject constructor(
+    private val dataStore: DataStore<UserPreferences>
+) {
+    val preferences: Flow<UserPreferences> = dataStore.data.catch { e ->
+        if (e is IOException) emit(UserPreferencesSerializer.defaultValue) else throw e
+    }
+
+    suspend fun setTheme(theme: UserPreferences.Theme) {
+        dataStore.updateData { current -> current.toBuilder().setTheme(theme).build() }
+    }
+
+    suspend fun toggleMessages() {
+        dataStore.updateData { current ->
+            current.toBuilder().setNotificationSettings(
+                current.notificationSettings.toBuilder()
+                    .setMessages(!current.notificationSettings.messages)
+                    .build()
+            ).build()
+        }
+    }
+
+    suspend fun setQuietHours(start: Int, end: Int) {
+        dataStore.updateData { current ->
+            current.toBuilder().setNotificationSettings(
+                current.notificationSettings.toBuilder()
+                    .setQuietHoursStart(start)
+                    .setQuietHoursEnd(end)
+                    .build()
+            ).build()
+        }
+    }
+}
+```
+
+### Schema evolution
+
+Proto handles schema evolution gracefully:
+
+- **Adding fields** — default values for new fields in old data
+- **Removing fields** — old clients ignore new data; old data keeps working
+- **Renaming fields** — avoid; use field numbers as the canonical identity
+- **Changing field types** — breaking; version your proto file
+
+For breaking changes, write a migration:
+
+```kotlin
+val Context.userPreferencesDataStore: DataStore<UserPreferences> by dataStore(
+    fileName = "user_preferences.pb",
+    serializer = UserPreferencesSerializer,
+    produceMigrations = { listOf(UserPrefsV1toV2Migration) }
+)
+
+object UserPrefsV1toV2Migration : DataMigration<UserPreferences> {
+    override suspend fun shouldMigrate(currentData: UserPreferences): Boolean =
+        currentData.schemaVersion < 2
+
+    override suspend fun migrate(currentData: UserPreferences): UserPreferences =
+        currentData.toBuilder()
+            .setSchemaVersion(2)
+            .setFontScale(if (currentData.fontScale == 0f) 1.0f else currentData.fontScale)
+            .build()
+
+    override suspend fun cleanUp() { /* no-op */ }
+}
+```
+
+---
+
+## Migrating from SharedPreferences
+
+### Preferences DataStore — automatic migration
+
+```kotlin
+val Context.settingsDataStore: DataStore<Preferences> by preferencesDataStore(
+    name = "settings",
+    produceMigrations = { context ->
+        listOf(SharedPreferencesMigration(context, "legacy_prefs"))
+    }
+)
+```
+
+`SharedPreferencesMigration` copies every key from the legacy SharedPreferences
+into DataStore on first access, then deletes the SharedPreferences file.
+Zero code changes to callers.
+
+### Proto DataStore — custom migration
+
+```kotlin
+produceMigrations = { context ->
+    listOf(
+        SharedPreferencesMigration(
+            produceSharedPreferences = { context.getSharedPreferences("legacy_prefs", 0) }
+        ) { prefs, currentData ->
+            currentData.toBuilder()
+                .setTheme(UserPreferences.Theme.valueOf(prefs.getString("theme", "SYSTEM") ?: "SYSTEM"))
+                .setNotificationsEnabled(prefs.getBoolean("notifications", true))
+                .build()
+        }
+    )
+}
+```
+
+---
+
+## Multi-process considerations
+
+DataStore is **not multi-process safe** by default. If you read/write from
+multiple processes (main app + a `:sync` process, widget remote views):
+
+- Option A — use a `ContentProvider` wrapper to route all writes through one process.
+- Option B — use the preview `MultiProcessDataStore` (available as
+  `androidx.datastore:datastore-core:1.1+` with experimental API).
+
+For most apps, a single-process DataStore is correct.
+
+---
+
+## Testing DataStore
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class SettingsRepositoryTest {
+
+    private val testContext = ApplicationProvider.getApplicationContext<Context>()
+    private lateinit var dataStore: DataStore<Preferences>
+    private lateinit var repository: SettingsRepository
+    private val scope = TestScope(UnconfinedTestDispatcher())
+
+    @Before fun setup() {
+        dataStore = PreferenceDataStoreFactory.create(
+            scope = scope,
+            produceFile = { testContext.preferencesDataStoreFile("test-settings") }
+        )
+        repository = SettingsRepository(dataStore)
+    }
+
+    @After fun tearDown() {
+        testContext.preferencesDataStoreFile("test-settings").delete()
+    }
+
+    @Test fun writes_and_reads_back_theme() = scope.runTest {
+        repository.setTheme(Theme.Dark)
+        val observed = repository.theme.first()
+        assertEquals(Theme.Dark, observed)
+    }
+}
+```
+
+For Proto DataStore, use `DataStoreFactory.create` with your serializer.
+
+---
+
+## Using DataStore in Compose
+
+```kotlin
+@Composable
+fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
+    val prefs by viewModel.preferences.collectAsStateWithLifecycle(initialValue = UserPreferences.getDefaultInstance())
+    val scope = rememberCoroutineScope()
+
+    Column {
+        SwitchSetting(
+            label = "Messages",
+            checked = prefs.notificationSettings.messages,
+            onCheckedChange = { scope.launch { viewModel.toggleMessages() } }
+        )
+    }
+}
+```
+
+`collectAsStateWithLifecycle` suspends collection when the screen is off —
+respect battery.
+
+---
+
+## Sync with backend
+
+For settings that should follow a user across devices, mirror DataStore to
+your backend:
+
+```kotlin
+class SettingsSyncWorker @AssistedInject constructor(
+    @Assisted ctx: Context,
+    @Assisted params: WorkerParameters,
+    private val repo: UserPreferencesRepository,
+    private val api: SettingsApi
+) : CoroutineWorker(ctx, params) {
+
+    override suspend fun doWork(): Result = runCatching {
+        val local = repo.preferences.first()
+        val remote = api.fetchSettings()
+        val merged = merge(local, remote)
+        repo.updateAll(merged)
+        api.putSettings(merged)
+        Result.success()
+    }.getOrElse { Result.retry() }
+}
+```
+
+Use a version/timestamp on the proto for conflict resolution. See
+[Offline-First Architecture](/docs/architecture-patterns/offline-first).
+
+---
+
+## Preferences vs Proto — how to pick
+
+| Use **Preferences DataStore** when...          | Use **Proto DataStore** when...                |
+|------------------------------------------------|-------------------------------------------------|
+| < 10 simple settings                           | Complex nested preferences                     |
+| Replacing SharedPreferences directly           | Need schema evolution                           |
+| Quick prototyping                              | Cross-platform (shared proto with backend)     |
+| Don't care about runtime type safety           | Type safety matters                             |
+| No complex relationships                       | Many related settings grouped                   |
+
+For new features in an established app, **default to Proto** — the up-front
+schema file pays off every time you add a field.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'DataStore mistakes',
+    variant: 'old',
+    points: [
+      'Creating multiple DataStore instances for the same file',
+      'Calling edit { } every character during text input',
+      'Storing JSON-encoded complex objects in Preferences',
+      'Not handling IOException from .data',
+      'Writing to DataStore from main thread (non-suspend wrappers)',
+      'Large binary blobs in DataStore'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Solid DataStore',
+    variant: 'new',
+    points: [
+      'One @Singleton DataStore per file via Hilt',
+      'Debounce or batch writes during rapid input',
+      'Use Proto DataStore for complex data',
+      '.catch { if (it is IOException) emit(...) }',
+      'All writes via suspend functions',
+      'Use Room or file storage for blobs > 1MB'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="DataStore rules">
+- **Migrate off SharedPreferences** — SharedPreferencesMigration handles it automatically.
+- **Preferences DataStore** for simple key-value; **Proto DataStore** for structured data.
+- Always **catch IOException** from `.data`; return default on error.
+- **One @Singleton** DataStore per file; don't instantiate ad-hoc.
+- **updateData { }** is atomic — read-modify-write happens in one coroutine-safe step.
+- **Test with `PreferenceDataStoreFactory.create`** + a TestScope; clean the file in `@After`.
+- **Not multi-process safe** by default — route writes through one process.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Migrate from SharedPreferences', description: 'Pick a SharedPreferences instance in your app. Replace with Preferences DataStore using SharedPreferencesMigration. Verify existing values carry over.' },
+  { title: 'Design a Proto schema', description: 'Model your user settings as a .proto file. Include an enum, nested message, and repeated field. Generate bindings and build a UserPreferencesRepository.' },
+  { title: 'Write a migration', description: 'Add a field to your Proto schema. Write a DataMigration that backfills the new field on upgrade. Test with an existing store on disk.' },
+  { title: 'Sync with backend', description: 'Create a SettingsSyncWorker that merges local DataStore with a remote API on connectivity. Handle conflicts with last-write-wins.' }
+]} />
+
+## Next
+
+Continue to **[Encrypted Storage](./encrypted-storage)** for Keystore-backed secrets or **[Files, MediaStore & Scoped Storage](./files-and-media)** for larger data.

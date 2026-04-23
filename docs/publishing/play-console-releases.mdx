@@ -1,0 +1,545 @@
+---
+id: play-console-releases
+title: Play Console & Release Management
+sidebar_label: Play Console
+description: Play Console track structure, staged rollouts, release notes, pre-launch reports, Play App Signing, key rotation, and automated releases via Gradle + Fastlane.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Play Console & Release Management
+
+Play Console is where every Android app meets the world. Beyond "upload
+APK," serious release management involves track strategy, staged
+rollouts, automated halt on regressions, and signing discipline. This
+chapter covers the full production workflow.
+
+## The track structure
+
+```text
+Internal Testing     (up to 100 testers, same day)
+    ↓
+Closed Testing       (alpha / email groups, 1-N days bake)
+    ↓
+Open Testing         (beta, public opt-in, 3-7 days)
+    ↓
+Production Rollout   (1% → 5% → 10% → 25% → 50% → 100%, 1-3 days each step)
+```
+
+### Internal Testing
+
+Up to 100 testers via email list. Release appears **same day**. Use for:
+- Dogfooding within your team
+- Contractor / QA access before alpha
+
+### Closed Testing
+
+Up to 200 tester groups. Release appears in **hours** on test devices.
+Use for:
+- Partner preview
+- Region-locked beta (specific countries)
+- Trusted external testers
+
+### Open Testing (Beta)
+
+Public opt-in via a Play Store link. Appears in **3-7 days**. Use for:
+- Broad beta before release
+- Real device diversity testing
+- Performance baseline capture
+
+### Production
+
+Staged rollouts. Standard cadence:
+
+```text
+Day 0:  1% rollout  → monitor crash-free, ANR, Firebase Performance
+Day 1:  5%           → if metrics stable
+Day 3:  10%
+Day 5:  25%
+Day 7:  50%
+Day 10: 100%
+```
+
+Never jump straight to 100%. A 1% bad release affects 10,000 users; a 100%
+bad release affects 1,000,000.
+
+---
+
+## Automated rollout via Play Developer API
+
+Publishing manually via Play Console is fine for tiny teams. For anything
+at scale, automate via the **Play Developer API** (covered in
+[Module 17 — CI/CD](/docs/cicd-devops/overview)):
+
+```yaml
+# .github/workflows/release.yml
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production                # requires manual approval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Decode keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+      - name: Build bundle
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew bundleRelease
+      - name: Upload to Play (internal track)
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.myapp
+          releaseFiles: app/build/outputs/bundle/release/app-release.aab
+          track: internal
+          status: completed
+```
+
+### Fastlane alternative
+
+```ruby
+# fastlane/Fastfile
+platform :android do
+  desc "Upload to internal track"
+  lane :internal do
+    gradle(task: "bundleRelease")
+    upload_to_play_store(
+      track: "internal",
+      aab: "app/build/outputs/bundle/release/app-release.aab",
+      release_status: "completed"
+    )
+  end
+
+  desc "Promote internal → production 5%"
+  lane :promote_to_production_5 do
+    upload_to_play_store(
+      track: "internal",
+      track_promote_to: "production",
+      rollout: "0.05"
+    )
+  end
+end
+```
+
+See [Module 17 — CI/CD](/docs/cicd-devops/overview) for the full Fastlane
+setup.
+
+---
+
+## Play App Signing (mandatory since 2021)
+
+Two keys in modern signing:
+
+| Key              | Who owns it           | Purpose                                  |
+|------------------|-----------------------|------------------------------------------|
+| **Upload key**   | You (local / CI)      | Signs uploads to Play                    |
+| **App-signing key** | Google (HSM)        | Signs what end users install             |
+
+If your upload key is compromised → revoke it via Play Console, Google
+re-issues without impacting users. If Google held only one key, any
+compromise meant redistributing a new signed APK to all users (essentially
+a forced reinstall for everyone).
+
+### Key generation (upload key)
+
+```bash
+keytool -genkey -v \
+  -keystore upload-keystore.jks \
+  -keyalg RSA -keysize 4096 -validity 10000 \
+  -alias upload \
+  -dname "CN=My App Dev, O=My Company, L=City, ST=State, C=US"
+```
+
+**Store the keystore file + password in a secure secret manager** — never
+in git. Losing it means you can't ship updates until Google re-issues.
+
+### Signing config in Gradle
+
+```kotlin
+// app/build.gradle.kts
+android {
+    signingConfigs {
+        create("release") {
+            storeFile = file(System.getenv("KEYSTORE_PATH") ?: "upload.keystore")
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("KEY_ALIAS")
+            keyPassword = System.getenv("KEY_PASSWORD")
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+}
+```
+
+### Key rotation
+
+Google supports **key rotation** — if you want to change the upload key:
+
+1. Generate a new upload key
+2. Upload a CSR to Play Console
+3. Google signs a certificate rotation request
+4. Start signing uploads with the new key; Play accepts both during
+   transition
+
+Users never notice — the app-signing key (held by Google) doesn't
+change.
+
+### Cloud KMS / HSM signing (banking, gov)
+
+For extreme security, don't even keep the upload key on disk — let
+Google Cloud KMS or an HSM sign via Fastlane:
+
+```ruby
+upload_to_play_store(
+  package_name: "com.example.bank",
+  aab: "app.aab",
+  track: "internal",
+  json_key_data: ENV["PLAY_JSON_KEY"]
+  # Signing happens in Google's HSM post-upload — key never in your environment
+)
+```
+
+---
+
+## Versioning strategy
+
+```kotlin
+// app/build.gradle.kts
+android {
+    defaultConfig {
+        versionCode = computeVersionCode()        // monotonically increasing integer
+        versionName = "2.5.3"                      // user-visible string (semver)
+    }
+}
+
+// Compute from git
+fun computeVersionCode(): Int {
+    val process = ProcessBuilder("git", "rev-list", "--count", "HEAD").start()
+    return process.inputStream.bufferedReader().readText().trim().toInt()
+}
+```
+
+### versionCode
+
+Monotonically increasing integer. Play rejects uploads with equal or
+lower versionCode than an existing release on any track.
+
+### versionName
+
+User-visible in Play Store + app settings. Follow semver (`MAJOR.MINOR.PATCH`):
+- MAJOR: breaking UI / data changes
+- MINOR: new features
+- PATCH: bug fixes
+
+Some apps add a build number: `2.5.3 (12345)` where 12345 is the version code.
+
+---
+
+## Release notes
+
+Ship release notes for every public release. Play Console localizes them
+per-language:
+
+```xml
+<!-- fastlane/metadata/android/en-US/changelogs/default.txt -->
+- New: Dark mode for the order history screen
+- Fix: Resolved crash when applying expired discount codes
+- Fix: Cart totals now show correct tax in EU regions
+- Performance: 30% faster checkout
+```
+
+Keep it **user-facing** — no "refactored ViewModel," no issue numbers.
+
+---
+
+## Screenshots and store listing
+
+Required assets:
+
+- **Icon**: 512×512 PNG
+- **Feature graphic**: 1024×500 PNG (top of store listing)
+- **Screenshots**: 2-8 per device type (phone, 7" tablet, 10" tablet)
+- **Short description**: 80 chars
+- **Full description**: up to 4000 chars
+
+Use **Fastlane screenshots** to automate capture across devices and
+locales:
+
+```ruby
+capture_android_screenshots(
+  locales: ["en-US", "es-ES", "hi-IN"],
+  device_type: "phone"
+)
+```
+
+---
+
+## Pre-launch report
+
+Play Console runs your app on a device farm before release — catches:
+- Obvious crashes
+- Security vulnerabilities
+- Performance issues
+- Screenshot gallery
+
+Fix every pre-launch failure before promoting. Firebase Test Lab
+integrates into this flow — Play uses the same underlying infrastructure.
+
+---
+
+## Data Safety declaration
+
+Every app must declare what data it collects, for what purpose, and
+whether users can request deletion. Play rejects apps that declare
+incorrectly.
+
+### Collected vs shared
+
+- **Collected**: data sent to your servers (auth, analytics, crashes)
+- **Shared**: data you pass to 3rd parties (SDKs — AdMob, Meta, Firebase Analytics is both)
+
+### Categories
+
+Common categories you'll declare:
+
+| Category                          | Sources                                          |
+|-----------------------------------|--------------------------------------------------|
+| **Personal info**                 | Name, email, user ID                             |
+| **Financial info**                | In-app purchase history, payment info            |
+| **Health & fitness**              | Heart rate, steps                                |
+| **Messages**                      | Chat, email content                              |
+| **Photos & videos**               | User uploads                                     |
+| **Files & docs**                  | User-selected files                              |
+| **Audio**                         | Voice messages, recordings                       |
+| **App activity**                  | Screens viewed, taps, search queries             |
+| **Device or other IDs**           | Advertising ID, device model, install ID         |
+
+For each: purpose (functionality, analytics, advertising, account management,
+developer communications, fraud prevention, personalization), whether
+encrypted in transit, and whether users can request deletion.
+
+### Automated data inventory
+
+Keep a YAML in the repo:
+
+```yaml
+# privacy/data-inventory.yml
+collected:
+  - type: email
+    purpose: [account_management]
+    shared_with: []
+    encrypted_in_transit: true
+    user_deletable: true
+  - type: device_id
+    purpose: [crash_diagnostics]
+    shared_with: [firebase_crashlytics]
+    encrypted_in_transit: true
+    user_deletable: false
+```
+
+Review this whenever you add a new SDK. Out-of-sync declaration is the
+most common reason for rejected releases.
+
+---
+
+## Content rating
+
+Answer questions about content: violence, gore, drugs, gambling, sexual
+content. Play assigns ESRB / PEGI / IARC ratings per region.
+
+For apps serving children: declare **target audience** under 13 →
+automatically triggers COPPA-compliance requirements (no behavioral ads,
+parental consent, minimal data).
+
+---
+
+## Staged rollout — monitoring and halting
+
+Once at 5%+, watch metrics obsessively:
+
+| Metric                      | Threshold             |
+|-----------------------------|------------------------|
+| Crash-free users (24h)      | ≥ 99.5%               |
+| Crash-free sessions (24h)   | ≥ 99.5%               |
+| ANR rate (24h)              | ≤ 0.20%               |
+| Slow cold-start rate        | ≤ 5%                  |
+| Excessive battery          | ≤ 5%                  |
+
+Play Console surfaces regressions; Firebase Crashlytics + Performance
+give you per-release trends. See [Module 18 — Observability](/docs/observability/overview).
+
+### Halting a rollout
+
+From Play Console → Production release → Halt rollout. Existing installs
+remain; new users see the previous version until you promote again.
+
+### Automated watchdog
+
+```yaml
+# .github/workflows/rollout-watchdog.yml
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 min during rollout
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Query Crashlytics
+        id: crash
+        run: |
+          RATE=$(curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://firebase.googleapis.com/.../crashFreePercentile" | jq .p50)
+          echo "rate=$RATE" >> $GITHUB_OUTPUT
+      - name: Halt if regressed
+        if: ${{ fromJSON(steps.crash.outputs.rate) < 99.5 }}
+        run: |
+          bundle exec fastlane halt
+          curl -X POST -d '{"text":"🚨 Rollout halted — crash-free dropped to ${{ steps.crash.outputs.rate }}%"}' \
+            ${{ secrets.SLACK_WEBHOOK }}
+```
+
+Reactive rollback saves hours of bad-version exposure.
+
+---
+
+## Release cadence
+
+| Team size                           | Typical cadence             |
+|-------------------------------------|-----------------------------|
+| Solo dev                            | Every 2-4 weeks              |
+| Small team (2-5)                    | Weekly                       |
+| Mid-size (5-15)                     | Bi-weekly, train-based       |
+| Large (15+)                         | Weekly trains, continuous    |
+
+"**Release trains**" — features merge to a release branch on a schedule
+(e.g., every Friday). Bug fixes can land on the current train. The train
+ships Tuesday following a 3-day bake on internal + closed testing.
+
+---
+
+## Handling emergencies
+
+### Critical bug found at 5% rollout
+
+1. **Halt the rollout** (takes seconds)
+2. Investigate via Crashlytics — find the stack trace
+3. Fix, cut a hotfix branch, run CI
+4. Either:
+   - **Resume with new 5%** if fix is small and tested
+   - **Release a new version** with higher versionCode if significant
+
+### Ordered for full removal
+
+A fix still needs a new version to push. Meanwhile, users on the bad
+version are stuck. Two mitigations:
+
+- **Feature flag off** via Remote Config (Module 07) — instant, no
+  redeploy
+- **Server-side patch** for API changes
+- **Force-upgrade** dialog via in-app update API (rare, heavy-handed)
+
+### In-App Update API
+
+```kotlin
+// build.gradle
+implementation("com.google.android.play:app-update-ktx:2.1.0")
+
+class AppUpdateManager @Inject constructor(@ApplicationContext context: Context) {
+    private val manager = AppUpdateManagerFactory.create(context)
+
+    suspend fun checkForUpdate(): UpdateStatus = suspendCoroutine { cont ->
+        manager.appUpdateInfo.addOnSuccessListener { info ->
+            when {
+                info.updateAvailability() == UpdateAvailability.UPDATE_AVAILABLE &&
+                        info.isUpdateTypeAllowed(AppUpdateType.IMMEDIATE) ->
+                    cont.resume(UpdateStatus.ForceRequired(info))
+                info.updateAvailability() == UpdateAvailability.UPDATE_AVAILABLE &&
+                        info.isUpdateTypeAllowed(AppUpdateType.FLEXIBLE) ->
+                    cont.resume(UpdateStatus.AvailableOptional(info))
+                else -> cont.resume(UpdateStatus.UpToDate)
+            }
+        }
+    }
+}
+```
+
+Immediate updates **force** the user to update before continuing.
+Flexible updates download in the background. Use flexible for most
+releases; immediate only for **critical** releases (security, legal).
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Release mistakes',
+    variant: 'old',
+    points: [
+      '100% rollout on day 1',
+      'Manual Play Console uploads (human error)',
+      'Upload keystore checked into git',
+      'No staged rollout monitoring',
+      'fallbackToDestructiveMigration in release Room',
+      'Release notes saying "bug fixes and improvements"'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production releases',
+    variant: 'new',
+    points: [
+      '1% → 5% → 10% → ... gradual rollout',
+      'Fastlane / Play Developer API automation',
+      'Keystore in secrets manager; never in git',
+      'Automated watchdog halts on crash-free regression',
+      'Tested migrations; schema history in git',
+      'Specific, user-facing release notes'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Play Console rules">
+- **Track strategy**: Internal → Closed → Open → Production with bake time between.
+- **Play App Signing** — upload key on disk, app-signing key in Google's HSM.
+- **Staged rollout** 1% → 5% → 10% → 25% → 50% → 100% with 1-3 day bake per step.
+- **Automated watchdog** halts rollout on crash-free / ANR regression.
+- **Data Safety** declaration must match actual SDK behavior.
+- **Fastlane / Play Developer API** for reproducible, auditable releases.
+- **Remote Config + feature flags** for instant rollback without redeploy.
+- **In-app update API** for critical version prompts.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Set up Play App Signing', description: 'Generate an upload keystore, configure signingConfigs, upload your first release to internal track.' },
+  { title: 'Automate via Fastlane', description: 'Set up a Fastlane `internal` lane. Run it from CI on tag push. Verify the AAB uploads.' },
+  { title: 'Staged rollout drill', description: 'Release a cosmetic change. Take it through internal → closed → production 5%. Monitor Crashlytics for 24h before promoting.' },
+  { title: 'Data Safety audit', description: 'Review your data-inventory.yml against every SDK in your app (Firebase, AdMob, analytics). Update Play Console declarations.' },
+  { title: 'Rollout watchdog', description: 'Set up the GitHub Actions watchdog to halt on crash-free < 99.5%. Simulate by temporarily reducing the threshold.' }
+]} />
+
+## Next
+
+Continue to **[Play Billing](./play-billing)** for in-app purchases and subscriptions, or **[App Bundles & Dynamic Delivery](./app-bundles)** for distribution optimization.

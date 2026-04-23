@@ -1,0 +1,561 @@
+---
+id: firestore-deep-dive
+title: Firestore Deep Dive
+sidebar_label: Firestore
+description: Cloud Firestore — data modeling, queries, real-time listeners, transactions, offline persistence, security rules, and performance patterns.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Firestore Deep Dive
+
+Firestore is a document database with offline-first semantics out of the
+box. For the right app shape — real-time UIs, moderate write volume,
+user-isolated data — it replaces a whole backend team. For the wrong
+shape (big analytics queries, joins across millions of docs), it's the
+wrong tool. This chapter covers the right-shape patterns.
+
+## Data modeling — collections, documents, subcollections
+
+```text
+users/                       (collection)
+  userId-a/                  (document)
+    name: "Aarav"
+    email: "a@x.com"
+    createdAt: Timestamp
+
+    orders/                  (subcollection)
+      order-1/               (document)
+        total: 4999
+        status: "shipped"
+
+        items/               (subcollection)
+          item-a/            (document)
+            productId: "p1"
+            quantity: 2
+```
+
+### Modeling rules of thumb
+
+- **Small, stable document shape**. Firestore charges per read; a 300KB
+  document read N times is 300KB × N of quota.
+- **Denormalize** — duplicate data when it saves reads. No joins.
+- **Max document size**: 1 MB. Max depth: 100 subcollections.
+- **Collection Group queries** let you query across same-named
+  subcollections across all parents (`orders/*/items`).
+
+---
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+firebase-firestore = { module = "com.google.firebase:firebase-firestore-ktx" }
+kotlinx-coroutines-play-services = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-play-services", version = "1.9.0" }
+
+// Data classes with Kotlinx serialization can't be used with Firestore directly.
+// Use @DocumentId + no-arg constructor, or manual mapping.
+```
+
+```kotlin
+val firestore: FirebaseFirestore = Firebase.firestore.apply {
+    // Enable offline persistence (default on, but be explicit)
+    firestoreSettings = firestoreSettings {
+        isPersistenceEnabled = true
+        cacheSizeBytes = 100L * 1024 * 1024            // 100 MB local cache
+        host = if (BuildConfig.DEBUG) "10.0.2.2:8080" else "firestore.googleapis.com"
+        isSslEnabled = !BuildConfig.DEBUG
+    }
+}
+```
+
+---
+
+## Writing data
+
+### Set (create or overwrite)
+
+```kotlin
+data class UserDoc(
+    @DocumentId val id: String = "",
+    val name: String = "",
+    val email: String = "",
+    @ServerTimestamp val createdAt: Timestamp? = null
+)
+
+suspend fun createUser(id: String, name: String, email: String) {
+    firestore.collection("users").document(id).set(
+        UserDoc(id = id, name = name, email = email)
+    ).await()
+}
+```
+
+### Update (partial)
+
+```kotlin
+suspend fun updateEmail(userId: String, newEmail: String) {
+    firestore.collection("users").document(userId).update(
+        mapOf(
+            "email" to newEmail,
+            "updatedAt" to FieldValue.serverTimestamp()
+        )
+    ).await()
+}
+```
+
+### Increment, array ops, delete fields
+
+```kotlin
+firestore.collection("posts").document(postId).update(
+    mapOf(
+        "viewCount" to FieldValue.increment(1),
+        "likedBy" to FieldValue.arrayUnion(userId),
+        "retractedAt" to FieldValue.delete()
+    )
+).await()
+```
+
+`FieldValue.increment` is an **atomic server-side op** — no read-modify-
+write race.
+
+---
+
+## Reading — one-shot
+
+```kotlin
+suspend fun loadUser(id: String): UserDoc? = try {
+    val snap = firestore.collection("users").document(id).get().await()
+    snap.toObject(UserDoc::class.java)
+} catch (e: FirebaseFirestoreException) {
+    null
+}
+
+// Specify source
+val remote = firestore.collection("users").document(id)
+    .get(Source.SERVER).await()
+
+val cached = firestore.collection("users").document(id)
+    .get(Source.CACHE).await()
+```
+
+---
+
+## Real-time listeners
+
+```kotlin
+fun observeUser(id: String): Flow<UserDoc?> = callbackFlow {
+    val registration = firestore.collection("users").document(id)
+        .addSnapshotListener { snap, error ->
+            if (error != null) {
+                close(error)
+                return@addSnapshotListener
+            }
+            trySend(snap?.toObject(UserDoc::class.java))
+        }
+    awaitClose { registration.remove() }
+}
+```
+
+### Metadata and local writes
+
+```kotlin
+firestore.collection("posts").document(id)
+    .addSnapshotListener(MetadataChanges.INCLUDE) { snap, _ ->
+        if (snap?.metadata?.hasPendingWrites() == true) {
+            // Local write hasn't reached the server yet (offline)
+        }
+        if (snap?.metadata?.isFromCache == true) {
+            // Data is from local cache, not live
+        }
+    }
+```
+
+The metadata tells you whether to show a "sending…" indicator for
+optimistic UI.
+
+---
+
+## Queries
+
+```kotlin
+// Simple
+val recent = firestore.collection("posts")
+    .whereEqualTo("authorId", userId)
+    .orderBy("createdAt", Query.Direction.DESCENDING)
+    .limit(20)
+    .get().await()
+
+// Compound
+val trending = firestore.collection("posts")
+    .whereGreaterThan("likes", 100)
+    .orderBy("likes", Query.Direction.DESCENDING)
+    .orderBy("createdAt", Query.Direction.DESCENDING)
+    .limit(50)
+    .get().await()
+
+// in / not-in / array-contains
+val batch = firestore.collection("users")
+    .whereIn("role", listOf("admin", "moderator"))
+    .get().await()
+
+val tagged = firestore.collection("posts")
+    .whereArrayContains("tags", "kotlin")
+    .get().await()
+
+// Collection group
+val allOrderItems = firestore.collectionGroup("items")
+    .whereEqualTo("productId", productId)
+    .get().await()
+```
+
+### Pagination with `startAfter`
+
+```kotlin
+suspend fun loadPage(lastDoc: DocumentSnapshot? = null, pageSize: Int = 20): QuerySnapshot {
+    var query = firestore.collection("posts")
+        .orderBy("createdAt", Query.Direction.DESCENDING)
+        .limit(pageSize.toLong())
+    if (lastDoc != null) query = query.startAfter(lastDoc)
+    return query.get().await()
+}
+```
+
+### Query limitations
+
+- `whereIn` / `whereArrayContainsAny` — max 30 values
+- Inequality filters — only one field per query (`<`, `<=`, `>`, `>=`, `!=`)
+- Compound queries require a **composite index** — Firestore logs the
+  creation URL in the error message
+
+---
+
+## Transactions and batched writes
+
+### Transaction — read then write atomically
+
+```kotlin
+suspend fun transferPoints(fromId: String, toId: String, amount: Int) {
+    firestore.runTransaction { tx ->
+        val fromRef = firestore.collection("users").document(fromId)
+        val toRef = firestore.collection("users").document(toId)
+
+        val fromSnap = tx.get(fromRef)
+        val toSnap = tx.get(toRef)
+
+        val fromBalance = fromSnap.getLong("points") ?: 0
+        if (fromBalance < amount) throw InsufficientFunds()
+
+        tx.update(fromRef, "points", fromBalance - amount)
+        tx.update(toRef, "points", (toSnap.getLong("points") ?: 0) + amount)
+    }.await()
+}
+```
+
+Transactions auto-retry on concurrent modification. Don't do side effects
+(network calls, push notifications) inside the transaction lambda — it
+may execute multiple times.
+
+### Batched write — multiple writes, no reads
+
+```kotlin
+val batch = firestore.batch()
+batch.set(firestore.collection("orders").document(orderId), order)
+batch.update(firestore.collection("carts").document(userId), "items", emptyList<Any>())
+batch.update(firestore.collection("users").document(userId),
+    "orderCount", FieldValue.increment(1))
+batch.commit().await()
+```
+
+Up to 500 writes per batch. Atomic: all or nothing.
+
+---
+
+## Offline persistence
+
+Firestore ships with aggressive offline caching:
+
+- **Reads** hit the local cache first, then the server
+- **Writes** are queued and replayed when online
+- **Listeners** emit from cache immediately, then from server
+
+```kotlin
+// Explicit offline toggling (for testing)
+suspend fun goOffline() { firestore.disableNetwork().await() }
+suspend fun goOnline() { firestore.enableNetwork().await() }
+
+// Clear local cache (on sign-out)
+suspend fun clearCache() {
+    firestore.terminate().await()
+    firestore.clearPersistence().await()
+}
+```
+
+### Snapshots in memory — listener aggregation
+
+Every active listener consumes memory. Keep the number reasonable:
+
+```kotlin
+class InboxViewModel @Inject constructor(
+    private val firestore: FirebaseFirestore
+) : ViewModel() {
+    val conversations: StateFlow<List<Conversation>> = observeConversations()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    private fun observeConversations(): Flow<List<Conversation>> = callbackFlow {
+        val reg = firestore.collection("conversations")
+            .whereArrayContains("participants", currentUserId)
+            .addSnapshotListener { snap, _ ->
+                trySend(snap?.toObjects(Conversation::class.java) ?: emptyList())
+            }
+        awaitClose { reg.remove() }
+    }
+}
+```
+
+`SharingStarted.WhileSubscribed(5_000)` tears down the listener 5s after
+the last collector disconnects (screen goes background). Re-subscribes
+when the UI returns.
+
+---
+
+## Security Rules — the authorization layer
+
+Every Firestore operation runs through **Security Rules** — server-side
+code that decides allow/deny based on the incoming request:
+
+```
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // Users can only access their own profile
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == userId;
+
+      // Subcollection inherits nothing — define its own rules
+      match /orders/{orderId} {
+        allow read: if request.auth.uid == userId;
+        allow create: if request.auth.uid == userId &&
+                         request.resource.data.total is number &&
+                         request.resource.data.total > 0;
+        allow update: if request.auth.uid == userId &&
+                         resource.data.status != "shipped";   // lock after shipped
+      }
+    }
+
+    // Admin-only collection
+    match /admin/{doc=**} {
+      allow read, write: if request.auth.token.role == 'admin';
+    }
+
+    // Public read, admin write
+    match /products/{productId} {
+      allow read: if true;
+      allow write: if request.auth.token.role == 'admin';
+    }
+
+    // Rate limiting via timestamps
+    match /posts/{postId} {
+      allow create: if request.auth != null &&
+                       request.time > resource.data.lastPostAt + duration.value(10, 's');
+    }
+  }
+}
+```
+
+### Testing rules with the emulator
+
+```javascript
+// Node test
+const {initializeTestEnvironment, assertFails, assertSucceeds} = require('@firebase/rules-unit-testing');
+
+test('user cannot read other users orders', async () => {
+  const alice = testEnv.authenticatedContext('alice').firestore();
+  await assertFails(alice.doc('users/bob/orders/order1').get());
+});
+```
+
+Run `firebase emulators:exec --only firestore 'npm test'` in CI.
+
+---
+
+## Data classes and Firestore mapping
+
+Firestore's auto-mapping requires a **no-arg constructor** and **var**
+properties. Kotlin `data class` with default values works:
+
+```kotlin
+data class UserDoc(
+    @DocumentId var id: String = "",
+    var name: String = "",
+    var email: String = "",
+    @ServerTimestamp var createdAt: Timestamp? = null,
+    @get:PropertyName("is_premium") @set:PropertyName("is_premium")
+    var isPremium: Boolean = false,
+    @Exclude var localOnly: String = ""          // not serialized
+)
+
+// Nested objects work too
+data class ConversationDoc(
+    @DocumentId var id: String = "",
+    var participants: List<String> = emptyList(),
+    var lastMessage: LastMessage? = null
+)
+
+data class LastMessage(
+    var body: String = "",
+    var senderId: String = "",
+    @ServerTimestamp var sentAt: Timestamp? = null
+)
+```
+
+### Mapping to domain types
+
+```kotlin
+fun UserDoc.toDomain(): User = User(
+    id = UserId(id),
+    name = name,
+    email = Email.parse(email).valueOr { error(it) },
+    createdAt = createdAt?.toDate()?.toInstant() ?: Instant.EPOCH,
+    isPremium = isPremium
+)
+```
+
+Keep Firestore DTOs in `:data`; convert to domain types at the
+repository boundary.
+
+---
+
+## Aggregation queries (counts, sums)
+
+Firestore now supports server-side aggregations — no need to fetch all
+docs:
+
+```kotlin
+val query = firestore.collection("posts").whereEqualTo("authorId", userId)
+
+val count = query.count().get(AggregateSource.SERVER).await().count
+val sum = query.aggregate(
+    AggregateField.sum("likes"),
+    AggregateField.average("commentsCount")
+).get(AggregateSource.SERVER).await()
+```
+
+Pay for 1 read per aggregation instead of N reads for all documents.
+
+---
+
+## Performance patterns
+
+### 1. Index every `whereEqualTo` + `orderBy` combination
+
+Firestore auto-indexes single-field queries. Compound queries need a
+**composite index**. The error message includes a URL that creates it
+with one click.
+
+### 2. Denormalize hot paths
+
+For a social feed where "posts with author name + avatar" is queried
+100× more than the author is edited, embed a snapshot of the author in
+each post:
+
+```kotlin
+data class PostDoc(
+    @DocumentId var id: String = "",
+    var body: String = "",
+    var authorId: String = "",
+    var authorName: String = "",       // denormalized
+    var authorAvatar: String = ""      // denormalized
+)
+```
+
+Update via a Cloud Function trigger when the user changes their profile.
+
+### 3. Use Bundles for cold-start reads
+
+`firestore.loadBundle(bundleData)` pre-hydrates the cache with docs
+generated server-side — no client-side reads for the first render.
+
+### 4. Cache sizing
+
+Default cache is 100 MB. For read-heavy apps, increase:
+
+```kotlin
+firestoreSettings { cacheSizeBytes = 250L * 1024 * 1024 }
+```
+
+---
+
+## Cost optimization
+
+Firestore charges per read, write, delete, and network egress. Tips:
+
+- **Listener re-subscribes are free** — keep them attached while the UI is alive.
+- **Paginate** queries; don't fetch entire collections.
+- **Use projections** sparingly — Firestore always returns the whole document.
+- **Use aggregation queries** for counts instead of `get()` then `.size()`.
+- **Batched writes** are still 1 write per doc — doesn't save cost.
+- **Offline reads** from cache don't cost anything.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Firestore mistakes',
+    variant: 'old',
+    points: [
+      'Storing everything in one giant document',
+      'Deep nesting (5+ subcollections)',
+      'Client-side filtering after whereEqualTo',
+      'No security rules (production left open)',
+      'Transactions that do HTTP calls',
+      'Forgetting to remove snapshot listeners'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production patterns',
+    variant: 'new',
+    points: [
+      'Small documents, denormalized for read patterns',
+      'Max 2-3 levels of subcollections',
+      'Server-side filtering with composite indexes',
+      'Rules enforced + emulator-tested in CI',
+      'Pure reducers in transaction blocks',
+      'awaitClose { reg.remove() } in every callbackFlow'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Firestore rules">
+- **Model for reads** — denormalize, keep docs small, avoid deep nesting.
+- **Real-time listeners** with `callbackFlow` + `SharingStarted.WhileSubscribed(5_000)`.
+- **Transactions** for atomic read-then-write; no side effects inside.
+- **Offline persistence** on by default; 100MB cache is usually enough.
+- **Security rules** + emulator tests in CI — enforcement is server-side.
+- **Aggregation queries** for counts/sums — pay for 1 read, not N.
+- **Custom claims** for role-based rules; set via Admin SDK, read from tokens.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Model a chat schema', description: 'Design conversations/ and messages/ collections with appropriate denormalization. Write security rules that enforce participant-only access.' },
+  { title: 'Real-time Flow', description: 'Write observeMessages(convId) returning Flow<List<Message>> backed by addSnapshotListener with proper awaitClose cleanup.' },
+  { title: 'Transaction', description: 'Implement a transferPoints transaction. Verify it retries on concurrent modification by racing two coroutines.' },
+  { title: 'Emulator tests', description: 'Set up Firebase emulators + firebase-rules-unit-testing. Write a test asserting a non-admin cannot write to /admin/.' },
+  { title: 'Aggregation', description: 'Replace a query that counts all posts by a user (fetches all docs) with an aggregation query. Compare read cost.' }
+]} />
+
+## Next
+
+Continue to **[Cloud Storage & FCM](./cloud-storage-fcm)** for file uploads and push notifications, or
+**[Remote Config & App Check](./remote-config-app-check)** for feature flags and anti-abuse.

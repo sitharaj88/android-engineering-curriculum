@@ -1,0 +1,505 @@
+---
+id: media3-exoplayer
+title: Media3 / ExoPlayer
+sidebar_label: Media3 / ExoPlayer
+description: Video / audio playback on Android — Media3 ExoPlayer, adaptive streaming, DRM, MediaSession, lockscreen / Android Auto / chromecast.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Media3 / ExoPlayer
+
+Media3 is Google's unified media library — it subsumes ExoPlayer (video
+player), MediaSession (system-wide media controls), and related APIs.
+If your app plays audio or video, this is the stack.
+
+## When to use Media3 vs alternatives
+
+<ComparisonCard
+  left={{
+    label: 'Use Media3',
+    title: 'Recommended for',
+    variant: 'new',
+    points: [
+      'Video playback (HLS, DASH, progressive)',
+      'Audio / music apps',
+      'Podcast apps',
+      'Livestream / low-latency',
+      'Any app needing lockscreen controls',
+      'Cast to Chromecast / Android TV'
+    ]
+  }}
+  right={{
+    label: 'Alternatives',
+    title: 'When',
+    variant: 'old',
+    points: [
+      'MediaPlayer — legacy; avoid for new code',
+      'VideoView — too basic; no adaptive streaming',
+      'Third-party players — rare; only for specific codec support',
+      'WebView — for YouTube embeds if you can\'t use YouTube Player API'
+    ]
+  }}
+/>
+
+---
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+media3 = "1.5.1"
+
+media3-exoplayer      = { module = "androidx.media3:media3-exoplayer",      version.ref = "media3" }
+media3-exoplayer-dash = { module = "androidx.media3:media3-exoplayer-dash", version.ref = "media3" }
+media3-exoplayer-hls  = { module = "androidx.media3:media3-exoplayer-hls",  version.ref = "media3" }
+media3-ui             = { module = "androidx.media3:media3-ui",             version.ref = "media3" }
+media3-session        = { module = "androidx.media3:media3-session",        version.ref = "media3" }
+media3-datasource-okhttp = { module = "androidx.media3:media3-datasource-okhttp", version.ref = "media3" }
+```
+
+---
+
+## Basic video playback
+
+```kotlin
+@Composable
+fun VideoPlayer(mediaUri: Uri, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    val player = remember(mediaUri) {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(mediaUri))
+            prepare()
+            playWhenReady = true
+        }
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> player.pause()
+                Lifecycle.Event.ON_RESUME -> player.play()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            player.release()           // critical — avoid memory leaks
+        }
+    }
+
+    AndroidView(
+        factory = { ctx ->
+            PlayerView(ctx).apply {
+                this.player = player
+                useController = true
+                setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
+            }
+        },
+        modifier = modifier
+    )
+}
+```
+
+### Always release the player
+
+The #1 media bug is forgetting `player.release()`. Every `ExoPlayer`
+instance holds:
+- A surface texture (GPU memory)
+- Network connections (bandwidth)
+- Codec instances (scarce hardware resource)
+
+Release in `onDispose`, `onDestroy`, or when done.
+
+---
+
+## Adaptive streaming (HLS / DASH)
+
+Video apps typically stream adaptive formats — Media3 picks the right
+bitrate based on network / device / screen size:
+
+```kotlin
+val mediaItem = MediaItem.Builder()
+    .setUri("https://cdn.example.com/video/master.m3u8")
+    .setMimeType(MimeTypes.APPLICATION_M3U8)      // HLS
+    .build()
+
+// Or DASH
+val dashItem = MediaItem.Builder()
+    .setUri("https://cdn.example.com/video/manifest.mpd")
+    .setMimeType(MimeTypes.APPLICATION_MPD)
+    .build()
+
+player.setMediaItem(mediaItem)
+player.prepare()
+```
+
+### Custom track selection
+
+```kotlin
+val trackSelector = DefaultTrackSelector(context).apply {
+    setParameters(buildUponParameters()
+        .setMaxVideoSize(1280, 720)                 // cap at 720p on mobile data
+        .setPreferredAudioLanguage("en")
+        .setPreferredTextLanguage("en")
+    )
+}
+
+val player = ExoPlayer.Builder(context)
+    .setTrackSelector(trackSelector)
+    .build()
+```
+
+Cap bitrate on mobile data, full quality on Wi-Fi — set via
+`ConnectivityManager`:
+
+```kotlin
+val isUnmetered = connectivityManager.isActiveNetworkMetered.not()
+trackSelector.setParameters(trackSelector.buildUponParameters()
+    .setMaxVideoSize(if (isUnmetered) Int.MAX_VALUE else 1280,
+                     if (isUnmetered) Int.MAX_VALUE else 720)
+)
+```
+
+---
+
+## DRM (Widevine)
+
+For protected content:
+
+```kotlin
+val mediaItem = MediaItem.Builder()
+    .setUri("https://cdn.example.com/video/manifest.mpd")
+    .setMimeType(MimeTypes.APPLICATION_MPD)
+    .setDrmConfiguration(
+        MediaItem.DrmConfiguration.Builder(C.WIDEVINE_UUID)
+            .setLicenseUri("https://license.example.com/drm/widevine")
+            .setLicenseRequestHeaders(mapOf("Authorization" to "Bearer $token"))
+            .build()
+    )
+    .build()
+```
+
+Widevine has three security levels:
+- **L1** — full decode in TEE; secure hardware; 4K allowed
+- **L2** — decrypt in TEE; render can be software
+- **L3** — software decode; typically 720p cap
+
+Check at runtime:
+
+```kotlin
+val securityLevel = ExoPlayer.Builder(context).build().use {
+    it.renderers.firstOrNull { it is MediaCodecVideoRenderer }
+    // Inspect DrmSessionManager for level
+}
+```
+
+L3 devices get 720p; L1 gets 1080p or 4K. Your backend issues licenses
+matching the device's capability.
+
+---
+
+## MediaSession — system-wide controls
+
+For audio / music / podcasts, use `MediaSessionService` so:
+- Lockscreen shows play/pause / next / previous
+- Notifications are system-styled
+- Android Auto / chromecast can see your content
+- Wear OS companion can control
+
+```kotlin
+@AndroidEntryPoint
+class PlaybackService : MediaSessionService() {
+
+    private var mediaSession: MediaSession? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        val player = ExoPlayer.Builder(this).build().apply {
+            addAnalyticsListener(EventLogger())
+        }
+        mediaSession = MediaSession.Builder(this, player)
+            .setCallback(MediaSessionCallback())
+            .build()
+    }
+
+    override fun onGetSession(info: MediaSession.ControllerInfo) = mediaSession
+
+    override fun onDestroy() {
+        mediaSession?.run {
+            player.release()
+            release()
+            mediaSession = null
+        }
+        super.onDestroy()
+    }
+}
+
+private class MediaSessionCallback : MediaSession.Callback {
+    override fun onPlaybackResumption(
+        mediaSession: MediaSession,
+        controller: MediaSession.ControllerInfo
+    ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+        // Restore last-played queue on resumption (e.g., Android Auto reconnect)
+        return Futures.immediateFuture(buildLastQueue())
+    }
+}
+```
+
+```xml
+<!-- AndroidManifest.xml -->
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+<service
+    android:name=".PlaybackService"
+    android:foregroundServiceType="mediaPlayback"
+    android:exported="true">
+    <intent-filter>
+        <action android:name="androidx.media3.session.MediaSessionService"/>
+        <action android:name="android.media.browse.MediaBrowserService"/>
+    </intent-filter>
+</service>
+```
+
+### Connecting from your Activity
+
+```kotlin
+class PlaybackController @Inject constructor(@ApplicationContext context: Context) {
+    private val sessionToken = SessionToken(
+        context,
+        ComponentName(context, PlaybackService::class.java)
+    )
+    private var controllerFuture: ListenableFuture<MediaController>? = null
+    private var _controller: MediaController? = null
+
+    suspend fun connect(): MediaController {
+        val future = MediaController.Builder(context, sessionToken).buildAsync()
+        controllerFuture = future
+        _controller = future.await()
+        return _controller!!
+    }
+
+    fun release() {
+        controllerFuture?.let { MediaController.releaseFuture(it) }
+        _controller = null
+    }
+}
+```
+
+Your UI uses `MediaController` exactly like `Player` — same API, but it's
+connected to the foreground service so playback continues in background.
+
+---
+
+## Notification (MediaStyle)
+
+Media3 auto-builds a `MediaStyle` notification from the `MediaSession`.
+Customize via:
+
+```kotlin
+class MediaNotificationProvider @Inject constructor(
+    @ApplicationContext context: Context
+) : DefaultMediaNotificationProvider(context) {
+
+    override fun getChannelId() = "playback"
+
+    // Custom actions
+    override fun getMediaButtons(
+        session: MediaSession,
+        playerCommands: Commands,
+        customLayout: ImmutableList<CommandButton>,
+        showPauseButton: Boolean
+    ): ImmutableList<CommandButton> = super.getMediaButtons(...)
+}
+
+override fun onCreate() {
+    super.onCreate()
+    setMediaNotificationProvider(MediaNotificationProvider(this))
+}
+```
+
+Lockscreen shows a play/pause + previous/next + progress bar without any
+manual notification building.
+
+---
+
+## Android Auto / Wear OS / Chromecast
+
+A `MediaSessionService` with `MediaBrowserServiceCompat` entry automatically
+exposes your app to:
+
+- **Android Auto** / **Automotive OS** — car head units browse your content
+- **Wear OS Media Player** — watch users control playback
+- **Google Assistant** — "Hey Google, play my podcast"
+
+```kotlin
+<service android:name=".PlaybackService" android:exported="true">
+    <intent-filter>
+        <action android:name="androidx.media3.session.MediaSessionService"/>
+        <action android:name="android.media.browse.MediaBrowserService"/>
+    </intent-filter>
+</service>
+
+<meta-data
+    android:name="com.google.android.gms.car.application"
+    android:resource="@xml/automotive_app_desc"/>
+```
+
+```xml
+<!-- res/xml/automotive_app_desc.xml -->
+<automotiveApp>
+    <uses name="media"/>
+</automotiveApp>
+```
+
+---
+
+## Chromecast
+
+```kotlin
+// libs.versions.toml
+media3-cast = { module = "androidx.media3:media3-cast", version.ref = "media3" }
+```
+
+```kotlin
+@Composable
+fun CastButton(modifier: Modifier = Modifier) {
+    AndroidView(
+        factory = { ctx ->
+            MediaRouteButton(ctx).apply {
+                CastButtonFactory.setUpMediaRouteButton(ctx, this)
+            }
+        },
+        modifier = modifier
+    )
+}
+```
+
+Users cast from your app; playback continues on the TV even with the
+phone locked.
+
+---
+
+## Download for offline
+
+```kotlin
+class OfflineMediaDownloader @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val downloadManager: DownloadManager
+) {
+    fun downloadVideo(uri: Uri, mediaItem: MediaItem) {
+        val request = DownloadRequest.Builder(mediaItem.mediaId, uri)
+            .setMimeType(MimeTypes.APPLICATION_M3U8)
+            .setCustomCacheKey(mediaItem.mediaId)
+            .build()
+
+        DownloadService.sendAddDownload(context, DownloadServiceImpl::class.java, request, false)
+    }
+
+    fun progressFlow(): Flow<Download> = callbackFlow {
+        val listener = object : DownloadManager.Listener {
+            override fun onDownloadChanged(mgr: DownloadManager, download: Download, error: Exception?) {
+                trySend(download)
+            }
+        }
+        downloadManager.addListener(listener)
+        awaitClose { downloadManager.removeListener(listener) }
+    }
+}
+```
+
+Downloads continue in a background `DownloadService`; survive process death.
+
+---
+
+## Performance — bitrate adaptation
+
+```kotlin
+val trackSelector = DefaultTrackSelector(context).apply {
+    setParameters(buildUponParameters()
+        .setMaxVideoBitrate(2_000_000)         // 2 Mbps cap
+        .setMinVideoBitrate(300_000)            // 300 Kbps floor
+        .setForceHighestSupportedBitrate(false)  // adaptive
+    )
+}
+```
+
+Monitor adapted bitrate for analytics:
+
+```kotlin
+player.addAnalyticsListener(object : AnalyticsListener {
+    override fun onVideoSizeChanged(event: EventTime, videoSize: VideoSize) {
+        Log.d("Video", "Adapted to ${videoSize.width}x${videoSize.height}")
+    }
+    override fun onBandwidthEstimate(event: EventTime, bitrate: Int, totalBytes: Long, totalMs: Long) {
+        // Log bandwidth for analytics
+    }
+})
+```
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Media mistakes',
+    variant: 'old',
+    points: [
+      'Not calling player.release() (memory leak)',
+      'MediaPlayer for new code',
+      'Hardcoded bitrates (ignoring connection type)',
+      'No foreground service for background audio',
+      'Mixing multiple ExoPlayers in one screen',
+      'Not declaring foregroundServiceType = mediaPlayback'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production media',
+    variant: 'new',
+    points: [
+      'onDispose { player.release() } in every Composable',
+      'Media3 ExoPlayer for all new code',
+      'Adaptive track selection with network-aware caps',
+      'MediaSessionService for background audio',
+      'One ExoPlayer per active screen; share via session',
+      'FOREGROUND_SERVICE_MEDIA_PLAYBACK permission + type'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Media3 rules">
+- **Media3 ExoPlayer** for all video / audio playback; MediaPlayer is legacy.
+- **Adaptive streaming** (HLS / DASH) with network-aware track selection.
+- **MediaSessionService + foreground service + mediaPlayback type** for background audio.
+- **`player.release()`** in every lifecycle teardown — prevents codec / surface leaks.
+- **DRM via MediaItem.DrmConfiguration** — Widevine license URI + headers.
+- **Chromecast + Android Auto + Wear OS** via the same `MediaBrowserServiceCompat` entry.
+- **DownloadManager** for offline; survives process death.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Video player composable', description: 'Build a VideoPlayer composable with lifecycle-aware pause/play and proper release on dispose.' },
+  { title: 'HLS adaptive', description: 'Play an HLS stream with network-aware bitrate caps (720p on mobile data, full on Wi-Fi). Log adapted bitrate.' },
+  { title: 'MediaSessionService', description: 'Build a podcast-style player with lockscreen controls. Verify Android Auto browses your content.' },
+  { title: 'Offline download', description: 'Add a \"Download\" button that queues a media item. Show download progress via DownloadManager.Listener Flow.' },
+  { title: 'Chromecast', description: 'Add a cast button to your video screen. Cast to a Chromecast device; verify playback continues on TV.' }
+]} />
+
+## Next
+
+Continue to **[Battery & Power Optimization](./battery-power)** for the
+resource efficiency playbook.

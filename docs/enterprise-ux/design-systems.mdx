@@ -1,0 +1,649 @@
+---
+id: design-systems
+title: Design Systems at Scale
+sidebar_label: Design Systems
+description: Token-based design systems, Figma ↔ Kotlin sync, component galleries, multi-brand theming, and governance for teams of 20+.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Design Systems at Scale
+
+Every design system starts as "put the colors in `Color.kt`." A year
+later it's 800 composables, three brands, accessibility audits, and a
+design team asking why their Figma file and the app look different.
+This chapter covers how mature teams run design systems — tokens,
+Figma-to-code sync, component galleries, visual regression, and
+governance.
+
+## The token pyramid (recap)
+
+```text
+       ┌───────────────────────────┐
+       │  Component tokens          │   Button.Primary.Background
+       │  (semantic + component)    │   TextField.Error.BorderColor
+       └───────────┬────────────────┘
+                   │ references
+                   ▼
+       ┌───────────────────────────┐
+       │  Semantic tokens           │   color.surface
+       │  (meaning)                 │   color.onSurface
+       └───────────┬────────────────┘   spacing.inline.sm
+                   │ references
+                   ▼
+       ┌───────────────────────────┐
+       │  Primitive tokens          │   green.500 = #3DDC84
+       │  (raw values)              │   space.04 = 8.dp
+       └───────────────────────────┘
+```
+
+Code references only semantic / component tokens. Primitive tokens live
+with design tooling.
+
+---
+
+## Figma Tokens (Tokens Studio)
+
+[Tokens Studio](https://tokens.studio/) is the Figma plugin that manages
+token JSON. Designers edit tokens in Figma; JSON is exported and
+synced to code.
+
+### Example `tokens.json`
+
+```json
+{
+  "global": {
+    "color": {
+      "gray": {
+        "50":  { "value": "#FAFAFA", "type": "color" },
+        "100": { "value": "#F4F4F5", "type": "color" },
+        "900": { "value": "#18181B", "type": "color" }
+      },
+      "green": {
+        "400": { "value": "#34D399", "type": "color" },
+        "500": { "value": "#10B981", "type": "color" }
+      }
+    },
+    "space": {
+      "xs": { "value": "4", "type": "spacing" },
+      "sm": { "value": "8", "type": "spacing" },
+      "md": { "value": "16", "type": "spacing" },
+      "lg": { "value": "24", "type": "spacing" }
+    }
+  },
+  "light": {
+    "color": {
+      "surface":   { "value": "{color.gray.50}", "type": "color" },
+      "onSurface": { "value": "{color.gray.900}", "type": "color" },
+      "accent":    { "value": "{color.green.500}", "type": "color" }
+    }
+  },
+  "dark": {
+    "color": {
+      "surface":   { "value": "{color.gray.900}", "type": "color" },
+      "onSurface": { "value": "{color.gray.50}", "type": "color" },
+      "accent":    { "value": "{color.green.400}", "type": "color" }
+    }
+  }
+}
+```
+
+---
+
+## Tokens → Kotlin codegen
+
+Write a small build plugin or Gradle task that reads `tokens.json` and
+generates Kotlin files:
+
+```kotlin
+// build-logic/convention/src/main/kotlin/TokensGenTask.kt
+abstract class TokensGenTask : DefaultTask() {
+    @get:InputFile abstract val tokensFile: RegularFileProperty
+    @get:OutputDirectory abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun generate() {
+        val json = Json.parseToJsonElement(tokensFile.get().asFile.readText()).jsonObject
+        val generated = buildString {
+            appendLine("// Generated — do not edit")
+            appendLine("package com.myapp.design.tokens")
+            appendLine("import androidx.compose.ui.graphics.Color")
+            appendLine("import androidx.compose.ui.unit.dp")
+
+            appendLine("object Palette {")
+            json["global"]?.jsonObject?.get("color")?.jsonObject?.forEach { (family, values) ->
+                values.jsonObject.forEach { (shade, token) ->
+                    val hex = token.jsonObject["value"]?.jsonPrimitive?.content?.removePrefix("#") ?: return@forEach
+                    appendLine("    val ${family}$shade = Color(0xFF$hex)")
+                }
+            }
+            appendLine("}")
+
+            appendLine("object Spacing {")
+            json["global"]?.jsonObject?.get("space")?.jsonObject?.forEach { (name, token) ->
+                val dp = token.jsonObject["value"]?.jsonPrimitive?.content ?: return@forEach
+                appendLine("    val $name = ${dp}.dp")
+            }
+            appendLine("}")
+        }
+
+        outputDir.file("Palette.kt").get().asFile.writeText(generated)
+    }
+}
+```
+
+Register in the design module:
+
+```kotlin
+// core/design/build.gradle.kts
+val generateTokens = tasks.register<TokensGenTask>("generateTokens") {
+    tokensFile.set(layout.projectDirectory.file("tokens.json"))
+    outputDir.set(layout.buildDirectory.dir("generated/tokens"))
+}
+
+sourceSets["main"].kotlin.srcDir(generateTokens.map { it.outputDir })
+```
+
+Now `tokens.json` is the source of truth. Any change to Figma Tokens
+pushes a JSON update, regenerates `Palette.kt`, and the whole app uses
+new values on next build.
+
+---
+
+## Semantic theming
+
+```kotlin
+@Immutable
+data class SemanticColors(
+    val surface: Color,
+    val onSurface: Color,
+    val surfaceVariant: Color,
+    val accent: Color,
+    val onAccent: Color,
+    val success: Color,
+    val onSuccess: Color,
+    val warning: Color,
+    val onWarning: Color,
+    val danger: Color,
+    val onDanger: Color
+)
+
+val LightSemantic = SemanticColors(
+    surface = Palette.gray50,
+    onSurface = Palette.gray900,
+    surfaceVariant = Palette.gray100,
+    accent = Palette.green500,
+    onAccent = Color.White,
+    success = Palette.green500,
+    onSuccess = Color.White,
+    warning = Palette.amber500,
+    onWarning = Palette.amber900,
+    danger = Palette.red500,
+    onDanger = Color.White
+)
+
+val DarkSemantic = SemanticColors(
+    surface = Palette.gray900,
+    onSurface = Palette.gray50,
+    // ... dark variants
+)
+
+val LocalSemantic = staticCompositionLocalOf<SemanticColors> {
+    error("No SemanticColors provided. Wrap in AppTheme.")
+}
+
+@Composable
+fun AppTheme(
+    darkTheme: Boolean = isSystemInDarkTheme(),
+    content: @Composable () -> Unit
+) {
+    val semantic = if (darkTheme) DarkSemantic else LightSemantic
+    CompositionLocalProvider(LocalSemantic provides semantic) {
+        MaterialTheme(
+            colorScheme = semantic.toMaterialColorScheme(),
+            typography = AppTypography,
+            shapes = AppShapes,
+            content = content
+        )
+    }
+}
+
+val MaterialTheme.semantic: SemanticColors
+    @Composable
+    @ReadOnlyComposable
+    get() = LocalSemantic.current
+```
+
+Components use `MaterialTheme.semantic.*` — isolated from Material 3
+color roles if you want custom names.
+
+---
+
+## Component patterns
+
+### Stateless + stateful pairing
+
+Every component ships in two forms:
+
+```kotlin
+// Stateless — works anywhere, perfectly testable
+@Composable
+fun PasswordField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    visible: Boolean,
+    onVisibilityToggle: () -> Unit,
+    modifier: Modifier = Modifier,
+    label: String = "Password",
+    error: String? = null
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label) },
+        isError = error != null,
+        supportingText = error?.let { { Text(it) } },
+        visualTransformation = if (visible) VisualTransformation.None else PasswordVisualTransformation(),
+        trailingIcon = {
+            IconButton(onClick = onVisibilityToggle) {
+                Icon(
+                    if (visible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                    contentDescription = if (visible) "Hide password" else "Show password"
+                )
+            }
+        },
+        modifier = modifier
+    )
+}
+
+// Stateful — convenient default
+@Composable
+fun PasswordField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    label: String = "Password",
+    error: String? = null
+) {
+    var visible by rememberSaveable { mutableStateOf(false) }
+    PasswordField(value, onValueChange, visible, { visible = !visible }, modifier, label, error)
+}
+```
+
+### Slot APIs
+
+```kotlin
+@Composable
+fun AppCard(
+    modifier: Modifier = Modifier,
+    shape: Shape = MaterialTheme.shapes.medium,
+    colors: CardColors = CardDefaults.cardColors(),
+    leading: (@Composable () -> Unit)? = null,
+    trailing: (@Composable () -> Unit)? = null,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Card(modifier = modifier, shape = shape, colors = colors) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(16.dp)) {
+            leading?.invoke()
+            if (leading != null) Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f), content = content)
+            if (trailing != null) Spacer(Modifier.width(12.dp))
+            trailing?.invoke()
+        }
+    }
+}
+
+// Caller decides content
+AppCard(
+    leading = { Icon(Icons.Default.Person, null) },
+    trailing = { TextButton(onClick = ::edit) { Text("Edit") } }
+) {
+    Text("Aarav", style = MaterialTheme.typography.titleMedium)
+    Text("Premium member", style = MaterialTheme.typography.bodySmall)
+}
+```
+
+See [Component Patterns](/docs/patterns/component-patterns) for the
+full slot API playbook.
+
+---
+
+## The component gallery (Showkase / Appyx / custom)
+
+Every component gets a Preview that doubles as documentation. Use
+**Showkase** to generate a runtime gallery screen:
+
+```kotlin
+// libs.versions.toml
+showkase = "1.0.3"
+
+showkase = { module = "com.airbnb.android:showkase", version.ref = "showkase" }
+showkase-processor = { module = "com.airbnb.android:showkase-processor", version.ref = "showkase" }
+```
+
+```kotlin
+@ShowkaseComposable(name = "Primary Button", group = "Buttons")
+@Preview
+@Composable
+fun PrimaryButtonPreview() {
+    AppTheme {
+        Button(onClick = {}) { Text("Confirm") }
+    }
+}
+
+// In :app
+@ShowkaseRoot
+class AppShowkaseRoot : ShowkaseRootModule
+```
+
+Showkase generates `ShowkaseBrowserActivity` — a browseable gallery of
+every component, state, and preview. Ship with internal builds so PMs
+and designers can browse without running individual screens.
+
+### Multi-preview annotations
+
+```kotlin
+@Preview(name = "Light", showBackground = true)
+@Preview(name = "Dark", showBackground = true, uiMode = Configuration.UI_MODE_NIGHT_YES)
+@Preview(name = "Large font", fontScale = 2f)
+@Preview(name = "RTL", locale = "ar")
+@Preview(name = "Tablet", device = "spec:width=1280dp,height=800dp")
+annotation class ThemePreviews
+
+@ThemePreviews
+@Composable
+fun PrimaryButtonPreview() {
+    AppTheme { Button(onClick = {}) { Text("Confirm") } }
+}
+```
+
+One annotation → 5 preview variants. Design-system components should all
+use `@ThemePreviews`.
+
+---
+
+## Visual regression testing
+
+### Paparazzi — deterministic snapshots
+
+```kotlin
+class PrimaryButtonSnapshotTest {
+    @get:Rule val paparazzi = Paparazzi(
+        deviceConfig = DeviceConfig.PIXEL_6,
+        theme = "android:Theme.Material.Light.NoActionBar"
+    )
+
+    @Test fun primary_button() {
+        paparazzi.snapshot {
+            AppTheme { Button(onClick = {}) { Text("Confirm") } }
+        }
+    }
+
+    @Test fun primary_button_dark() {
+        paparazzi.snapshot {
+            AppTheme(darkTheme = true) { Button(onClick = {}) { Text("Confirm") } }
+        }
+    }
+
+    @Test fun primary_button_large_font() {
+        paparazzi.snapshot(deviceConfig = DeviceConfig.PIXEL_6.copy(fontScale = 2f)) {
+            AppTheme { Button(onClick = {}) { Text("Confirm") } }
+        }
+    }
+}
+```
+
+Commit baseline PNGs. Any PR changing a component produces a visual diff
+— design-system PRs become visual code review.
+
+### Compose Preview Screenshot Testing (Android Studio Jellyfish+)
+
+Auto-generates snapshot tests from every `@Preview` function:
+
+```kotlin
+// build.gradle.kts
+plugins {
+    id("com.android.compose.screenshot") version "0.0.1-alpha08"
+}
+
+android {
+    experimentalProperties["android.experimental.enableScreenshotTest"] = true
+}
+```
+
+```bash
+./gradlew validateScreenshotTest
+# or
+./gradlew updateScreenshotTest
+```
+
+Every `@Preview` in the codebase is a visual test. No extra code needed.
+
+---
+
+## Accessibility as a design-system concern
+
+A design system's job isn't just "look nice" — it's "accessibility by
+default." Every component ships with:
+
+- **Correct content descriptions** on decorative elements
+- **WCAG AA contrast** (4.5:1 text, 3:1 graphics) audited
+- **Minimum 48dp touch targets**
+- **Semantic roles** (`Role.Button`, `Role.Checkbox`, etc.)
+- **Live regions** for dynamic content
+
+```kotlin
+@Composable
+fun StatusBadge(text: String, kind: StatusKind, modifier: Modifier = Modifier) {
+    val (bg, fg) = kind.colors()
+    Surface(
+        color = bg,
+        shape = MaterialTheme.shapes.small,
+        modifier = modifier.semantics {
+            role = Role.Image                 // not interactive
+            contentDescription = "$text, ${kind.severityLabel}"
+        }
+    ) {
+        Text(
+            text = text,
+            color = fg,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+        )
+    }
+}
+```
+
+### Automated audit
+
+```kotlin
+@Test fun a11y_audit() {
+    compose.setContent { AppTheme { PrimaryButton(text = "Confirm", onClick = {}) } }
+    compose.onRoot().performAccessibilityAudit()   // Google A11y Test Framework
+}
+```
+
+See [Module 19: Accessibility](./accessibility) for the full a11y
+playbook.
+
+---
+
+## Multi-brand theming
+
+For white-label apps or regional variants:
+
+```kotlin
+enum class Brand {
+    Default, Premium, Enterprise, WhiteLabelA
+}
+
+@Composable
+fun BrandedTheme(
+    brand: Brand,
+    darkTheme: Boolean = isSystemInDarkTheme(),
+    content: @Composable () -> Unit
+) {
+    val semantic = when (brand) {
+        Brand.Default -> if (darkTheme) DefaultDarkSemantic else DefaultLightSemantic
+        Brand.Premium -> if (darkTheme) PremiumDarkSemantic else PremiumLightSemantic
+        Brand.Enterprise -> if (darkTheme) EnterpriseDarkSemantic else EnterpriseLightSemantic
+        Brand.WhiteLabelA -> if (darkTheme) WhiteLabelADarkSemantic else WhiteLabelALightSemantic
+    }
+    val typography = when (brand) {
+        Brand.Default, Brand.Premium -> AppTypography
+        Brand.Enterprise -> EnterpriseTypography      // more formal
+        Brand.WhiteLabelA -> WhiteLabelATypography
+    }
+
+    CompositionLocalProvider(LocalSemantic provides semantic) {
+        MaterialTheme(
+            colorScheme = semantic.toMaterialColorScheme(),
+            typography = typography,
+            shapes = AppShapes,
+            content = content
+        )
+    }
+}
+```
+
+Combined with flavor-based resource overrides, you ship three branded
+apps from one codebase.
+
+---
+
+## Governance
+
+### Contribution rules
+
+- **Every new component** needs a Preview + snapshot test
+- **Every new color / typography token** goes through the token JSON, not ad-hoc
+- **Component changes** require a DS team review (CODEOWNERS for `core/design/`)
+- **Breaking changes** (renaming a component, deprecating a token) need a deprecation window
+
+### Deprecation
+
+```kotlin
+@Deprecated(
+    message = "Use MaterialTheme.semantic.accent instead",
+    replaceWith = ReplaceWith("MaterialTheme.semantic.accent")
+)
+val LegacyAccentColor = Color(0xFF10B981)
+```
+
+```kotlin
+// build.gradle.kts
+tasks.withType<KotlinCompile> {
+    kotlinOptions {
+        allWarningsAsErrors = true
+        freeCompilerArgs += "-Xopt-in=kotlin.RequiresOptIn"
+    }
+}
+```
+
+Deprecation → warning → error over 2-3 releases. Teams get time to
+migrate.
+
+### Versioning the design system
+
+For very large orgs:
+
+```text
+my-app/
+├── design-system/                        published as :
+│   ├── v1/
+│   └── v2/
+└── feature/checkout/                     consumes :design-system:v2
+```
+
+Apps opt into a specific version. Major releases (color rename, typography
+overhaul) don't force every feature to migrate simultaneously.
+
+---
+
+## Design-engineering handoff
+
+### What designers deliver
+
+- Figma file with components + tokens
+- `tokens.json` exported via Tokens Studio
+- Accessibility notes (contrast, keyboard, screen reader)
+- Motion specs (duration, easing)
+
+### What engineers deliver
+
+- Component + Preview + snapshot test
+- CHANGELOG entry per change
+- Automated RTL + dark mode + 2x-font snapshots
+- Accessibility audit screenshot
+
+### Feedback loop
+
+```text
+Figma update → tokens.json → PR → codegen → visual regression test →
+design review of snapshot diff → merge
+```
+
+Design gets a visual preview of their own tokens rendered in production
+code. No "it looks different than the design" bug reports.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Design-system smells',
+    variant: 'old',
+    points: [
+      'Hardcoded hex colors in screens',
+      'No semantic layer (screens reference primitives directly)',
+      'Duplicate components (AppButton, MyButton, SubmitButton)',
+      'Design-system breaking changes without deprecation',
+      'Components that don\'t accept Modifier',
+      'A11y added as an afterthought'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Mature design systems',
+    variant: 'new',
+    points: [
+      'Tokens-only references in screens',
+      'Three-layer token pyramid (primitive, semantic, component)',
+      'One canonical component per concept',
+      '@Deprecated with replacement; multi-release window',
+      'Modifier is the first optional parameter',
+      'A11y tests per component; contrast audited'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Design system rules">
+- **Token pyramid**: primitive → semantic → component. Screens reference the top two layers only.
+- **Figma Tokens + JSON + codegen** keeps design and code in sync.
+- **Stateless + stateful pairs** + **slot APIs** for flexibility.
+- **Multi-preview annotations + Paparazzi** for visual regression on every PR.
+- **Showkase gallery** so designers and PMs can browse live components.
+- **Accessibility-first**: every component ships with contentDescription, role, WCAG AA contrast.
+- **Multi-brand theming** via swap-able SemanticColors.
+- **Governance** — CODEOWNERS, deprecation windows, changelog.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Build a token pipeline', description: 'Export tokens from Figma Tokens Studio. Write a TokensGenTask that converts JSON → Kotlin Palette. Regenerate on every build.' },
+  { title: 'Add SemanticColors', description: 'Define a SemanticColors data class + LocalSemantic CompositionLocal. Refactor 3 screens to use MaterialTheme.semantic.* instead of primitives.' },
+  { title: 'ThemePreviews annotation', description: 'Create @ThemePreviews (Light + Dark + 2x font + RTL). Apply to every design-system component. Confirm Android Studio renders 4 previews per.' },
+  { title: 'Paparazzi snapshots', description: 'Add a snapshot test for your PrimaryButton in 4 theme variants. Commit baselines. Intentionally break the button; verify the diff.' },
+  { title: 'Multi-brand theme', description: 'Add a Brand enum with 2 variants. Provide different SemanticColors per brand. Show the same screen under both brands in previews.' }
+]} />
+
+## Next
+
+Continue to **[Accessibility Deep Dive](./accessibility)** for WCAG 2.2, TalkBack, and a11y testing.

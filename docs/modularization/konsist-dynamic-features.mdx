@@ -1,0 +1,600 @@
+---
+id: konsist-dynamic-features
+title: Konsist & Dynamic Features
+sidebar_label: Konsist & Dynamic Features
+description: Enforce architectural boundaries with Konsist; ship features on-demand with Play Feature Delivery; multi-app repos with shared modules.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Konsist & Dynamic Features
+
+Module boundaries enforced by convention are enforced by **nobody**. This
+chapter covers **Konsist** for compile-time architectural tests and
+**Play Feature Delivery** for shipping features on-demand to keep base
+APK small.
+
+## Konsist — the architectural test framework
+
+[Konsist](https://docs.konsist.lemonappdev.com/) lets you write unit tests
+that enforce code architecture:
+- Naming conventions
+- Module dependencies
+- Layer purity
+- Visibility rules
+
+### Setup
+
+```kotlin
+// libs.versions.toml
+konsist = "0.17.3"
+
+konsist = { module = "com.lemonappdev:konsist", version.ref = "konsist" }
+```
+
+```kotlin
+// :core:testing/build.gradle.kts
+dependencies {
+    testImplementation(libs.konsist)
+    testImplementation(libs.junit.jupiter.api)
+}
+```
+
+### First test — no Android in domain
+
+```kotlin
+class DomainPurityTest {
+
+    @Test
+    fun `domain module has no Android dependencies`() {
+        Konsist.scopeFromProject()
+            .files
+            .filter { it.moduleName.startsWith("core.domain") }
+            .assertFalse { file ->
+                file.imports.any { import ->
+                    import.name.startsWith("android.") ||
+                    import.name.startsWith("androidx.") ||
+                    import.name.startsWith("com.google.android") ||
+                    import.name.startsWith("retrofit2.") ||
+                    import.name.startsWith("okhttp3.")
+                }
+            }
+    }
+}
+```
+
+If any file in `:core:domain` imports Android or data-layer libraries,
+the test fails with the exact file + import.
+
+### Enforce feature isolation
+
+```kotlin
+class FeatureIsolationTest {
+
+    @Test
+    fun `features never depend on other features`() {
+        Konsist.scopeFromProject()
+            .files
+            .filter { it.moduleName.startsWith("feature.") }
+            .assertFalse { file ->
+                file.imports.any { import ->
+                    val source = file.moduleName
+                    val target = import.name.modulePath() ?: return@any false
+                    source != target &&
+                    source.startsWith("feature.") &&
+                    target.startsWith("feature.")
+                }
+            }
+    }
+}
+```
+
+Feature A importing Feature B fails CI. Teams can evolve features
+independently without hidden coupling.
+
+### Naming conventions
+
+```kotlin
+class NamingConventionTest {
+
+    @Test
+    fun `use cases end with UseCase`() {
+        Konsist.scopeFromProject()
+            .classes()
+            .filter { it.resideInPackage("..usecase..") }
+            .assertTrue { it.name.endsWith("UseCase") }
+    }
+
+    @Test
+    fun `ViewModels extend ViewModel`() {
+        Konsist.scopeFromProject()
+            .classes()
+            .filter { it.name.endsWith("ViewModel") }
+            .assertTrue { it.hasParentClass { parent -> parent.name == "ViewModel" } }
+    }
+
+    @Test
+    fun `Repositories end with Repository`() {
+        Konsist.scopeFromProject()
+            .interfaces()
+            .filter { it.resideInPackage("..domain..") && it.name.contains("Repo") }
+            .assertTrue { it.name.endsWith("Repository") }
+    }
+
+    @Test
+    fun `DTOs end with Dto and are in data layer`() {
+        Konsist.scopeFromProject()
+            .classes()
+            .filter { it.name.endsWith("Dto") }
+            .assertTrue {
+                it.resideInPackage("..data..") &&
+                it.hasAnnotationWithName("Serializable") ||
+                it.hasAnnotationWithName("JsonClass")
+            }
+    }
+}
+```
+
+### Enforcing Compose patterns
+
+```kotlin
+@Test
+fun `composables accept a Modifier parameter`() {
+    Konsist.scopeFromProject()
+        .functions()
+        .filter { it.hasAnnotationWithName("Composable") }
+        .filter { it.returnType?.text == "Unit" || it.returnType == null }
+        .filter { it.name.first().isUpperCase() }     // proper Composables, not helpers
+        .assertTrue { fn ->
+            fn.parameters.any { it.type.text == "Modifier" }
+        }
+}
+
+@Test
+fun `composables' Modifier parameter has default Modifier`() {
+    Konsist.scopeFromProject()
+        .functions()
+        .filter { it.hasAnnotationWithName("Composable") }
+        .filter { it.name.first().isUpperCase() }
+        .flatMap { it.parameters }
+        .filter { it.type.text == "Modifier" }
+        .assertTrue { it.defaultValue != null }
+}
+```
+
+### Enforcing layer direction
+
+```kotlin
+@Test
+fun `presentation doesn't depend on data`() {
+    Konsist.scopeFromProject()
+        .files
+        .filter { it.moduleName.startsWith("feature.") }
+        .assertFalse { file ->
+            file.imports.any { it.name.contains("com.myapp.data.") }
+        }
+}
+
+@Test
+fun `data doesn't depend on presentation`() {
+    Konsist.scopeFromProject()
+        .files
+        .filter { it.moduleName.startsWith("core.data.") }
+        .assertFalse { file ->
+            file.imports.any { it.name.contains("com.myapp.feature.") }
+        }
+}
+```
+
+### Running Konsist in CI
+
+```yaml
+# .github/workflows/pr.yml
+- name: Architecture tests
+  run: ./gradlew :core:testing:test --tests '*ArchitectureTest'
+```
+
+Treat architecture violations the same as test failures. One `@Test` per
+rule, one place to read the full list of rules.
+
+---
+
+## Dynamic Features — Play Feature Delivery
+
+Play Feature Delivery lets you ship features that download **on demand**.
+Advantages:
+- Smaller base APK (shrinks install size)
+- Pay-wall or premium features shipped separately
+- Region / device-specific modules
+
+Trade-off: more complexity (install flow, conditional UI, testing).
+
+### When to use dynamic features
+
+<ComparisonCard
+  left={{
+    label: 'Good candidates',
+    title: 'Use dynamic features',
+    variant: 'new',
+    points: [
+      'Large (>1 MB) optional features',
+      'Premium tier (gated by IAP)',
+      'Region-specific (conditional install)',
+      'AR / ML features with heavy libraries',
+      'Power-user tools used by minority',
+      'Instant apps (separate module)'
+    ]
+  }}
+  right={{
+    label: 'Bad candidates',
+    title: 'Skip dynamic',
+    variant: 'old',
+    points: [
+      'Core flows everyone uses',
+      'Small features (<200 KB)',
+      'Frequently accessed (download UX hurts)',
+      'Small team (< 3 engineers)',
+      'Apps distributed outside Play Store',
+      'When `conditional install-time` suffices'
+    ]
+  }}
+/>
+
+### Module setup
+
+```kotlin
+// feature/premium-analytics/build.gradle.kts
+plugins {
+    alias(libs.plugins.android.dynamic.feature)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.hilt)
+}
+
+android {
+    namespace = "com.myapp.premium.analytics"
+    compileSdk = 35
+    defaultConfig { minSdk = 24 }
+}
+
+dependencies {
+    implementation(project(":app"))              // dynamic features depend on :app
+    implementation(projects.core.ui)
+    implementation(projects.core.domain)
+}
+```
+
+```xml
+<!-- feature/premium-analytics/src/main/AndroidManifest.xml -->
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:dist="http://schemas.android.com/apk/distribution">
+
+    <dist:module
+        dist:instant="false"
+        dist:title="@string/title_premium_analytics">
+        <dist:delivery>
+            <dist:on-demand/>
+        </dist:delivery>
+        <dist:fusing dist:include="true"/>       <!-- include on pre-API 21 installs -->
+    </dist:module>
+</manifest>
+```
+
+### Delivery modes
+
+```xml
+<dist:delivery>
+    <dist:install-time/>                                        <!-- at install -->
+</dist:delivery>
+
+<dist:delivery>
+    <dist:on-demand/>                                            <!-- runtime request -->
+</dist:delivery>
+
+<dist:delivery>
+    <dist:install-time>
+        <dist:conditions>
+            <dist:min-sdk dist:value="28"/>
+            <dist:device-feature dist:name="android.hardware.camera.ar"/>
+            <dist:user-countries dist:include="true">
+                <dist:country dist:code="US"/>
+                <dist:country dist:code="CA"/>
+            </dist:user-countries>
+        </dist:conditions>
+    </dist:install-time>
+</dist:delivery>
+```
+
+Conditional install lets Play decide at install time: only ship the AR
+feature to devices with AR hardware, only ship CA-specific regulations
+module to Canadian users.
+
+### Requesting modules at runtime
+
+```kotlin
+// libs.versions.toml
+feature-delivery = { module = "com.google.android.play:feature-delivery-ktx", version = "2.1.0" }
+
+implementation(libs.feature.delivery)
+```
+
+```kotlin
+@Singleton
+class PremiumFeatureLoader @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    private val manager = SplitInstallManagerFactory.create(context)
+
+    val state: StateFlow<InstallState> = callbackFlow {
+        val listener = SplitInstallStateUpdatedListener { state ->
+            val installState = when (state.status()) {
+                SplitInstallSessionStatus.DOWNLOADING -> InstallState.Downloading(
+                    bytesDownloaded = state.bytesDownloaded(),
+                    total = state.totalBytesToDownload()
+                )
+                SplitInstallSessionStatus.INSTALLED -> InstallState.Installed
+                SplitInstallSessionStatus.FAILED -> InstallState.Failed(state.errorCode())
+                SplitInstallSessionStatus.REQUIRES_USER_CONFIRMATION -> InstallState.NeedsConfirmation(state)
+                else -> InstallState.InProgress
+            }
+            trySend(installState)
+        }
+        manager.registerListener(listener)
+        awaitClose { manager.unregisterListener(listener) }
+    }.stateIn(
+        scope = ProcessLifecycleOwner.get().lifecycleScope,
+        started = SharingStarted.Eagerly,
+        initialValue = if (manager.installedModules.contains("premium-analytics")) InstallState.Installed
+                       else InstallState.NotInstalled
+    )
+
+    suspend fun install(): Result<Unit> = suspendCancellableCoroutine { cont ->
+        if (manager.installedModules.contains("premium-analytics")) {
+            cont.resume(Result.success(Unit)) {}
+            return@suspendCancellableCoroutine
+        }
+
+        val request = SplitInstallRequest.newBuilder()
+            .addModule("premium-analytics")
+            .build()
+
+        manager.startInstall(request)
+            .addOnSuccessListener { cont.resume(Result.success(Unit)) {} }
+            .addOnFailureListener { cont.resume(Result.failure(it)) {} }
+    }
+
+    suspend fun uninstall(): Unit = manager.deferredUninstall(listOf("premium-analytics")).await()
+}
+
+sealed interface InstallState {
+    data object NotInstalled : InstallState
+    data object InProgress : InstallState
+    data class Downloading(val bytesDownloaded: Long, val total: Long) : InstallState
+    data object Installed : InstallState
+    data class NeedsConfirmation(val state: SplitInstallSessionState) : InstallState
+    data class Failed(val code: Int) : InstallState
+}
+```
+
+### UX for install flow
+
+```kotlin
+@Composable
+fun PremiumFeatureGate(content: @Composable () -> Unit) {
+    val loader = hiltViewModel<PremiumFeatureLoader>()
+    val state by loader.state.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
+
+    when (state) {
+        InstallState.Installed -> content()
+        InstallState.NotInstalled -> CtaScreen(onStart = { scope.launch { loader.install() } })
+        is InstallState.Downloading -> DownloadingScreen(state as InstallState.Downloading)
+        is InstallState.NeedsConfirmation -> {
+            // Show a dialog, then call manager.startConfirmationDialogForResult
+            ConfirmationDialog(state as InstallState.NeedsConfirmation)
+        }
+        is InstallState.Failed -> ErrorScreen(onRetry = { scope.launch { loader.install() } })
+        InstallState.InProgress -> LoadingIndicator()
+    }
+}
+```
+
+### Launching after install
+
+```kotlin
+fun openPremiumAnalytics(context: Context) {
+    val intent = Intent().setClassName(
+        context.packageName,
+        "com.myapp.premium.analytics.PremiumAnalyticsActivity"
+    )
+    context.startActivity(intent)
+}
+```
+
+Dynamic feature classes can't be reached with compile-time references
+(they're not on the base classpath). Use reflection or navigation by
+class name.
+
+For Compose screens in dynamic features, **reflection-based navigation**
+works:
+
+```kotlin
+@Composable
+fun DynamicFeatureNav(featureName: String) {
+    val context = LocalContext.current
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { /* ... */ }
+
+    LaunchedEffect(featureName) {
+        val intent = Intent().setClassName(context.packageName,
+            "com.myapp.$featureName.MainActivity")
+        launcher.launch(intent)
+    }
+}
+```
+
+Or use a **service-locator pattern** — dynamic feature registers a
+`PremiumFeatureEntry` at install time, base module invokes it via a
+ContentProvider or runtime registry.
+
+---
+
+## Instant apps via dynamic feature
+
+```xml
+<dist:module dist:instant="true">
+    <dist:delivery>
+        <dist:instant-delivery/>
+    </dist:delivery>
+</dist:module>
+```
+
+Size limit: 15 MB for the instant module's APK. Users tap "Try now" in
+Play Store → app launches instantly without full install.
+
+---
+
+## Dynamic feature + modularization structure
+
+```text
+my-app/
+├── app/                                  base module (minimal, links everything)
+├── core/
+│   ├── ui/         design/  domain/  data/  common/
+├── feature/                              install-time features
+│   ├── home/
+│   ├── profile/
+│   └── settings/
+├── dynamic-feature/                      on-demand features
+│   ├── premium-analytics/
+│   ├── ar-viewer/
+│   └── video-editor/
+└── build-logic/
+```
+
+### Testing dynamic features locally
+
+```bash
+# Build the universal APK (includes all modules)
+./gradlew :app:bundleDebug
+bundletool build-apks \
+    --bundle=app/build/outputs/bundle/debug/app-debug.aab \
+    --output=app.apks \
+    --local-testing        # simulates on-demand install via bundletool
+
+bundletool install-apks --apks=app.apks --modules=_ALL_
+```
+
+`--local-testing` + `--modules=_ALL_` simulates Play delivery locally.
+Without it, your request-module calls would fail because the feature
+isn't actually downloadable.
+
+---
+
+## Multi-app repos
+
+Some organizations ship multiple apps from one repo (free + premium
+tiers, white-label variants, B2B + B2C). Modularization makes this
+tractable:
+
+```text
+my-apps/
+├── app-free/                  → com.myapp.free
+├── app-premium/               → com.myapp.premium
+├── app-b2b/                   → com.myapp.enterprise
+├── core/                      shared business logic
+├── feature/                   shared screens
+└── build-logic/               shared build config
+```
+
+Each `:app-*` module:
+- Different `applicationId`
+- Different signing key
+- Different flavors enabled (free vs premium feature toggles)
+- Same core modules
+
+Build + publish:
+
+```bash
+./gradlew :app-free:bundleRelease
+./gradlew :app-premium:bundleRelease
+./gradlew :app-b2b:bundleRelease
+```
+
+Three separate app listings on Play Store, from one codebase.
+
+---
+
+## Migration playbook — monolith → modular
+
+<StepList steps={[
+  { title: 'Week 1: extract core:design', description: 'Move Theme.kt, colors, typography, and 3 reusable Composables into :core:design. Apply convention plugin.' },
+  { title: 'Week 2: extract core:common + core:domain', description: 'Move pure Kotlin models, sealed classes, and interface definitions. These modules should compile on JVM alone.' },
+  { title: 'Week 3: extract first feature', description: 'Pick a small, self-contained feature. Move its screen + VM + feature logic into :feature:X. Ensure the :app still builds.' },
+  { title: 'Week 4: extract core:data + core:network', description: 'Pull Retrofit, OkHttp, auth interceptors out of :app. Features depend on domain interfaces; impls live in :core:data.' },
+  { title: 'Week 5: add Konsist tests', description: 'Lock in the boundaries you just created. Add tests for: domain purity, feature isolation, naming conventions.' },
+  { title: 'Week 6: iterate', description: 'Every sprint, extract one more feature. Measure incremental build time after each extraction — your ROI dashboard.' }
+]} />
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Modularization mistakes',
+    variant: 'old',
+    points: [
+      'Modularizing before you have pain',
+      'A giant :common module everything depends on',
+      'Feature-to-feature imports',
+      'Dynamic features for everything (complexity tax)',
+      'No Konsist tests (boundaries drift)',
+      'Different Gradle config in every module'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Modern modularization',
+    variant: 'new',
+    points: [
+      'Extract when build time or boundaries hurt',
+      'Split :core by domain: design, data, domain, ui',
+      'Features route cross-feature traffic via domain',
+      'Dynamic features for large, optional features only',
+      'Konsist tests run on every PR',
+      'Convention plugins keep modules uniform'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Konsist & Dynamic Features rules">
+- **Konsist** enforces architectural boundaries at the JUnit level — catches violations in PR review.
+- **Name conventions + layer rules + module isolation** as Konsist tests.
+- **Dynamic features** for large, optional capabilities; **install-time conditional** for region / device-specific.
+- **On-demand + fusing** for backwards compatibility on pre-API 21.
+- **Reflection / service-locator** for invoking dynamic feature code from base module.
+- **bundletool --local-testing** simulates Play delivery locally.
+- **Multi-app repos** share core + feature modules; separate `:app-*` with different `applicationId`.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Write your first Konsist test', description: 'Add a `domain module has no Android dependencies` test to :core:testing. Run it; fix any violations.' },
+  { title: 'Feature isolation rule', description: 'Add a Konsist test asserting features never import other features. If any feature currently does, refactor to route through :core:domain.' },
+  { title: 'Dynamic feature module', description: 'Extract one optional feature into a :dynamic-feature:X module. Configure on-demand delivery. Test install via bundletool --local-testing.' },
+  { title: 'Conditional install', description: 'Add a <dist:install-time> block with a country condition. Verify the module delivers only to specified countries.' },
+  { title: 'Instant app slice', description: 'Extract a minimal, < 15MB core flow into an instant module. Test via Internal App Sharing \"Try now\".' }
+]} />
+
+## Next
+
+Return to **[Module 15 Overview](./overview)** or continue to
+**[Module 16 — Security & Compliance](/docs/security-compliance/overview)**.

@@ -1,0 +1,503 @@
+---
+id: benchmark-property-based
+title: Benchmark & Property-Based Testing
+sidebar_label: Benchmark & Property-Based
+description: Microbenchmark for CPU-bound code, Macrobenchmark for user-facing performance, JankStats for production, and property-based testing with Kotest.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Benchmark & Property-Based Testing
+
+Unit and instrumentation tests verify correctness. **Benchmarks** verify
+performance. **Property-based tests** explore input space to find bugs
+you wouldn't think to write. Both are specialist tools — but for the
+right problems, they save weeks of production firefighting.
+
+## Microbenchmark — per-function CPU
+
+Use Microbenchmark when you want to measure **a specific function**
+across scenarios (e.g., is parser A faster than parser B?).
+
+```kotlin
+// benchmark/build.gradle.kts
+plugins {
+    alias(libs.plugins.android.library)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.benchmark)
+}
+
+android {
+    defaultConfig {
+        testInstrumentationRunner = "androidx.benchmark.junit4.AndroidBenchmarkRunner"
+    }
+}
+
+dependencies {
+    androidTestImplementation("androidx.benchmark:benchmark-junit4:1.3.3")
+}
+```
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class JsonParserBenchmark {
+
+    @get:Rule val benchmarkRule = BenchmarkRule()
+
+    private val json = ClassLoader.getSystemResourceAsStream("product.json")!!
+        .bufferedReader().use { it.readText() }
+
+    @Test fun moshi() {
+        val adapter = Moshi.Builder().build().adapter(Product::class.java)
+        benchmarkRule.measureRepeated {
+            adapter.fromJson(json)
+        }
+    }
+
+    @Test fun kotlinx() {
+        benchmarkRule.measureRepeated {
+            Json.decodeFromString<Product>(json)
+        }
+    }
+}
+```
+
+Output:
+
+```
+JsonParserBenchmark.moshi    mean=85.2 ns  min=82 ns  stdev=1.8 ns
+JsonParserBenchmark.kotlinx  mean=61.8 ns  min=58 ns  stdev=2.1 ns
+```
+
+Microbenchmark disables measurement during debugging, throws if you run
+without CPU pinning (release build, isolated core) to keep results
+deterministic.
+
+### Hot vs cold phases
+
+```kotlin
+benchmarkRule.measureRepeated {
+    // WARMUP — implicit; Benchmark library auto-warms JIT
+    // MEASURED — this block is timed
+
+    runWithTimingDisabled {
+        // Setup that you don't want to measure
+        val state = prepare()
+    }
+
+    // Measured
+    heavyWork(state)
+}
+```
+
+`runWithTimingDisabled` pauses the clock for setup (fresh input, cache
+invalidation). Keeps the benchmark honest.
+
+---
+
+## Macrobenchmark — real user-facing performance
+
+Use Macrobenchmark for **end-to-end user flows** — cold start, scroll
+frame timing, input latency. See [Module 10: Baseline Profiles](/docs/performance/baseline-profiles)
+for the full startup chapter; this is the testing lens.
+
+```kotlin
+// benchmark/build.gradle.kts
+plugins {
+    alias(libs.plugins.android.test)
+    alias(libs.plugins.benchmark)
+}
+
+dependencies {
+    implementation("androidx.benchmark:benchmark-macro-junit4:1.3.3")
+    implementation("androidx.test.uiautomator:uiautomator:2.3.0")
+}
+```
+
+### Cold start
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class StartupBenchmark {
+
+    @get:Rule val rule = MacrobenchmarkRule()
+
+    @Test fun startupCompilationNone() = startup(CompilationMode.None())
+
+    @Test fun startupCompilationBaselineProfile() =
+        startup(CompilationMode.Partial(BaselineProfileMode.Require))
+
+    private fun startup(mode: CompilationMode) = rule.measureRepeated(
+        packageName = "com.myapp",
+        metrics = listOf(StartupTimingMetric(), FrameTimingMetric()),
+        compilationMode = mode,
+        startupMode = StartupMode.COLD,
+        iterations = 10,
+        setupBlock = { pressHome() },
+        measureBlock = {
+            startActivityAndWait()
+            device.wait(Until.hasObject(By.res("home_root")), 5_000)
+        }
+    )
+}
+```
+
+Results:
+
+```
+StartupBenchmark.startupCompilationNone
+  timeToInitialDisplayMs   P50=1,480  P90=1,620  P99=1,790
+
+StartupBenchmark.startupCompilationBaselineProfile
+  timeToInitialDisplayMs   P50=1,010  P90=1,120  P99=1,240
+```
+
+### Scroll jank
+
+```kotlin
+@Test fun feedScroll() = rule.measureRepeated(
+    packageName = "com.myapp",
+    metrics = listOf(FrameTimingMetric()),
+    compilationMode = CompilationMode.Partial(),
+    iterations = 10,
+    startupMode = StartupMode.WARM,
+    setupBlock = {
+        startActivityAndWait()
+        device.wait(Until.hasObject(By.res("feed")), 5_000)
+    }
+) {
+    val list = device.findObject(By.res("feed"))
+    list.setGestureMargin(device.displayWidth / 5)
+    repeat(5) {
+        list.fling(Direction.DOWN)
+        device.waitForIdle()
+    }
+}
+```
+
+`FrameTimingMetric` reports:
+- `frameDurationCpuMs` — P50/P90/P99 of CPU frame time
+- `frameOverrunMs` — how much each dropped frame overran its deadline
+
+Targets (for 60 Hz): P95 < 16.67 ms, P99 < 33.33 ms. For 90/120 Hz,
+tighter.
+
+### Input latency
+
+```kotlin
+@Test fun inputLatency() = rule.measureRepeated(
+    metrics = listOf(TraceSectionMetric("onClick-submit")),
+    iterations = 10
+) {
+    /* navigate to button, click, measure trace section */
+}
+```
+
+With a `Trace.beginSection("onClick-submit")` in production code, you can
+benchmark the latency of specific UI handlers.
+
+### Running on Firebase Test Lab
+
+```bash
+./gradlew :benchmark:connectedCheck
+```
+
+For true device coverage, upload the benchmark APKs to Firebase Test Lab
+across a device matrix.
+
+---
+
+## JankStats — measuring real users
+
+Benchmarks measure your dev phone. **JankStats** (AndroidX) measures
+**real users in production** so you know actual field performance:
+
+```kotlin
+// build.gradle
+implementation("androidx.metrics:metrics-performance:1.0.0-beta02")
+```
+
+```kotlin
+class JankReporterInitializer @Inject constructor(
+    private val crashReporter: CrashReporter
+) : Initializer<Unit> {
+
+    override fun create(context: Context) {
+        ProcessLifecycleOwner.get().lifecycleScope.launch {
+            ProcessLifecycleOwner.get().lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                val window = /* obtain a Window reference */
+                val jankStats = JankStats.createAndTrack(window, JankStats.OnFrameListener { frame ->
+                    if (frame.isJank) {
+                        crashReporter.log("jank: ${frame.frameDurationUiNanos / 1_000_000}ms on ${frame.states}")
+                    }
+                })
+            }
+        }
+    }
+
+    override fun dependencies() = emptyList<Class<out Initializer<*>>>()
+}
+```
+
+Combined with per-screen `PerformanceMetricsState`, you get real-world
+jank rates per screen:
+
+```kotlin
+val metricsHolder = remember(view) { PerformanceMetricsState.getHolderForHierarchy(view) }
+
+LaunchedEffect(metricsHolder) {
+    metricsHolder.state?.apply {
+        putState("screen", "home_feed")
+        putSingleFrameState("refresh", "user_initiated")
+    }
+}
+```
+
+Ship jank percentiles to your observability backend (Module 18).
+
+---
+
+## Property-based testing
+
+Example-based tests assert specific cases:
+
+```kotlin
+@Test fun `add commutes`() {
+    assertEquals(5, add(2, 3))
+    assertEquals(5, add(3, 2))
+}
+```
+
+Property-based tests assert **laws** — properties that should hold for
+**any** input:
+
+```kotlin
+// build.gradle
+testImplementation("io.kotest:kotest-property:5.9.1")
+
+test("addition commutes") {
+    checkAll(Arb.int(), Arb.int()) { a, b ->
+        add(a, b) shouldBe add(b, a)
+    }
+}
+```
+
+Kotest generates 1000 random pairs by default, testing:
+
+- Boundary values (0, 1, -1, Int.MAX_VALUE, Int.MIN_VALUE)
+- Shrinking — if a test fails, Kotest narrows down to the minimal failing input
+
+### When property-based pays off
+
+<ComparisonCard
+  left={{
+    label: 'Great for PBT',
+    title: 'Ideal problems',
+    variant: 'new',
+    points: [
+      'Parsers and serializers (round-trip property)',
+      'Data transformations (associativity, commutativity, idempotency)',
+      'State machines (invariant checks)',
+      'Collections (list reversed twice = original)',
+      'Math and statistics',
+      'Validators (parse + format + parse = original)'
+    ]
+  }}
+  right={{
+    label: 'Skip PBT',
+    title: 'Use examples',
+    variant: 'old',
+    points: [
+      'UI behavior (can\'t generate meaningful clicks)',
+      'Thin CRUD wrappers',
+      'One-off business rules with < 5 cases',
+      'External side effects (network, DB)',
+      'Tests where shrinking makes no sense (single enum value)',
+      'Simple value objects'
+    ]
+  }}
+/>
+
+### Round-trip property — always worth writing
+
+For any `encode`/`decode` pair, assert the round-trip:
+
+```kotlin
+test("JSON round-trip") {
+    checkAll(Arb.user()) { user ->
+        val json = Json.encodeToString(user)
+        val decoded = Json.decodeFromString<User>(json)
+        decoded shouldBe user
+    }
+}
+
+fun Arb.Companion.user(): Arb<User> = Arb.bind(
+    Arb.string(minSize = 1),                      // id
+    Arb.string(minSize = 1),                      // name
+    Arb.string(minSize = 5).filter { "@" in it }, // email
+    Arb.long(min = 0)                              // createdAt
+) { id, name, email, created -> User(id, name, email, created) }
+```
+
+One round-trip test often catches bugs that 20 example tests miss —
+Unicode edge cases, null handling, character encoding.
+
+### Stateful property-based
+
+For testing stateful systems (e.g., a cache), generate random sequences
+of commands:
+
+```kotlin
+test("cache respects LRU eviction") {
+    checkAll(Arb.list(Arb.cacheCommand(), 1..100)) { commands ->
+        val cache = LruCache<String, Int>(maxSize = 10)
+        val model = LinkedHashMap<String, Int>()
+
+        commands.forEach { cmd ->
+            when (cmd) {
+                is Put -> {
+                    cache[cmd.key] = cmd.value
+                    model[cmd.key] = cmd.value
+                    while (model.size > 10) model.remove(model.keys.first())
+                }
+                is Get -> cache[cmd.key] shouldBe model[cmd.key]
+            }
+        }
+    }
+}
+```
+
+The model tracks expected state; the cache is compared to it. Any
+divergence = a bug.
+
+---
+
+## Fuzz testing
+
+Kotest's property-based is a flavor of fuzzing. For deeper fuzzing (bytes
+of random input into a parser to find crashes), **Jazzer** or
+**AFL++** are industry tools — rare in Android apps outside of
+security-sensitive parsers.
+
+---
+
+## Combining benchmarks with CI
+
+```yaml
+# .github/workflows/performance.yml
+on:
+  schedule: [{cron: '0 3 * * *'}]          # nightly
+  workflow_dispatch:                        # manual
+
+jobs:
+  macrobenchmark:
+    runs-on: macos-14-large
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          script: ./gradlew :benchmark:connectedBenchmarkAndroidTest
+
+      - name: Compare with baseline
+        run: |
+          python compare_benchmarks.py \
+            --baseline benchmarks/baseline.json \
+            --current benchmarks/result.json \
+            --threshold 10    # fail if 10% regression
+```
+
+Catching a regression in CI is cheaper than discovering it from a user
+report. Set realistic thresholds and update the baseline on approved
+changes.
+
+---
+
+## Chaos testing (advanced)
+
+For apps with real-time data (chat, games), introduce random network
+chaos into integration tests:
+
+```kotlin
+class ChaoticInterceptor(private val random: Random = Random.Default) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val roll = random.nextFloat()
+        return when {
+            roll < 0.05f -> throw IOException("simulated network failure")
+            roll < 0.10f -> {
+                Thread.sleep(5_000)
+                chain.proceed(chain.request())
+            }
+            else -> chain.proceed(chain.request())
+        }
+    }
+}
+```
+
+Run UI tests with the chaotic interceptor in the graph. Your app should
+degrade gracefully under simulated failure.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Benchmark / PBT mistakes',
+    variant: 'old',
+    points: [
+      'Benchmarking in debug builds (throws / garbage numbers)',
+      'Measuring with stack traces enabled',
+      'Property-based tests on UI behavior',
+      'Round-trip without a fixed-seed for reproducibility',
+      'Ignoring benchmark regressions ("probably noise")',
+      'Macrobenchmark on emulator only'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production-grade',
+    variant: 'new',
+    points: [
+      'Release builds, isolated CPU core',
+      'CompilationMode.Partial for realistic prod conditions',
+      'PBT for parsers, transformations, state machines',
+      'Checkpoint seeds for shrinking reproducibility',
+      'Baseline + threshold in CI; alert on regression',
+      'Firebase Test Lab device matrix in nightly'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Benchmark & PBT rules">
+- **Microbenchmark** measures function-level CPU; use for algorithm comparison.
+- **Macrobenchmark** measures user-flow performance (cold start, scroll, input).
+- **JankStats** ships real-user jank rates to your observability backend.
+- **Property-based testing** (Kotest) for parsers, mappers, state machines, round-trips.
+- **Round-trip property** is the single most valuable PBT pattern.
+- **Nightly CI benchmark** with thresholds prevents silent regressions.
+- **Chaos testing** for real-time apps — test under network chaos.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Microbenchmark two parsers', description: 'Compare Moshi vs kotlinx.serialization for your product model. Measure with BenchmarkRule.' },
+  { title: 'Cold-start benchmark', description: 'Write a Macrobenchmark that measures cold start in CompilationMode.None vs CompilationMode.Partial(BaselineProfileMode.Require). Report the delta.' },
+  { title: 'Round-trip PBT', description: 'For one domain type (User, Cart, Message), write a round-trip property asserting decode(encode(x)) == x across 1000 random inputs.' },
+  { title: 'JankStats in prod', description: 'Add JankStats tracking to one screen. Ship a custom key `screen=home_feed`. Verify jank rates appear in your observability backend.' },
+  { title: 'Chaotic interceptor', description: 'Add a ChaoticInterceptor in debug builds. Run your UI tests with it; fix any flows that crash or hang under simulated failure.' }
+]} />
+
+## Next
+
+Return to **[Module 09 Overview](./overview)** or continue to
+**[Module 10 — Performance Optimization](/docs/performance/overview)**.

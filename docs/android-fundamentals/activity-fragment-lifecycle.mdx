@@ -1,0 +1,510 @@
+---
+id: activity-fragment-lifecycle
+title: Activity & Fragment Lifecycle
+sidebar_label: Lifecycle Deep Dive
+description: Activity and Fragment lifecycle states, configuration changes, SavedStateHandle, ComponentActivity, back navigation, and single-activity architecture.
+---
+
+import { Callout, StepList, ComparisonCard, Diagram, ActivityLifecycleDiagram } from '@site/src/components/Doc';
+
+# Activity & Fragment Lifecycle
+
+Lifecycle is the oldest source of Android bugs. Every data load, every
+resource allocation, every callback registration must be paired with the
+right hook — or you leak, crash, or lose state. This chapter covers the
+full lifecycle, config changes, SavedState, and the modern single-
+activity architecture that minimizes lifecycle pain.
+
+## Activity lifecycle
+
+<Diagram title="Activity lifecycle" caption="Each state has matching callbacks — setup in the forward call, cleanup in the reverse.">
+  <ActivityLifecycleDiagram />
+</Diagram>
+
+```text
+    [Launched]
+        │
+    onCreate()            — inflate UI, init dependencies
+        │
+    onStart()             — Activity visible (may not be in foreground)
+        │
+    onResume()            — Activity has focus, user interacting
+        │
+    ⇅ (user interacts)
+        │
+    onPause()             — losing focus (dialog, other activity in front)
+        │
+    onStop()              — no longer visible
+        │
+    onDestroy()           — Activity being destroyed (finish, config change, OS kill)
+```
+
+### What each callback actually means
+
+| Callback     | State           | Do this                                              |
+|--------------|-----------------|------------------------------------------------------|
+| `onCreate`   | Created         | Inflate UI, restore state, set up non-visible deps  |
+| `onStart`    | Started         | Register listeners that only matter when visible    |
+| `onResume`   | Resumed         | Start animations, camera preview, sensor listeners  |
+| `onPause`    | Paused          | Pause animations, release exclusive resources       |
+| `onStop`     | Stopped         | Unregister visible listeners, persist state if risky|
+| `onDestroy`  | Destroyed       | Final cleanup; don't persist (use onStop)           |
+
+### The guarantees
+
+- **`onCreate` runs exactly once** per Activity instance.
+- **`onPause` is guaranteed** if the Activity was in the foreground — use
+  it to save critical state.
+- **`onStop` may not run** if the OS kills the app abruptly (low memory).
+- **`onDestroy` may not run** — never rely on it for important cleanup.
+
+---
+
+## Configuration changes
+
+By default, changes like rotation, locale switch, dark-mode toggle, or
+window size changes **recreate the Activity** — `onDestroy` → new
+`onCreate` with `savedInstanceState`.
+
+### Why? A new Activity gets new resources (rotated layout, new locale)
+without you managing that manually. Expensive in 2010; trivial in 2025.
+
+### Handling it three ways
+
+1. **Default: let Android recreate** — save state in `SavedStateHandle` /
+   `rememberSaveable` / `onSaveInstanceState`. This is what 99% of apps
+   should do.
+
+2. **Opt out with `configChanges`** — rare, tight control:
+   ```xml
+   <activity
+       android:name=".GameActivity"
+       android:configChanges="orientation|screenSize|keyboardHidden"/>
+   ```
+   Now `onConfigurationChanged` fires instead of recreation. Use only for
+   fullscreen games / AR where recreation ruins the experience.
+
+3. **Let ViewModels bridge** — ViewModels survive recreation; they're the
+   correct home for anything expensive.
+
+### Saving state
+
+```kotlin
+class PlayerActivity : AppCompatActivity() {
+    private var currentPosition: Long = 0
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        currentPosition = savedInstanceState?.getLong(KEY_POSITION) ?: 0
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putLong(KEY_POSITION, currentPosition)
+    }
+
+    companion object { private const val KEY_POSITION = "position" }
+}
+```
+
+`onSaveInstanceState` runs before `onStop` — it's your chance to save
+anything that would be lost in recreation. The Bundle has a size limit
+(~500KB across the whole app); for larger state, use a ViewModel +
+`SavedStateHandle`.
+
+---
+
+## ViewModel + SavedStateHandle
+
+```kotlin
+@HiltViewModel
+class PlayerViewModel @Inject constructor(
+    private val savedState: SavedStateHandle
+) : ViewModel() {
+
+    // Survives config changes AND process death (via Bundle)
+    val currentPosition: StateFlow<Long> = savedState.getStateFlow("position", 0L)
+
+    fun seekTo(position: Long) {
+        savedState["position"] = position
+    }
+}
+```
+
+SavedStateHandle is a `Bundle`-backed map that survives process death.
+Prefer this over manual `onSaveInstanceState` in modern apps.
+
+### Scope
+
+```text
+Activity recreated on config change
+    ↓
+New Activity instance
+    ↓ but reuses the SAME ViewModelStore
+Same ViewModel instance (with same SavedStateHandle)
+```
+
+The ViewModelStore is tied to a `ViewModelStoreOwner`. Activities,
+Fragments, and Nav destinations are all owners — each scopes its
+ViewModels appropriately.
+
+---
+
+## Process death
+
+When the OS kills your process (low memory, user swipes away, Doze),
+everything in memory goes. Recovery path:
+
+1. User returns to the app
+2. Android restores the task's Activity stack
+3. The top Activity is recreated with `savedInstanceState` from its last
+   `onSaveInstanceState`
+4. Your ViewModel is re-created with `SavedStateHandle` containing the
+   saved bundle values
+5. Repositories re-fetch from the cache / network
+
+Test it explicitly:
+
+```bash
+# Kill the app while in background
+adb shell am kill com.myapp
+
+# Or turn "Don't keep activities" ON in Developer Options
+```
+
+Your app should reopen exactly where the user left off. If it can't,
+something isn't saving state correctly.
+
+---
+
+## Lifecycle-aware components
+
+Modern code observes lifecycle via `LifecycleObserver` / `repeatOnLifecycle`:
+
+```kotlin
+class NetworkListener(private val lifecycle: Lifecycle) {
+    init {
+        lifecycle.coroutineScope.launch {
+            lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                connectivityFlow.collect { state ->
+                    // Only collects while Activity is STARTED+
+                }
+            }
+        }
+    }
+}
+```
+
+`repeatOnLifecycle(STARTED)`:
+- Starts collection on `onStart`
+- Cancels on `onStop`
+- Re-starts on next `onStart`
+
+Perfect for Flow collection. Use it instead of manually wiring
+`onStart`/`onStop` pairs.
+
+### From Compose
+
+```kotlin
+@Composable
+fun MyScreen(viewModel: MyViewModel) {
+    val state by viewModel.state.collectAsStateWithLifecycle()  // repeatOnLifecycle(STARTED) under the hood
+}
+```
+
+`collectAsStateWithLifecycle` is the canonical choice. `collectAsState`
+keeps collecting while the screen is in background — wasteful.
+
+---
+
+## Fragment lifecycle
+
+Fragments have **two lifecycles**: the Fragment itself and its View.
+
+```text
+  Fragment lifecycle                 View lifecycle (reset on detach)
+  ─────────────                      ──────────────
+  onAttach                           —
+  onCreate                           —
+  onCreateView    ──────▶            onCreateView  (returns a View)
+  onViewCreated                      onViewCreated
+  onStart                            onStart
+  onResume                           onResume
+  ⇅                                  ⇅
+  onPause                            onPause
+  onStop                             onStop
+  onDestroyView   ──────▶            onDestroyView (View destroyed)
+  (Fragment retained — can be reattached)
+  onDestroy
+  onDetach
+```
+
+### The `viewLifecycleOwner` trap
+
+```kotlin
+// ❌ WRONG — leaks when the Fragment's view is destroyed but Fragment retained
+override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+    viewModel.events.observe(this) { /* ... */ }   // `this` is Fragment, not View
+}
+
+// ✅ RIGHT — uses viewLifecycleOwner
+override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+    viewModel.events.observe(viewLifecycleOwner) { /* ... */ }
+}
+```
+
+Always use `viewLifecycleOwner` for anything tied to the Fragment's
+view. The Fragment can outlive its view when placed in a back stack.
+
+### Fragment + ViewBinding
+
+```kotlin
+class MyFragment : Fragment(R.layout.fragment_my) {
+
+    private var _binding: FragmentMyBinding? = null
+    private val binding get() = _binding!!
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        _binding = FragmentMyBinding.bind(view)
+    }
+
+    override fun onDestroyView() {
+        _binding = null              // release View references
+        super.onDestroyView()
+    }
+}
+```
+
+The nullable binding + null in `onDestroyView` pattern is mandatory — the
+binding holds View references that must be released.
+
+For new code, use **Compose** and avoid this whole dance. A Fragment
+hosting a `ComposeView` with `DisposeOnViewTreeLifecycleDestroyed` is
+lifecycle-safe by construction.
+
+---
+
+## Back navigation
+
+### System back on Activity
+
+```kotlin
+override fun onBackPressed() {
+    if (canGoBack) {
+        goBack()
+    } else {
+        super.onBackPressed()
+    }
+}
+```
+
+This is legacy. The modern API:
+
+```kotlin
+// In Activity/Fragment
+override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+        override fun handleOnBackPressed() {
+            if (canGoBack) goBack() else finish()
+        }
+    })
+}
+```
+
+`OnBackPressedDispatcher` is composable — multiple callbacks at different
+scopes (Activity, Fragment, Dialog) layered.
+
+### Predictive back (Android 13+)
+
+```xml
+<application android:enableOnBackInvokedCallback="true">
+```
+
+Opts into predictive back animations (user sees the previous screen while
+swiping). Combine with `OnBackAnimationCallback` for custom animations.
+
+### Back in Compose
+
+```kotlin
+@Composable
+fun MyScreen(onBack: () -> Unit) {
+    BackHandler(enabled = true, onBack = onBack)
+}
+```
+
+`BackHandler` wraps `OnBackPressedDispatcher`. Enable/disable dynamically
+with the `enabled` parameter.
+
+---
+
+## Single-activity architecture
+
+Modern Android apps increasingly ship as **one Activity hosting many
+screens**. Navigation library (Nav Compose or Nav Fragment) manages the
+back stack — no Activity-per-screen complexity.
+
+Benefits:
+- One lifecycle to reason about
+- Shared ViewModelStore at the Activity scope
+- Faster navigation (no Activity transitions)
+- Better state restoration (nav handles it)
+
+```kotlin
+@AndroidEntryPoint
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            AppTheme { AppNavHost() }
+        }
+    }
+}
+```
+
+Everything else is a `@Composable` screen (or Fragment) hosted inside.
+See [Navigation Masterclass](/docs/jetpack-compose/navigation).
+
+---
+
+## Task stacks & launch modes
+
+### Launch modes
+
+| Mode           | Behavior                                                  |
+|----------------|-----------------------------------------------------------|
+| `standard`     | New instance each launch (default)                        |
+| `singleTop`    | Reuse instance if at top of stack; else new              |
+| `singleTask`   | One instance per task; clears anything on top             |
+| `singleInstance` | One instance across the whole system (rarely useful)    |
+
+Set in manifest:
+
+```xml
+<activity android:name=".MainActivity" android:launchMode="singleTask"/>
+```
+
+For typical apps: `standard` everywhere except entry-point Activity,
+which is `singleTask` to deduplicate from notification taps / deep links.
+
+### Task stacks
+
+Deep links from notifications sometimes need to preserve a "back to Home"
+stack:
+
+```kotlin
+val deepIntent = Intent(context, ProfileActivity::class.java).apply {
+    putExtra("userId", userId)
+}
+
+TaskStackBuilder.create(context)
+    .addNextIntentWithParentStack(deepIntent)     // includes parent
+    .getPendingIntent(
+        0,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
+```
+
+`parentActivityName` in the manifest declares the hierarchy:
+
+```xml
+<activity
+    android:name=".ProfileActivity"
+    android:parentActivityName=".MainActivity"/>
+```
+
+---
+
+## `onNewIntent` — re-entering an Activity
+
+When `singleTop` / `singleTask` reuses an existing Activity, `onCreate`
+does NOT run. Instead:
+
+```kotlin
+override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    setIntent(intent)             // replace getIntent() result
+    handleDeepLink(intent)
+}
+```
+
+Typical for deep link routing — the Activity was already open when the
+link fired.
+
+---
+
+## `Configuration.onConfigurationChanged`
+
+If you declared `configChanges` in manifest, Android calls this instead
+of recreating:
+
+```kotlin
+override fun onConfigurationChanged(newConfig: Configuration) {
+    super.onConfigurationChanged(newConfig)
+    updateLayoutForOrientation(newConfig.orientation)
+}
+```
+
+For Compose, this rarely matters — Compose reacts automatically to
+configuration via `LocalConfiguration`.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Lifecycle bugs',
+    variant: 'old',
+    points: [
+      'Storing state in Activity var fields (lost on config change)',
+      'this instead of viewLifecycleOwner in Fragments',
+      'Flows collected outside of repeatOnLifecycle (battery drain)',
+      'onBackPressed() override (deprecated)',
+      'Forgetting to null out Fragment ViewBindings',
+      'configChanges="orientation" to avoid dealing with recreation'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Correct patterns',
+    variant: 'new',
+    points: [
+      'ViewModel + SavedStateHandle for persistent state',
+      'viewLifecycleOwner for view-lifetime observations',
+      'collectAsStateWithLifecycle / repeatOnLifecycle(STARTED)',
+      'OnBackPressedDispatcher / BackHandler in Compose',
+      'ComposeView in Fragments to skip binding management',
+      'Save state properly; embrace recreation'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Lifecycle rules">
+- **ViewModel + SavedStateHandle** outlive config changes and process death.
+- **`repeatOnLifecycle(STARTED)`** or **`collectAsStateWithLifecycle`** for battery-safe Flow collection.
+- **`viewLifecycleOwner`** in Fragments, not `this`.
+- **`OnBackPressedDispatcher`** / **`BackHandler`** for back navigation.
+- **Single-activity architecture** simplifies most apps.
+- **`singleTask`** on the entry-point Activity to dedupe from notifications.
+- **Test process death** (Don't keep activities) — your app should resume correctly.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Verify state restoration', description: 'Enable "Don\'t keep activities" in Dev Options. Navigate through 3 screens. Rotate. Confirm every field / scroll position / selection is preserved.' },
+  { title: 'Migrate a Fragment to ComposeView', description: 'Pick a Fragment with XML + binding. Replace with a ComposeView hosting a Composable. Verify lifecycle behavior matches.' },
+  { title: 'Deep link intent stack', description: 'Build a notification that deep-links to a detail screen, with "back" returning to Home rather than closing the app.' },
+  { title: 'repeatOnLifecycle audit', description: 'Find every Flow collection in your Fragments / Activities. Migrate to repeatOnLifecycle(STARTED) or collectAsStateWithLifecycle.' }
+]} />
+
+## Next
+
+Continue to **[Intents & PendingIntent](./intents-pendingintent)** for IPC, deep linking, and task stack management.

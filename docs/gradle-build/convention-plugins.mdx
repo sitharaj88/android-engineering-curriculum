@@ -1,0 +1,677 @@
+---
+id: convention-plugins
+title: Convention Plugins & Build Performance
+sidebar_label: Convention Plugins
+description: Build-logic convention plugins, configuration cache, build scans, dependency catalog strategies, and taming a 50+ module Gradle graph.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Convention Plugins & Build Performance
+
+Once your Android project has more than a handful of modules,
+copy-pasted `build.gradle.kts` blocks become the #1 source of build drift.
+**Convention plugins** consolidate shared build logic into one place,
+applied via a one-line `plugins { id("myapp.android.feature") }`. Combined
+with configuration cache and Gradle Develocity, this chapter covers the
+enterprise-grade build setup.
+
+## The build-logic composite build
+
+```text
+my-app/
+├── app/
+├── core/...
+├── feature/...
+├── build-logic/                       ← composite build
+│   ├── settings.gradle.kts
+│   └── convention/
+│       ├── build.gradle.kts
+│       └── src/main/kotlin/
+│           ├── AndroidApplicationConventionPlugin.kt
+│           ├── AndroidLibraryConventionPlugin.kt
+│           ├── AndroidFeatureConventionPlugin.kt
+│           ├── AndroidComposeConventionPlugin.kt
+│           ├── KotlinJvmLibraryConventionPlugin.kt
+│           ├── AndroidTestConventionPlugin.kt
+│           └── AndroidHiltConventionPlugin.kt
+├── gradle/libs.versions.toml
+└── settings.gradle.kts
+```
+
+### Wire it up
+
+```kotlin
+// settings.gradle.kts (root)
+pluginManagement {
+    includeBuild("build-logic")
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+```
+
+```kotlin
+// build-logic/settings.gradle.kts
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    versionCatalogs {
+        create("libs") {
+            from(files("../gradle/libs.versions.toml"))
+        }
+    }
+}
+rootProject.name = "build-logic"
+include(":convention")
+```
+
+```kotlin
+// build-logic/convention/build.gradle.kts
+plugins {
+    `kotlin-dsl`
+}
+
+group = "com.myapp.buildlogic"
+
+dependencies {
+    compileOnly(libs.android.gradle.plugin)
+    compileOnly(libs.kotlin.gradle.plugin)
+    compileOnly(libs.ksp.gradle.plugin)
+    compileOnly(libs.compose.gradle.plugin)
+}
+
+gradlePlugin {
+    plugins {
+        register("androidApplication") {
+            id = "myapp.android.application"
+            implementationClass = "AndroidApplicationConventionPlugin"
+        }
+        register("androidLibrary") {
+            id = "myapp.android.library"
+            implementationClass = "AndroidLibraryConventionPlugin"
+        }
+        register("androidFeature") {
+            id = "myapp.android.feature"
+            implementationClass = "AndroidFeatureConventionPlugin"
+        }
+        register("androidCompose") {
+            id = "myapp.android.compose"
+            implementationClass = "AndroidComposeConventionPlugin"
+        }
+        register("androidHilt") {
+            id = "myapp.android.hilt"
+            implementationClass = "AndroidHiltConventionPlugin"
+        }
+        register("kotlinJvmLibrary") {
+            id = "myapp.kotlin.library"
+            implementationClass = "KotlinJvmLibraryConventionPlugin"
+        }
+    }
+}
+```
+
+---
+
+## A library convention plugin
+
+```kotlin
+// build-logic/convention/src/main/kotlin/AndroidLibraryConventionPlugin.kt
+class AndroidLibraryConventionPlugin : Plugin<Project> {
+    override fun apply(target: Project) = with(target) {
+        with(pluginManager) {
+            apply("com.android.library")
+            apply("org.jetbrains.kotlin.android")
+        }
+
+        extensions.configure<LibraryExtension> {
+            compileSdk = 35
+            defaultConfig {
+                minSdk = 24
+                testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+                consumerProguardFiles("consumer-rules.pro")
+            }
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_17
+                targetCompatibility = JavaVersion.VERSION_17
+            }
+            buildFeatures {
+                buildConfig = false
+            }
+            lint {
+                warningsAsErrors = true
+                abortOnError = true
+            }
+            packaging {
+                resources {
+                    excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                    excludes += "/META-INF/LICENSE*"
+                }
+            }
+        }
+
+        extensions.configure<KotlinAndroidProjectExtension> {
+            jvmToolchain(17)
+            compilerOptions {
+                freeCompilerArgs.addAll(
+                    "-opt-in=kotlin.RequiresOptIn",
+                    "-Xjvm-default=all",
+                    "-Xcontext-receivers"
+                )
+            }
+        }
+
+        dependencies {
+            add("implementation", libs.findLibrary("androidx.core.ktx").get())
+            add("testImplementation", libs.findLibrary("junit.jupiter.api").get())
+            add("testRuntimeOnly", libs.findLibrary("junit.jupiter.engine").get())
+        }
+
+        tasks.withType<Test> {
+            useJUnitPlatform()
+        }
+    }
+}
+
+// Extension to reach the version catalog
+val Project.libs: VersionCatalog
+    get() = extensions.getByType<VersionCatalogsExtension>().named("libs")
+```
+
+### A compose convention plugin
+
+```kotlin
+class AndroidComposeConventionPlugin : Plugin<Project> {
+    override fun apply(target: Project) = with(target) {
+        pluginManager.apply("org.jetbrains.kotlin.plugin.compose")
+
+        val bom = libs.findLibrary("androidx-compose-bom").get()
+
+        dependencies {
+            val androidExtension = extensions.getByType<CommonExtension<*, *, *, *, *, *>>()
+            androidExtension.apply {
+                buildFeatures { compose = true }
+            }
+            add("implementation", platform(bom))
+            add("implementation", libs.findBundle("compose").get())
+            add("androidTestImplementation", platform(bom))
+            add("debugImplementation", libs.findLibrary("androidx-compose-ui-tooling").get())
+            add("debugImplementation", libs.findLibrary("androidx-compose-ui-test-manifest").get())
+        }
+
+        // Opt into Compose compiler metrics via a Gradle property
+        extensions.configure<KotlinAndroidProjectExtension> {
+            compilerOptions {
+                val reportsDir = layout.buildDirectory.dir("compose-reports").get().asFile.absolutePath
+                if (project.findProperty("composeMetrics") == "true") {
+                    freeCompilerArgs.addAll(
+                        "-P", "plugin:androidx.compose.compiler.plugins.kotlin:metricsDestination=$reportsDir",
+                        "-P", "plugin:androidx.compose.compiler.plugins.kotlin:reportsDestination=$reportsDir"
+                    )
+                }
+            }
+        }
+    }
+}
+```
+
+### A feature convention plugin — combine them
+
+```kotlin
+class AndroidFeatureConventionPlugin : Plugin<Project> {
+    override fun apply(target: Project) = with(target) {
+        with(pluginManager) {
+            apply("myapp.android.library")
+            apply("myapp.android.compose")
+            apply("myapp.android.hilt")
+        }
+
+        dependencies {
+            add("implementation", project(":core:ui"))
+            add("implementation", project(":core:design"))
+            add("implementation", project(":core:domain"))
+            add("implementation", libs.findLibrary("androidx-lifecycle-viewmodel").get())
+            add("implementation", libs.findLibrary("androidx-hilt-navigation-compose").get())
+            add("implementation", libs.findBundle("androidx-lifecycle-ktx").get())
+        }
+    }
+}
+```
+
+### Using it
+
+A new feature module's build script is **3 lines**:
+
+```kotlin
+// feature/catalog/build.gradle.kts
+plugins {
+    id("myapp.android.feature")
+}
+
+android {
+    namespace = "com.myapp.feature.catalog"
+}
+```
+
+Everything else — Compose, Hilt, Lifecycle, test runner, lint settings —
+comes from the convention plugins.
+
+---
+
+## Version catalog deep dive
+
+### Bundles
+
+```toml
+[bundles]
+compose = [
+    "compose-ui",
+    "compose-ui-tooling-preview",
+    "compose-foundation",
+    "compose-material3",
+    "compose-runtime"
+]
+
+testing-unit = [
+    "junit-jupiter-api",
+    "mockk",
+    "turbine",
+    "coroutines-test"
+]
+```
+
+```kotlin
+// in a build.gradle.kts
+dependencies {
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.bundles.compose)
+    testImplementation(libs.bundles.testing.unit)
+}
+```
+
+Bundle once, include across 50 modules. Changing a library version is a
+single catalog edit.
+
+### Plugin references
+
+```toml
+[versions]
+agp = "8.7.2"
+kotlin = "2.1.0"
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+```
+
+```kotlin
+plugins {
+    alias(libs.plugins.android.library)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
+}
+```
+
+---
+
+## Configuration cache
+
+```properties
+# gradle.properties
+org.gradle.configuration-cache=true
+org.gradle.configuration-cache.problems=warn    # or 'fail' to enforce
+org.gradle.caching=true
+org.gradle.parallel=true
+org.gradle.workers.max=8
+```
+
+The configuration cache serializes the task graph. On the second build,
+Gradle skips the entire configuration phase — huge speedup in large
+projects (often 10-20 seconds saved per incremental build).
+
+### Compatibility
+
+Most modern plugins are compatible. If not:
+
+```text
+> ./gradlew assembleDebug
+Configuration cache problems found in this build.
+
+1 problem was found storing the configuration cache.
+- Task `:app:processDebugResources` of type ...:
+  cannot serialize object of type java.io.File ...
+```
+
+Workarounds:
+- Use providers and lazy configuration: `.set { ... }` instead of eager `= ...`
+- Avoid `project.exec` in configuration; use tasks
+- Report non-compliant plugins and update versions
+
+### Incremental builds
+
+With configuration cache:
+- **First build**: normal time
+- **Second build, same tasks**: Gradle skips config (≈ 300 ms instead of 15s)
+- **After `build.gradle.kts` edit**: rebuilds config, then caches
+
+---
+
+## Build scans with Develocity
+
+```kotlin
+// settings.gradle.kts
+plugins {
+    id("com.gradle.develocity") version "3.18"
+}
+
+develocity {
+    buildScan {
+        termsOfUseUrl = "https://gradle.com/terms-of-service"
+        termsOfUseAgree = "yes"
+        publishing.onlyIf { isCi || buildResult.failures.isNotEmpty() }
+        tag(if (isCi) "CI" else "Local")
+        tag(System.getProperty("os.name"))
+    }
+}
+
+val isCi = System.getenv("CI") == "true"
+```
+
+Build scans give you:
+- Task timing (which task took 4s out of 15s)
+- Dependency graph visualizations
+- Per-test timing
+- Flaky test detection (across runs)
+- Compare any two builds
+
+Free tier is generous; enterprise Develocity adds remote build cache,
+Test Distribution (parallelize tests across CI nodes), and insights.
+
+### Remote build cache
+
+```kotlin
+// settings.gradle.kts
+buildCache {
+    local {
+        isEnabled = true
+    }
+    remote<HttpBuildCache> {
+        url = uri("https://cache.mycompany.com/cache/")
+        isPush = isCi
+        credentials {
+            username = providers.gradleProperty("cacheUser").orNull
+            password = providers.gradleProperty("cachePassword").orNull
+        }
+    }
+}
+```
+
+A shared cache means developer B doesn't recompile what developer A
+already compiled on CI. For large projects, **remote build cache cuts
+30-60% off clean-build times**.
+
+---
+
+## Gradle properties for performance
+
+```properties
+# gradle.properties
+org.gradle.jvmargs=-Xmx6g -XX:+UseG1GC -XX:MaxMetaspaceSize=1g \
+  -Dfile.encoding=UTF-8 -Dkotlin.daemon.jvm.options="-Xmx4g"
+
+# Parallel + caching
+org.gradle.parallel=true
+org.gradle.caching=true
+org.gradle.configuration-cache=true
+org.gradle.workers.max=8
+
+# Kotlin
+kotlin.code.style=official
+kotlin.incremental=true
+kotlin.incremental.useClasspathSnapshot=true
+
+# AndroidX + AGP
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+android.nonFinalResIds=true
+android.defaults.buildfeatures.buildconfig=false
+android.defaults.buildfeatures.aidl=false
+android.defaults.buildfeatures.renderscript=false
+android.defaults.buildfeatures.resvalues=false
+android.defaults.buildfeatures.shaders=false
+```
+
+### Key toggles
+
+- `nonTransitiveRClass=true` — each module's `R` only contains its own
+  resources. Faster incremental R.jar generation.
+- `nonFinalResIds=true` — `R.id.*` aren't compile-time constants. Allows
+  more caching.
+- `buildconfig=false` by default — turn on only where needed.
+
+---
+
+## Task profiling
+
+```bash
+./gradlew :app:assembleDebug --profile --scan
+```
+
+Generates `build/reports/profile/profile-*.html` plus a scan URL. Use
+for:
+- Finding the slowest task
+- Identifying redundant work
+- Before/after measuring an optimization
+
+### `--dry-run` to inspect the task graph
+
+```bash
+./gradlew :app:assembleDebug --dry-run
+```
+
+Shows which tasks would run without executing. Useful when you think
+"why is that task running?" — check the dependencies.
+
+### `--rerun-tasks` to invalidate cache
+
+```bash
+./gradlew :app:assembleDebug --rerun-tasks
+```
+
+Forces everything to re-execute, bypassing caches. Useful to measure
+worst-case clean-build time.
+
+---
+
+## Dependency analysis
+
+```kotlin
+// app/build.gradle.kts
+plugins {
+    id("com.autonomousapps.dependency-analysis") version "2.1.4"
+}
+```
+
+```bash
+./gradlew buildHealth
+```
+
+Reports:
+- Unused dependencies (can be removed)
+- `api` vs `implementation` mismatches
+- Version conflicts
+- Duplicate classes
+
+Addresses are often surprising — a "just in case" Kotlin extension
+library pulls in 5 MB of unused transitive deps.
+
+---
+
+## Dependency locking
+
+For supply-chain security, lock dependency versions:
+
+```kotlin
+// root build.gradle.kts
+allprojects {
+    configurations.all {
+        resolutionStrategy.activateDependencyLocking()
+    }
+}
+```
+
+```bash
+./gradlew dependencies --write-locks
+```
+
+Produces `gradle.lockfile` per configuration. Any new dependency forces a
+lock update — no surprise version bumps from transitive deps.
+
+---
+
+## KSP over kapt
+
+```kotlin
+plugins {
+    alias(libs.plugins.ksp)
+}
+
+dependencies {
+    ksp(libs.hilt.compiler)
+    ksp(libs.room.compiler)
+    ksp(libs.moshi.codegen)
+}
+```
+
+KSP is **2× faster** than kapt. Every annotation processor you use
+(Hilt, Room, Moshi, Dagger) supports KSP. No reason to use kapt in new
+code; migrating old code is worth the effort.
+
+---
+
+## Build script testing
+
+For convention plugins, write tests:
+
+```kotlin
+// build-logic/convention/src/test/kotlin/ConventionPluginTest.kt
+class AndroidLibraryConventionPluginTest {
+    @TempDir lateinit var testProjectDir: File
+
+    @Test fun plugin_applies_and_configures() {
+        File(testProjectDir, "settings.gradle.kts").writeText("")
+        File(testProjectDir, "build.gradle.kts").writeText("""
+            plugins { id("myapp.android.library") }
+            android { namespace = "com.test" }
+        """.trimIndent())
+
+        val result = GradleRunner.create()
+            .withProjectDir(testProjectDir)
+            .withPluginClasspath()
+            .withArguments("tasks")
+            .build()
+
+        assertTrue(result.output.contains("assembleDebug"))
+    }
+}
+```
+
+---
+
+## CI-specific optimizations
+
+```yaml
+# .github/workflows/ci.yml
+- uses: gradle/actions/setup-gradle@v4
+  with:
+    cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+    develocity-access-key: ${{ secrets.DEVELOCITY_KEY }}
+
+- name: Build
+  run: ./gradlew assembleDebug --no-daemon --parallel --build-cache
+```
+
+- `cache-read-only=true` on PRs — don't push ephemeral builds to cache
+- `--no-daemon` on CI — avoids daemon memory bloat in container
+- `setup-gradle` action handles caching, artifact uploads, scan publishing
+
+---
+
+## Migration playbook — going from monolith to convention plugins
+
+<StepList steps={[
+  { title: 'Week 1: introduce build-logic', description: 'Set up the composite build skeleton. Create AndroidLibraryConventionPlugin with just minSdk / compileSdk. Apply to one library module.' },
+  { title: 'Week 2: extract Compose + Hilt conventions', description: 'Build AndroidComposeConventionPlugin and AndroidHiltConventionPlugin. Apply to all library modules.' },
+  { title: 'Week 3: feature convention', description: 'Combine library + compose + hilt into AndroidFeatureConventionPlugin. Migrate all feature modules to a 3-line build.gradle.kts.' },
+  { title: 'Week 4: version catalog', description: 'Move every hardcoded version and dependency into libs.versions.toml. Create bundles for common groups (compose, testing, networking).' },
+  { title: 'Week 5: configuration cache', description: 'Enable org.gradle.configuration-cache=true with problems=warn. Work through issues until clean. Flip to problems=fail.' },
+  { title: 'Week 6: build scans + remote cache', description: 'Publish build scans on every CI run. Set up remote cache (if budget allows). Baseline build times before/after each change.' }
+]} />
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Build script problems',
+    variant: 'old',
+    points: [
+      'Copy-paste android { } blocks across 30 modules',
+      'Hardcoded versions in build scripts',
+      'kapt when KSP is available',
+      'org.gradle.jvmargs with -Xmx1g (too small)',
+      'buildconfig / aidl enabled by default everywhere',
+      'No configuration cache (slow incremental)'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Modern builds',
+    variant: 'new',
+    points: [
+      'Convention plugins own the shared config',
+      'Version catalog with bundles + plugin refs',
+      'KSP for Hilt, Room, Moshi',
+      'JVM args 6g+, UseG1GC, Kotlin daemon 4g',
+      'Build features off by default; enable per-module',
+      'Configuration cache + build cache + parallel'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Build performance rules">
+- **Convention plugins in `build-logic`** — a new module is 3 lines of build script.
+- **Version catalog + bundles** — one place to change versions.
+- **Configuration cache** enabled with `problems=fail` once compatible.
+- **Remote build cache** shared between dev + CI for 30-60% clean-build reduction.
+- **Build scans** on every CI run + on local failures.
+- **KSP everywhere kapt was used** — 2× faster annotation processing.
+- **Dependency analysis + version locking** for supply-chain safety.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Bootstrap build-logic', description: 'Create the build-logic composite build with one AndroidLibraryConventionPlugin. Apply it to one module and verify it still builds.' },
+  { title: 'Extract feature plugin', description: 'Build AndroidFeatureConventionPlugin combining library + compose + hilt. Migrate all feature modules to use it.' },
+  { title: 'Enable configuration cache', description: 'Set org.gradle.configuration-cache=true with warn. Run ./gradlew build --info, fix the top-5 reported incompatibilities.' },
+  { title: 'Publish a build scan', description: 'Add Develocity plugin. Run ./gradlew build --scan. Inspect the task timing breakdown.' },
+  { title: 'Dependency audit', description: 'Add the dependency-analysis plugin. Run buildHealth. Remove 3 unused dependencies and fix one api/implementation mismatch.' }
+]} />
+
+## Next
+
+Return to **[Module 14 Overview](./overview)** or continue to
+**[Module 15 — Modularization at Scale](/docs/modularization/overview)**.

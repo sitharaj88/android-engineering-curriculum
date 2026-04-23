@@ -1,0 +1,563 @@
+---
+id: opentelemetry
+title: OpenTelemetry & Distributed Tracing
+sidebar_label: OpenTelemetry
+description: Android app telemetry at scale — OpenTelemetry, distributed tracing, structured logs, SLOs, custom metrics, and shipping to any OTLP backend.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# OpenTelemetry & Distributed Tracing
+
+Firebase Crashlytics and Firebase Performance Monitoring cover 80% of
+Android teams. For the remaining 20% — or any app talking to backend
+microservices — **OpenTelemetry (OTel)** is the industry standard for
+traces, metrics, and logs. Vendor-neutral. Ship to Honeycomb, Datadog,
+Grafana Tempo, New Relic, or self-hosted Jaeger — all via the same SDK.
+
+## Why OpenTelemetry
+
+<ComparisonCard
+  left={{
+    label: 'Firebase-only',
+    title: 'Limitations',
+    variant: 'old',
+    points: [
+      'Crashes are isolated — no trace context',
+      'Performance monitoring is auto-traces only (HTTP, screen render)',
+      'No way to correlate client traces with backend',
+      'Vendor lock-in',
+      'Limited metric / dimension cardinality',
+      'Hard to debug "slow checkout" across 6 backend services'
+    ]
+  }}
+  right={{
+    label: 'OpenTelemetry',
+    title: 'Benefits',
+    variant: 'new',
+    points: [
+      'Unified traces: client → API gateway → service A → DB',
+      'Typed spans with attributes, events, status',
+      'Custom metrics (p50/p99 histograms, counters)',
+      'Vendor-neutral OTLP export',
+      'Structured logs with trace correlation',
+      'Standard semantic conventions'
+    ]
+  }}
+/>
+
+---
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+opentelemetry = "1.45.0"
+otel-android = "0.9.0-alpha"
+
+opentelemetry-api            = { module = "io.opentelemetry:opentelemetry-api", version.ref = "opentelemetry" }
+opentelemetry-sdk            = { module = "io.opentelemetry:opentelemetry-sdk", version.ref = "opentelemetry" }
+opentelemetry-exporter-otlp  = { module = "io.opentelemetry:opentelemetry-exporter-otlp", version.ref = "opentelemetry" }
+opentelemetry-android        = { module = "io.opentelemetry.android:android-agent", version.ref = "otel-android" }
+```
+
+```kotlin
+@Singleton
+class OtelProvider @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    val openTelemetry: OpenTelemetry by lazy {
+        OpenTelemetrySdk.builder()
+            .setTracerProvider(
+                SdkTracerProvider.builder()
+                    .setResource(Resource.create(Attributes.builder()
+                        .put(ServiceAttributes.SERVICE_NAME, "myapp-android")
+                        .put(ServiceAttributes.SERVICE_VERSION, BuildConfig.VERSION_NAME)
+                        .put("device.model", Build.MODEL)
+                        .put("device.api_level", Build.VERSION.SDK_INT.toLong())
+                        .put("build.type", BuildConfig.BUILD_TYPE)
+                        .build()))
+                    .addSpanProcessor(BatchSpanProcessor.builder(
+                        OtlpGrpcSpanExporter.builder()
+                            .setEndpoint("https://otlp.mycollector.com:4317")
+                            .addHeader("x-api-key", BuildConfig.OTEL_API_KEY)
+                            .build()
+                    ).build())
+                    .setSampler(Sampler.parentBased(Sampler.traceIdRatioBased(0.1)))  // 10% sample
+                    .build())
+            .setMeterProvider(
+                SdkMeterProvider.builder()
+                    .setResource(Resource.default())
+                    .registerMetricReader(PeriodicMetricReader.builder(
+                        OtlpGrpcMetricExporter.builder()
+                            .setEndpoint("https://otlp.mycollector.com:4317")
+                            .build()
+                    ).build())
+                    .build())
+            .buildAndRegisterGlobal()
+    }
+
+    val tracer: Tracer by lazy { openTelemetry.getTracer("myapp-android") }
+    val meter: Meter by lazy { openTelemetry.getMeter("myapp-android") }
+}
+```
+
+---
+
+## Spans — the unit of tracing
+
+A span represents a unit of work with timing, attributes, and (optionally)
+child spans:
+
+```kotlin
+class CheckoutUseCase @Inject constructor(
+    private val tracer: Tracer,
+    private val cartRepo: CartRepository,
+    private val paymentApi: PaymentApi
+) {
+    suspend operator fun invoke(userId: String, method: PaymentMethod): Outcome<OrderId, CheckoutError> {
+        val span = tracer.spanBuilder("checkout")
+            .setAttribute("user.id", userId)
+            .setAttribute("payment.method", method.type)
+            .setSpanKind(SpanKind.INTERNAL)
+            .startSpan()
+
+        return span.use {
+            try {
+                val cart = tracer.spanBuilder("cart.fetch").startSpan().use { cartRepo.current() }
+                span.setAttribute("cart.items", cart.items.size.toLong())
+                span.setAttribute("cart.total.cents", cart.totalCents)
+
+                val receipt = tracer.spanBuilder("payment.charge").use { paymentApi.charge(cart.totalCents, method) }
+                span.setAttribute("payment.id", receipt.id)
+
+                span.setStatus(StatusCode.OK)
+                Outcome.Ok(OrderId(receipt.id))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                span.recordException(t)
+                span.setStatus(StatusCode.ERROR, t.message ?: "")
+                Outcome.Err(CheckoutError.fromException(t))
+            }
+        }
+    }
+}
+
+// Helper extension
+inline fun <T> Span.use(block: (Span) -> T): T = try {
+    block(this)
+} finally {
+    this.end()
+}
+
+inline fun <T> SpanBuilder.use(block: (Span) -> T): T = this.startSpan().use(block)
+```
+
+Calling `use { }` ensures every span is ended — critical for avoiding
+resource leaks.
+
+### Span hierarchy
+
+```text
+[checkout                              450 ms]
+ ├─[cart.fetch         12 ms]
+ ├─[payment.charge               320 ms]
+ │  └─[http.post                 310 ms]    (backend span, correlated via trace context)
+ └─[order.save        20 ms]
+```
+
+In the backend, the payment service's traces thread together with the
+client's — one search by trace ID shows the full flow.
+
+---
+
+## HTTP propagation — distributed tracing
+
+Attach W3C Trace Context headers to outgoing requests so your backend
+traces continue from the client:
+
+```kotlin
+class OtelOkHttpInterceptor @Inject constructor(
+    private val tracer: Tracer,
+    private val propagator: TextMapPropagator
+) : Interceptor {
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+
+        val span = tracer.spanBuilder("http ${request.method} ${request.url.encodedPath}")
+            .setSpanKind(SpanKind.CLIENT)
+            .setAttribute(HttpAttributes.HTTP_REQUEST_METHOD, request.method)
+            .setAttribute(UrlAttributes.URL_FULL, request.url.toString())
+            .setAttribute(ServerAttributes.SERVER_ADDRESS, request.url.host)
+            .startSpan()
+
+        return span.use {
+            val context = Context.current().with(span)
+            val builder = request.newBuilder()
+            propagator.inject(context, builder) { carrier, key, value ->
+                carrier?.header(key, value)
+            }
+
+            try {
+                val response = chain.proceed(builder.build())
+                span.setAttribute(HttpAttributes.HTTP_RESPONSE_STATUS_CODE, response.code.toLong())
+                if (response.code >= 400) span.setStatus(StatusCode.ERROR)
+                response
+            } catch (t: Throwable) {
+                span.recordException(t)
+                span.setStatus(StatusCode.ERROR, t.message ?: "")
+                throw t
+            }
+        }
+    }
+}
+```
+
+Add to OkHttp:
+
+```kotlin
+OkHttpClient.Builder()
+    .addInterceptor(OtelOkHttpInterceptor(tracer, W3CTraceContextPropagator.getInstance()))
+    .build()
+```
+
+Backend picks up the `traceparent` header, continues the trace, returns
+the span chain in the collector.
+
+---
+
+## Metrics
+
+```kotlin
+class CheckoutMetrics @Inject constructor(meter: Meter) {
+
+    private val checkoutCounter = meter.counterBuilder("checkout.attempts")
+        .setDescription("Number of checkout attempts")
+        .build()
+
+    private val checkoutDuration = meter.histogramBuilder("checkout.duration")
+        .setDescription("Duration of checkout in ms")
+        .setUnit("ms")
+        .ofLongs()
+        .build()
+
+    fun recordAttempt(result: String, paymentMethod: String, durationMs: Long) {
+        val attributes = Attributes.builder()
+            .put("checkout.result", result)
+            .put("payment.method", paymentMethod)
+            .build()
+
+        checkoutCounter.add(1, attributes)
+        checkoutDuration.record(durationMs, attributes)
+    }
+}
+```
+
+### Types of instruments
+
+| Type                     | Use for                                           |
+|--------------------------|---------------------------------------------------|
+| `Counter`                | Monotonically increasing counts (requests, errors) |
+| `UpDownCounter`          | Values that go up or down (active sessions)       |
+| `Histogram`              | Distributions (latency, request size)             |
+| `Observable Gauge`       | Snapshots of current value (memory, queue depth)  |
+
+---
+
+## Sampling
+
+Sending every trace is expensive. **Sample**:
+
+```kotlin
+.setSampler(Sampler.parentBased(Sampler.traceIdRatioBased(0.1)))  // 10% of traces
+```
+
+### Head vs tail sampling
+
+- **Head sampling** (default) — decide at root span based on random roll;
+  cheap but misses interesting traces
+- **Tail sampling** — decide based on the full trace (e.g., keep all
+  error traces, sample 1% of success); more complete but needs a
+  collector
+
+For production: **head-sample 10%**, but override to 100% for:
+- Error traces (`.setSampler(errorPreservingSampler)`)
+- Slow traces
+- Specific users (internal testers, support escalations)
+
+---
+
+## Logs with trace correlation
+
+OTel logs attach the current trace context to every log entry:
+
+```kotlin
+class OtelTimberTree @Inject constructor(
+    private val logger: Logger   // io.opentelemetry.api.logs.Logger
+) : Timber.Tree() {
+    override fun log(priority: Int, tag: String?, message: String, t: Throwable?) {
+        if (priority < Log.INFO) return
+
+        val severity = when (priority) {
+            Log.ERROR -> Severity.ERROR
+            Log.WARN -> Severity.WARN
+            Log.INFO -> Severity.INFO
+            else -> Severity.DEBUG
+        }
+
+        logger.logRecordBuilder()
+            .setSeverity(severity)
+            .setSeverityText(priorityToString(priority))
+            .setAttribute(AttributeKey.stringKey("tag"), tag ?: "app")
+            .setBody(message)
+            .apply {
+                t?.let { setAttribute(AttributeKey.stringKey("exception.stacktrace"), it.stackTraceToString()) }
+            }
+            .emit()
+    }
+}
+```
+
+In the collector backend: search logs by trace ID → see every log emitted
+during that request across services. Debugging becomes a 10-minute task
+instead of a half-day.
+
+---
+
+## Span events — point-in-time annotations
+
+```kotlin
+val span = tracer.spanBuilder("checkout").startSpan()
+try {
+    cart = cartRepo.current()
+    span.addEvent("cart.fetched", Attributes.of(AttributeKey.longKey("items"), cart.items.size.toLong()))
+
+    val receipt = paymentApi.charge(cart.total, method)
+    span.addEvent("payment.completed", Attributes.of(AttributeKey.stringKey("id"), receipt.id))
+} finally {
+    span.end()
+}
+```
+
+Events annotate moments within a span — useful for retries, cache
+hits/misses, partial progress.
+
+---
+
+## Baggage — context propagation beyond tracing
+
+```kotlin
+// Set
+val context = Baggage.fromContext(Context.current())
+    .toBuilder()
+    .put("tenant.id", tenantId)
+    .put("feature.variant", "premium")
+    .build()
+    .storeInContext(Context.current())
+
+// Read in any subsequent span or HTTP interceptor
+val tenantId = Baggage.current().getEntryValue("tenant.id")
+```
+
+Baggage propagates across services — useful for tenant IDs, experiment
+variants, feature flags — without attaching them to every span manually.
+
+---
+
+## Android Auto-instrumentation
+
+`io.opentelemetry.android:android-agent` auto-instruments:
+- Activity lifecycle spans
+- Network requests (HttpURLConnection)
+- ANRs
+- Crashes
+- Slow renders (via frame metrics)
+
+```kotlin
+class MyApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+
+        val endpoint = OtelRumConfig.create()
+            .setSessionIdleTimeout(Duration.ofMinutes(15))
+            .setGlobalAttributes(Attributes.builder()
+                .put("app.version", BuildConfig.VERSION_NAME)
+                .build())
+
+        val agent = OpenTelemetryRum.builder(this, endpoint)
+            .addSpanExporterCustomizer { exporter -> exporter }    // inject OTLP
+            .addInstrumentation(AnrInstrumentation())
+            .addInstrumentation(CrashInstrumentation())
+            .addInstrumentation(SlowRenderingDetectorInstrumentation())
+            .build()
+    }
+}
+```
+
+For manual instrumentation beyond the auto-instrumented stuff, still use
+the explicit `Tracer`.
+
+---
+
+## Exporting to backends
+
+### Honeycomb
+
+```kotlin
+OtlpGrpcSpanExporter.builder()
+    .setEndpoint("https://api.honeycomb.io:443")
+    .addHeader("x-honeycomb-team", BuildConfig.HONEYCOMB_API_KEY)
+    .addHeader("x-honeycomb-dataset", "myapp-android")
+    .build()
+```
+
+### Grafana Tempo (OSS)
+
+```kotlin
+OtlpGrpcSpanExporter.builder()
+    .setEndpoint("https://tempo.mycompany.com:4317")
+    .build()
+```
+
+### Datadog
+
+```kotlin
+OtlpGrpcSpanExporter.builder()
+    .setEndpoint("https://trace.agent.datadoghq.com:4317")
+    .addHeader("DD-API-KEY", BuildConfig.DATADOG_API_KEY)
+    .build()
+```
+
+All same SDK, different endpoints. Vendor-neutrality in action.
+
+---
+
+## SLOs — service-level objectives
+
+With metrics shipped to a backend, define SLOs:
+
+```yaml
+# Prometheus recording rules
+- record: app:checkout:success_rate_30d
+  expr: sum(rate(checkout_attempts_total{result="success"}[30d])) /
+        sum(rate(checkout_attempts_total[30d]))
+
+- alert: CheckoutSLOBurnRateHigh
+  expr: app:checkout:success_rate_30d < 0.98
+  labels:
+    severity: warning
+  annotations:
+    summary: Checkout success rate below 98% over 30 days
+```
+
+Alerts based on real user experience, not synthetic checks.
+
+---
+
+## Privacy — what NOT to send
+
+<Callout kind="danger" title="Never include PII in spans">
+Spans and logs go to your observability vendor — which may not be in
+your privacy jurisdiction. Sanitize:
+
+- **No raw user emails, names, phone numbers**
+- **Hashed / bucketed user IDs** only
+- **No raw API request/response bodies** (may contain PII)
+- **No passwords, tokens, session cookies**
+
+Use a `SpanSanitizer` processor that strips sensitive attributes before
+export.
+</Callout>
+
+```kotlin
+class PrivacySanitizingProcessor(val delegate: SpanProcessor) : SpanProcessor by delegate {
+    override fun onEnd(span: ReadableSpan) {
+        val sanitized = span.toSpanData().toBuilder()
+            .setAttributes(sanitize(span.toSpanData().attributes))
+            .build()
+        // Only the sanitized copy is exported
+    }
+
+    private fun sanitize(attrs: Attributes): Attributes = attrs.toBuilder().apply {
+        // Remove PII keys
+        listOf("user.email", "user.name", "http.request.body").forEach { remove(AttributeKey.stringKey(it)) }
+    }.build()
+}
+```
+
+---
+
+## Performance cost
+
+OTel SDK overhead:
+- **Span creation**: ~5-50 µs
+- **Span close**: ~5 µs
+- **Batch export** (background): &lt;1% CPU on typical devices
+
+For hot paths (60fps rendering), don't create spans per frame — sample or
+aggregate.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Telemetry mistakes',
+    variant: 'old',
+    points: [
+      'Sampling 100% of traces (expensive, noisy)',
+      'PII in span attributes',
+      'No trace correlation between client and backend',
+      'Logs without trace context (hard to debug)',
+      'One big span covering the whole checkout (no detail)',
+      'Missing span.end() calls (memory leaks)'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production telemetry',
+    variant: 'new',
+    points: [
+      '10% head sampling + 100% error traces',
+      'Sanitizer processor strips PII before export',
+      'W3C Trace Context headers auto-injected',
+      'OTel Timber tree adds trace_id to every log',
+      'Nested spans per sub-operation',
+      'span.use { } or try/finally with span.end()'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="OpenTelemetry rules">
+- **Vendor-neutral**: one SDK, export to Honeycomb / Datadog / Grafana / self-hosted.
+- **Spans + metrics + logs** all with trace correlation.
+- **W3C Trace Context** in OkHttp interceptor → backend traces continue.
+- **10% sampling + 100% errors** — cost-effective, preserves signal.
+- **Sanitize** before export — no PII in spans.
+- **Auto-instrumentation** (`io.opentelemetry.android`) for free activity / HTTP / crash spans.
+- **Baggage** for cross-service context (tenant, experiment).
+- **SLOs + alerts** based on custom metrics drive real reliability.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Wire up OTel SDK', description: 'Add OtelProvider with a BatchSpanProcessor + OTLP exporter. Ship a test span to Jaeger running locally on :4317.' },
+  { title: 'Instrument a flow', description: 'Wrap your checkout flow with nested spans (checkout → cart.fetch → payment.charge → order.save). Verify the hierarchy in Honeycomb / Tempo.' },
+  { title: 'HTTP propagation', description: 'Add OtelOkHttpInterceptor. Run a request. Confirm the backend receives a `traceparent` header and continues the trace.' },
+  { title: 'Sampling strategy', description: 'Configure a parent-based sampler with 10% ratio. Override to 100% for error spans (use a custom Sampler). Verify errors always appear.' },
+  { title: 'Privacy sanitizer', description: 'Add attributes with PII (email, name) to a test span. Implement PrivacySanitizingProcessor. Confirm PII is stripped before export.' }
+]} />
+
+## Next
+
+Return to **[Module 18 Overview](./overview)** or continue to
+**[Module 19 — Enterprise UX](/docs/enterprise-ux/overview)**.

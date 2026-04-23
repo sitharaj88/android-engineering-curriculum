@@ -1,0 +1,366 @@
+---
+id: overview
+title: Module 21 — AI & On-Device ML
+sidebar_label: Overview
+description: On-device AI with Gemini Nano, ML Kit, TensorFlow Lite, and Android's AICore. Privacy-preserving, offline, low-latency intelligence.
+---
+
+import { Callout, FeatureGrid, StepList } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Module:</strong> 21 of 21</span>
+  <span><strong>Duration:</strong> 2 weeks</span>
+  <span><strong>Topics:</strong> 3 · 8 subtopics</span>
+  <span><strong>Prerequisites:</strong> Modules 01–10</span>
+</div>
+
+# AI & On-Device ML
+
+The 2025-2026 Android platform is AI-native. **Gemini Nano** ships in
+Android 14 QPR2+ devices with AICore. **ML Kit** has expanded from
+vision-only to full text / image / document understanding. **TensorFlow
+Lite** remains the escape hatch for custom models. This module covers
+the stack — when to use each, how to ship, and the privacy posture that
+makes on-device AI compelling in the first place.
+
+<Callout kind="tip" title="The on-device advantage">
+**Why on-device when the cloud is cheaper per inference?** Privacy (data
+never leaves the device), latency (no round-trip), availability (works
+offline), cost at scale (no per-inference bill), and regulatory
+compliance (GDPR, HIPAA, COPPA). For consumer features, on-device wins
+on user trust alone.
+</Callout>
+
+---
+
+## The stack
+
+<FeatureGrid columns={2} features={[
+  { icon: '🧠', title: 'Gemini Nano (AICore)', description: 'Google\'s on-device LLM — summarization, proofreading, reply suggestions. Android 14 QPR2+, Pixel 8 Pro / Pixel 9 / Samsung S24.' },
+  { icon: '👁️', title: 'ML Kit', description: 'Pre-built ML features: text recognition, barcode, face, pose, translation, smart reply. Cross-device. No model hosting needed.' },
+  { icon: '🔧', title: 'TensorFlow Lite + LiteRT', description: 'Run custom TF models on-device. GPU / NNAPI / NPU accelerated. Escape hatch when ML Kit doesn\'t fit.' },
+  { icon: '🌐', title: 'Media Pipe / MediaPipe Tasks', description: 'High-level APIs for gesture, pose, segmentation — built on TF Lite but easier to use.' }
+]} />
+
+### When to pick which
+
+| Need                                    | Recommended                                            |
+|-----------------------------------------|--------------------------------------------------------|
+| Summarize a news article                | Gemini Nano                                            |
+| Proofread a comment                     | Gemini Nano                                            |
+| Generate smart reply suggestions         | ML Kit Smart Reply                                     |
+| Extract text from a receipt photo        | ML Kit Text Recognition                                |
+| Scan a barcode                          | ML Kit Barcode Scanning                                |
+| Detect faces / smile                    | ML Kit Face Detection                                  |
+| Translate text offline                  | ML Kit Translation                                     |
+| Real-time pose estimation                | MediaPipe Pose                                         |
+| Custom vision model (e.g., product type) | TensorFlow Lite + your model                          |
+| Custom NLP model (e.g., classification) | TensorFlow Lite or Gemini Nano (prompt-engineered)    |
+| Streaming text generation                | Gemini Nano with streaming API                         |
+| Heavy LLM / image gen                   | Server-side (Gemini Pro, OpenAI) — **not** on-device  |
+
+---
+
+## AICore — the Android AI runtime
+
+AICore is a **system-level service** on supported devices (Pixel 8 Pro,
+Pixel 9, Pixel Fold 2, Samsung S24, and a growing list). It hosts
+Gemini Nano and future on-device models:
+
+- **Apps don't embed the model** — AICore hosts it, shared across apps
+- **Download once, used everywhere** — no per-app 3GB download
+- **Automatic updates** via Play Services
+- **Hardware acceleration** — uses the NPU / DSP
+
+### Availability
+
+```kotlin
+class AiCoreAvailability @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    val genAiClient = GenerativeModel(
+        generationConfig = generationConfig {
+            context = context
+            temperature = 0.2f
+            topK = 16
+            maxOutputTokens = 256
+        }
+    )
+
+    suspend fun isAvailable(): Boolean = try {
+        genAiClient.prepareInferenceEngine()
+        true
+    } catch (e: UnsupportedOperationException) {
+        false
+    }
+}
+```
+
+Check at runtime. Fall back to a server-side API for devices without
+AICore.
+
+---
+
+## Privacy by default
+
+<Callout kind="success" title="What on-device gets you for free">
+- **Data never leaves the device** → no server-side attack surface
+- **Works offline** → availability improves
+- **No per-user compliance overhead** → GDPR / HIPAA / COPPA easier
+- **No per-inference cost** → scale is free
+- **User trust** → "runs on your device" is powerful marketing
+</Callout>
+
+Declaring in Play Data Safety:
+
+```yaml
+# Used only on device; not shared
+data_usage:
+  - data_type: user_messages
+    purpose: feature_functionality
+    shared_with: []
+    processing: on_device_only
+    user_deletable: true
+```
+
+---
+
+## The chapter roadmap
+
+<StepList steps={[
+  { title: 'Gemini Nano', description: 'API, prompt engineering, streaming, function calling, response validation.' },
+  { title: 'ML Kit', description: 'Pre-built features: text, barcode, face, pose, translation, smart reply.' },
+  { title: 'TensorFlow Lite + LiteRT', description: 'Custom model integration, GPU / NNAPI delegates, model updates via Play FFS.' }
+]} />
+
+---
+
+## Design patterns for AI features
+
+### 1. The graceful degradation pattern
+
+```kotlin
+class SummarizationService @Inject constructor(
+    private val geminiNano: GenerativeModel?,         // null if unavailable
+    private val serverApi: AiServerApi
+) {
+    suspend fun summarize(text: String): Outcome<String, SummarizationError> {
+        // Try on-device first
+        if (geminiNano != null) {
+            return runCatching {
+                geminiNano.generateContent("Summarize: $text").text.orEmpty()
+            }.map { Outcome.Ok(it) }
+             .getOrElse { Outcome.Err(SummarizationError.OnDeviceFailed) }
+        }
+
+        // Fall back to server
+        return runCatching { serverApi.summarize(text) }
+            .map { Outcome.Ok(it) }
+            .getOrElse { Outcome.Err(SummarizationError.Network) }
+    }
+}
+```
+
+On-device preferred; server fallback for older devices. Transparent to
+the caller.
+
+### 2. The streaming pattern
+
+```kotlin
+// Gemini Nano supports streaming
+fun summarizeStreaming(text: String): Flow<String> = flow {
+    val response = geminiNano.generateContentStream("Summarize: $text")
+    response.collect { chunk ->
+        emit(chunk.text.orEmpty())
+    }
+}
+
+@Composable
+fun SummaryScreen(viewModel: SummaryViewModel = hiltViewModel()) {
+    val summary by viewModel.summary.collectAsStateWithLifecycle()
+    Text(summary, modifier = Modifier.animateContentSize())
+}
+```
+
+Display chunks as they arrive — feels instant even for 500-token
+summaries.
+
+### 3. The cache pattern
+
+AI inference takes 500ms-5s. Cache results by prompt hash:
+
+```kotlin
+class AiCache @Inject constructor(private val dao: AiCacheDao) {
+    suspend fun summarize(text: String, generator: suspend (String) -> String): String {
+        val hash = sha256(text)
+        dao.get(hash)?.let { return it.result }
+
+        val fresh = generator(text)
+        dao.insert(AiCacheEntry(hash = hash, result = fresh, createdAt = now()))
+        return fresh
+    }
+}
+```
+
+Skip re-running inference for the same input (common for summarization of
+unchanged articles).
+
+### 4. The validation pattern
+
+LLMs hallucinate. Always validate outputs:
+
+```kotlin
+suspend fun categorize(text: String): Category {
+    val raw = geminiNano.generateContent(
+        """Classify as one of: FOOD, TECH, SPORTS, OTHER.
+           Text: $text
+           Return only the category name."""
+    ).text?.trim()?.uppercase()
+
+    return Category.values().find { it.name == raw } ?: Category.OTHER
+}
+```
+
+Constrain outputs to an enum. If the LLM returns nonsense, default to a
+safe value.
+
+### 5. The safety guardrail pattern
+
+```kotlin
+suspend fun proofread(userText: String): String {
+    // Check against prompt injection
+    if (userText.contains("ignore previous instructions", ignoreCase = true)) {
+        return userText      // don't feed suspicious text to the model
+    }
+
+    val prompt = "Proofread. Return only the corrected text:\n$userText"
+    val output = geminiNano.generateContent(prompt).text.orEmpty()
+
+    // Validate output isn't dramatically different (likely hallucination)
+    if (output.length > userText.length * 2) return userText
+
+    return output
+}
+```
+
+Defense in depth: input filtering + output validation + user confirmation
+for high-stakes operations.
+
+---
+
+## Performance considerations
+
+- **First inference is slow** (~1-3s) due to model load; subsequent
+  inferences are &lt;500ms
+- **Warm up on app start** if your feature is common
+- **Batch inferences** when possible (classify 10 posts in one prompt,
+  not 10 prompts)
+- **Respect battery** — heavy inference at < 20% battery should prompt
+  or defer
+- **Thermal throttling** — 30+ seconds of sustained LLM inference can
+  trigger thermal limits; monitor via `PowerManager`
+
+---
+
+## Model size and distribution
+
+Gemini Nano is ~3-4 GB on disk. AICore downloads it as a platform
+component:
+- User sees "Downloading Android System Components" occasionally
+- No per-app model download
+- Models auto-update via Play Services
+
+For TF Lite custom models, use **Firebase ML Feature Flag** (Play FFS)
+to download models at runtime — keeps your base APK small.
+
+---
+
+## Observability
+
+```kotlin
+class AiMetrics @Inject constructor(meter: Meter) {
+    private val inferenceDuration = meter.histogramBuilder("ai.inference.duration")
+        .setUnit("ms").ofLongs().build()
+
+    private val inferenceCounter = meter.counterBuilder("ai.inference.total").build()
+
+    private val validationFailures = meter.counterBuilder("ai.validation.failed").build()
+
+    suspend fun <T> trackInference(feature: String, block: suspend () -> T): T {
+        val start = System.currentTimeMillis()
+        return try {
+            val result = block()
+            val duration = System.currentTimeMillis() - start
+            inferenceDuration.record(duration, Attributes.of(AttributeKey.stringKey("feature"), feature))
+            inferenceCounter.add(1, Attributes.of(AttributeKey.stringKey("feature"), feature, AttributeKey.stringKey("result"), "success"))
+            result
+        } catch (t: Throwable) {
+            inferenceCounter.add(1, Attributes.of(AttributeKey.stringKey("feature"), feature, AttributeKey.stringKey("result"), "error"))
+            throw t
+        }
+    }
+}
+```
+
+Track:
+- Inference latency P50/P95/P99 per feature
+- Success / error rate
+- Validation failure rate (output constraints violated)
+- Server fallback rate (when on-device fails)
+
+---
+
+## Testing AI features
+
+### Deterministic inputs
+
+Set `temperature = 0` for deterministic outputs in tests:
+
+```kotlin
+val config = generationConfig {
+    temperature = 0f
+    topK = 1
+    seed = 42
+}
+```
+
+### Golden outputs
+
+```kotlin
+@Test fun summarizes_news_article() = runTest {
+    val article = readFixture("news-article.txt")
+    val expected = readFixture("news-article-summary.txt")
+
+    val actual = summarizer.summarize(article)
+
+    // Fuzzy match — LLMs aren't exact
+    assertTrue(actual.length in 50..200)
+    assertTrue(similarity(actual, expected) > 0.7f)
+}
+```
+
+### Shadow / canary runs
+
+Ship both on-device and server-side inference; log the difference for a
+sample. Gives you a quality signal before switching from server to
+on-device.
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="On-device AI rules">
+- **Gemini Nano** (via AICore) for text generation, summarization, proofreading on Pixel 8+ / Samsung S24+.
+- **ML Kit** for pre-built features — no model hosting, cross-device.
+- **TensorFlow Lite + LiteRT** for custom models; distribute via Firebase ML.
+- **Graceful degradation** — on-device first, server fallback.
+- **Streaming** for LLMs to feel instant.
+- **Cache + validate + guardrail** every AI output.
+- **Respect battery + thermal** — don't run sustained inference on low battery.
+- **Privacy by default** — declare on-device processing in Data Safety.
+</Callout>
+
+## Next
+
+Continue to **[Gemini Nano](./gemini-nano)** for the on-device LLM API,
+or **[ML Kit](./ml-kit-tensorflow)** for pre-built features.

@@ -1,0 +1,692 @@
+---
+id: unit-testing
+title: Unit Testing Deep Dive
+sidebar_label: Unit Testing
+description: JUnit 5 + MockK + Turbine for Kotlin/Android unit tests. Testing ViewModels, use cases, repositories, coroutines, Flow, and mapping logic on the JVM.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Unit Testing Deep Dive
+
+Unit tests run on the JVM — no emulator, no Android framework, no
+Robolectric. They target pure logic: **ViewModels, use cases, mappers,
+reducers, validators**. Done right, they run in seconds and catch 80% of
+bugs before you push the commit.
+
+## The testing stack
+
+| Library                        | Purpose                                        |
+|--------------------------------|------------------------------------------------|
+| **JUnit 5 (Jupiter)**          | Test runner with lifecycle annotations        |
+| **MockK**                      | Kotlin-first mocking                           |
+| **Turbine**                    | Assert on Flow emissions deterministically     |
+| **kotlinx-coroutines-test**    | Virtual time + TestDispatcher                  |
+| **Kotest assertions** (optional)| Rich assertion DSL                            |
+| **AssertJ** (optional)         | Fluent assertions for Java collections         |
+
+```kotlin
+// libs.versions.toml
+junit5    = "5.11.3"
+mockk     = "1.13.13"
+turbine   = "1.2.0"
+coroutines-test = "1.9.0"
+
+junit-jupiter-api    = { module = "org.junit.jupiter:junit-jupiter-api",    version.ref = "junit5" }
+junit-jupiter-engine = { module = "org.junit.jupiter:junit-jupiter-engine", version.ref = "junit5" }
+junit-jupiter-params = { module = "org.junit.jupiter:junit-jupiter-params", version.ref = "junit5" }
+mockk                = { module = "io.mockk:mockk",                        version.ref = "mockk" }
+turbine              = { module = "app.cash.turbine:turbine",              version.ref = "turbine" }
+coroutines-test      = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines-test" }
+
+// build.gradle.kts
+dependencies {
+    testImplementation(libs.junit.jupiter.api)
+    testImplementation(libs.junit.jupiter.params)
+    testRuntimeOnly(libs.junit.jupiter.engine)
+    testImplementation(libs.mockk)
+    testImplementation(libs.turbine)
+    testImplementation(libs.coroutines.test)
+}
+
+tasks.withType<Test> { useJUnitPlatform() }
+```
+
+---
+
+## JUnit 5 basics
+
+```kotlin
+class CartCalculatorTest {
+
+    private val calculator = CartCalculator()
+
+    @Test
+    fun `sums line totals`() {
+        val cart = Cart(items = listOf(
+            CartItem("p1", quantity = 2, unitPriceCents = 1000),
+            CartItem("p2", quantity = 1, unitPriceCents = 500)
+        ))
+
+        val total = calculator.total(cart)
+
+        assertEquals(2500L, total.cents)
+    }
+
+    @Test
+    fun `empty cart returns zero`() {
+        assertEquals(0L, calculator.total(Cart.Empty).cents)
+    }
+
+    @ParameterizedTest
+    @CsvSource(
+        "1, 100, 100",
+        "2, 100, 200",
+        "5, 250, 1250"
+    )
+    fun `quantity times price`(quantity: Int, unit: Long, expectedTotal: Long) {
+        val item = CartItem("p1", quantity, unit)
+        assertEquals(expectedTotal, calculator.total(Cart(listOf(item))).cents)
+    }
+}
+```
+
+### Lifecycle hooks
+
+```kotlin
+class RepositoryTest {
+
+    private lateinit var db: AppDatabase
+    private lateinit var repo: UserRepository
+
+    @BeforeEach
+    fun setUp() {
+        db = AppDatabase.inMemory()
+        repo = UserRepositoryImpl(db.userDao())
+    }
+
+    @AfterEach
+    fun tearDown() { db.close() }
+
+    @BeforeAll
+    @JvmStatic
+    fun allSetup() { /* runs once per class */ }
+
+    @Nested
+    inner class WhenUserExists {
+        @Test fun returns_user() { /* ... */ }
+    }
+}
+```
+
+`@Nested` groups related assertions and shares setup. Makes test output
+(and IDE tree) much clearer than one flat class.
+
+---
+
+## Testing ViewModels
+
+The biggest source of unit test value. A ViewModel test asserts state
+transitions given intents / inputs.
+
+```kotlin
+@ExtendWith(MainDispatcherRule::class)
+class ProductDetailViewModelTest {
+
+    private val repo = mockk<ProductRepository>()
+    private val savedState = SavedStateHandle(mapOf("productId" to "p1"))
+    private lateinit var vm: ProductDetailViewModel
+
+    @BeforeEach
+    fun setUp() {
+        vm = ProductDetailViewModel(repo, savedState)
+    }
+
+    @Test
+    fun `initial state is loading`() = runTest {
+        vm.state.test {
+            val initial = awaitItem()
+            assertTrue(initial.isLoading)
+            assertNull(initial.product)
+        }
+    }
+
+    @Test
+    fun `success transitions to content`() = runTest {
+        coEvery { repo.fetch("p1") } returns sampleProduct
+
+        vm.state.test {
+            assertTrue(awaitItem().isLoading)        // initial
+            vm.load()
+            val success = awaitItem()
+            assertFalse(success.isLoading)
+            assertEquals("Wireless Earbuds", success.product?.name)
+        }
+    }
+
+    @Test
+    fun `network error transitions to error with retry`() = runTest {
+        coEvery { repo.fetch(any()) } throws IOException("no net")
+
+        vm.state.test {
+            awaitItem()                              // initial
+            vm.load()
+            val error = awaitItem()
+            assertTrue(error.error != null)
+            assertFalse(error.isLoading)
+        }
+    }
+}
+
+class MainDispatcherRule(
+    private val dispatcher: TestDispatcher = StandardTestDispatcher()
+) : BeforeEachCallback, AfterEachCallback {
+    override fun beforeEach(ctx: ExtensionContext) { Dispatchers.setMain(dispatcher) }
+    override fun afterEach(ctx: ExtensionContext) { Dispatchers.resetMain() }
+}
+```
+
+---
+
+## Coroutines — `runTest` + TestDispatcher
+
+`runTest` provides a virtual time scheduler. Delays compress to nothing:
+
+```kotlin
+@Test
+fun `debounce waits 300ms`() = runTest {
+    val vm = SearchViewModel()
+
+    vm.onQueryChanged("p")
+    vm.onQueryChanged("pi")
+    vm.onQueryChanged("pix")
+
+    advanceTimeBy(299)
+    assertEquals(0, vm.searchCount)    // still debouncing
+
+    advanceTimeBy(1)
+    runCurrent()
+    assertEquals(1, vm.searchCount)    // fired
+}
+```
+
+Tools:
+
+- `runTest { }` — scope with virtual time
+- `advanceTimeBy(ms)` — fast-forward
+- `runCurrent()` — execute anything due now
+- `advanceUntilIdle()` — run until no pending coroutines
+
+### `StandardTestDispatcher` vs `UnconfinedTestDispatcher`
+
+| | `StandardTestDispatcher`                   | `UnconfinedTestDispatcher`                  |
+|-|---------------------------------------------|---------------------------------------------|
+| When | Queued execution; eager time control   | Immediate execution; simplest setup        |
+| Use | Tests asserting timing / order              | Quick-and-dirty tests; no timing           |
+
+Start with Standard. Switch to Unconfined only when timing isn't a concern
+and Standard makes the setup awkward.
+
+### Injecting dispatchers
+
+```kotlin
+@Qualifier annotation class IoDispatcher
+@Qualifier annotation class DefaultDispatcher
+
+class ImageProcessor @Inject constructor(
+    @IoDispatcher private val io: CoroutineDispatcher,
+    @DefaultDispatcher private val cpu: CoroutineDispatcher
+) {
+    suspend fun process(uri: Uri): Bitmap = withContext(io) { /* ... */ }
+}
+
+// Test
+class ImageProcessorTest {
+    @Test fun test() = runTest {
+        val processor = ImageProcessor(
+            io = StandardTestDispatcher(testScheduler),
+            cpu = StandardTestDispatcher(testScheduler)
+        )
+        // All work runs under testScheduler; advanceUntilIdle() completes it
+    }
+}
+```
+
+Never reference `Dispatchers.IO` directly in testable code. Inject and
+swap for a test dispatcher.
+
+---
+
+## MockK — Kotlin mocking
+
+### Basic mocks
+
+```kotlin
+val repo = mockk<UserRepository>()
+
+// Stub suspend functions with coEvery
+coEvery { repo.fetch("u1") } returns User("u1", "Aarav")
+
+// Stub regular functions
+every { repo.cacheTtl } returns 300_000L
+
+// Throwing
+coEvery { repo.fetch(any()) } throws IOException("no net")
+
+// Return different values on successive calls
+coEvery { repo.fetch("u1") } returnsMany listOf(user1, user2, user3)
+
+// Matchers
+coEvery { repo.save(any()) } returns Unit
+coEvery { repo.save(match { it.name.isNotEmpty() }) } returns Unit
+```
+
+### Verification
+
+```kotlin
+coVerify(exactly = 1) { repo.fetch("u1") }
+coVerify(atLeast = 1) { repo.save(any()) }
+coVerify(exactly = 0) { repo.delete(any()) }    // ensure NOT called
+
+// Verify order
+coVerifyOrder {
+    repo.save(any())
+    repo.fetch(any())
+}
+
+// Confirm no other interactions
+confirmVerified(repo)
+```
+
+### Relaxed mocks
+
+`mockk<T>(relaxed = true)` returns defaults (0, null, empty collections)
+instead of throwing for un-stubbed methods. Handy for mocks where you
+only care about one call.
+
+```kotlin
+val logger = mockk<Logger>(relaxed = true)
+logger.info("hello")   // no stub needed
+```
+
+### Slot captures
+
+```kotlin
+val capturedUser = slot<User>()
+coEvery { repo.save(capture(capturedUser)) } returns Unit
+
+service.createUser(name = "Aarav", email = "a@x.com")
+
+assertEquals("Aarav", capturedUser.captured.name)
+```
+
+### Spying on real instances
+
+```kotlin
+val real = UserService(repo, logger)
+val spy = spyk(real)
+
+every { spy.validate(any()) } returns true    // override only one method
+spy.createUser(...)   // everything else uses the real impl
+```
+
+### Static / top-level functions
+
+```kotlin
+mockkStatic(::currentTimeMillis)
+every { currentTimeMillis() } returns 1_000_000L
+
+// Or mockk for companion objects
+mockkObject(Analytics.Companion)
+every { Analytics.track(any()) } just Runs
+```
+
+### Mocking is a smell in some cases
+
+<Callout kind="tip" title="Fakes vs mocks">
+Mocking every dependency makes tests fragile — a test asserts a specific
+sequence of calls, so any refactor breaks it even if behavior is
+identical. For domain logic, **prefer fakes** (hand-written in-memory
+implementations) over mocks. Use mocks for boundaries (network, database)
+and when you need to inject failures.
+</Callout>
+
+```kotlin
+class FakeUserRepository : UserRepository {
+    private val users = mutableMapOf<UserId, User>()
+    fun seed(user: User) { users[user.id] = user }
+    override suspend fun fetch(id: UserId): User = users[id] ?: error("not seeded")
+    override suspend fun save(user: User) { users[user.id] = user }
+}
+```
+
+Fakes read like what they replace; tests assert observable behavior, not
+interaction patterns.
+
+---
+
+## Turbine — testing Flows
+
+```kotlin
+@Test
+fun `emits loading then success`() = runTest {
+    val flow = productRepository.productResource("p1")
+    flow.test {
+        assertEquals(Resource.Loading, awaitItem())
+        val success = awaitItem() as Resource.Success
+        assertEquals("Wireless Earbuds", success.data.name)
+        awaitComplete()
+    }
+}
+```
+
+Turbine `.test { }` collects from the Flow, letting you assert each
+emission with `awaitItem()`, `awaitComplete()`, `awaitError()`, `cancel()`.
+
+### `testIn(scope)` — when you need background collection
+
+```kotlin
+@Test
+fun `background collection`() = runTest {
+    val flow = viewModel.state.testIn(backgroundScope)
+    // interact with viewModel
+    viewModel.onRefresh()
+    runCurrent()
+    flow.awaitItem()
+    flow.cancel()
+}
+```
+
+### Skipping initial items
+
+```kotlin
+flow.test {
+    skipItems(1)                              // ignore initial state
+    assertEquals(Resource.Success(data), awaitItem())
+}
+```
+
+---
+
+## Testing repositories
+
+Repositories mix network + cache. Test the orchestration:
+
+```kotlin
+class UserRepositoryImplTest {
+
+    private val api = mockk<UserApi>()
+    private val dao = FakeUserDao()
+    private val dispatcher = StandardTestDispatcher()
+    private val repo = UserRepositoryImpl(api, dao, dispatcher)
+
+    @Test
+    fun `fetch caches to dao`() = runTest(dispatcher) {
+        coEvery { api.getUser("u1") } returns UserDto("u1", "Aarav", "a@x.com")
+
+        val user = repo.fetch(UserId("u1"))
+
+        assertEquals("Aarav", user.name)
+        assertNotNull(dao.get("u1"))
+    }
+
+    @Test
+    fun `observe emits from dao after refresh`() = runTest(dispatcher) {
+        coEvery { api.getUser("u1") } returns UserDto("u1", "Aarav", "a@x.com")
+
+        repo.observe(UserId("u1")).test {
+            assertEquals("Aarav", awaitItem().name)
+        }
+    }
+
+    @Test
+    fun `fetch propagates HttpException`() = runTest(dispatcher) {
+        coEvery { api.getUser(any()) } throws HttpException(Response.error<Any>(404, errorBody))
+
+        assertThrows<HttpException> {
+            runBlocking { repo.fetch(UserId("u1")) }
+        }
+    }
+}
+```
+
+---
+
+## Testing mappers
+
+```kotlin
+class UserMapperTest {
+
+    @Test
+    fun `maps DTO with all fields`() {
+        val dto = UserDto(id = "u1", name = "Aarav", email = "a@x.com", createdAtMs = 1_700_000_000_000L)
+        val entity = dto.toEntity(now = 1_700_000_100_000L)
+
+        assertEquals("u1", entity.id)
+        assertEquals("Aarav", entity.name)
+        assertEquals(1_700_000_100_000L, entity.fetchedAt)
+    }
+
+    @Test
+    fun `null name throws`() {
+        val dto = UserDto(id = "u1", name = null, email = "a@x.com", createdAtMs = 0)
+        assertThrows<IllegalStateException> { dto.toEntity() }
+    }
+
+    @ParameterizedTest
+    @MethodSource("edgeCases")
+    fun `handles edge cases`(dto: UserDto, expectedName: String) {
+        assertEquals(expectedName, dto.toEntity(0).name)
+    }
+
+    companion object {
+        @JvmStatic
+        fun edgeCases(): Stream<Arguments> = Stream.of(
+            Arguments.of(UserDto("u1", "  Aarav  ", "a@x.com", 0), "Aarav"),
+            Arguments.of(UserDto("u1", "<b>X</b>", "a@x.com", 0), "X")
+        )
+    }
+}
+```
+
+Mappers are the easiest thing to unit-test. Aim for near-100% coverage on
+them.
+
+---
+
+## Testing error paths
+
+Typed errors make this easy:
+
+```kotlin
+@Test
+fun `returns Err on invalid email`() = runTest {
+    val result = authService.signIn(email = "not-an-email", password = "secret123")
+    assertIs<Outcome.Err<AuthError>>(result)
+    assertEquals(AuthError.InvalidEmail, result.error)
+}
+
+@Test
+fun `returns Err on wrong password`() = runTest {
+    coEvery { api.login(any(), any()) } throws HttpException(Response.error<Any>(401, empty))
+
+    val result = authService.signIn(email = "a@x.com", password = "wrong")
+    assertIs<Outcome.Err<AuthError>>(result)
+    assertEquals(AuthError.WrongPassword, result.error)
+}
+```
+
+Every error case is its own test. Sealed error hierarchies make the list
+exhaustive — the compiler reminds you when you add one.
+
+---
+
+## Kotest — more expressive assertions (optional)
+
+```kotlin
+// libs.versions.toml
+kotest = "5.9.1"
+kotest-runner-junit5   = { module = "io.kotest:kotest-runner-junit5",   version.ref = "kotest" }
+kotest-assertions-core = { module = "io.kotest:kotest-assertions-core", version.ref = "kotest" }
+kotest-property        = { module = "io.kotest:kotest-property",        version.ref = "kotest" }
+```
+
+```kotlin
+class CartTests : FunSpec({
+    test("total") {
+        val cart = Cart(items = listOf(CartItem("p1", 2, 1000)))
+        cart.total().cents shouldBe 2000L
+    }
+
+    test("empty") {
+        Cart.Empty.isEmpty() shouldBe true
+    }
+})
+```
+
+### Property-based testing
+
+```kotlin
+test("total is commutative") {
+    checkAll(Arb.list(Arb.cartItem(), 0..10)) { items ->
+        val cart = Cart(items)
+        val reversed = Cart(items.reversed())
+        cart.total() shouldBe reversed.total()
+    }
+}
+```
+
+Property tests generate thousands of random inputs — often find edge
+cases no human would think to write.
+
+---
+
+## Code coverage with Kover
+
+```kotlin
+// build.gradle.kts
+plugins {
+    id("org.jetbrains.kotlinx.kover") version "0.9.0"
+}
+
+kover {
+    reports {
+        filters {
+            excludes {
+                classes("*Hilt_*", "*_Factory*", "*_MembersInjector")
+                classes("*.databinding.*", "*.di.*Module*")
+                annotatedBy("androidx.compose.runtime.Composable")    // UI preview-only
+            }
+        }
+        verify {
+            rule {
+                minBound(60)                   // project-wide minimum
+            }
+            rule {
+                filters { includes { classes("*.domain.*", "*.data.*") } }
+                minBound(80)                    // higher bar for domain / data
+            }
+        }
+    }
+}
+```
+
+```bash
+./gradlew koverHtmlReport                      # generates HTML at build/reports/kover/html
+./gradlew koverXmlReport                       # for CI
+./gradlew koverVerify                          # fails if below thresholds
+```
+
+<Callout kind="tip" title="Coverage is a diagnostic, not a target">
+Chasing 100% forces you to test getters and generated code — meaningless.
+Target high coverage on **logic modules** (domain, mappers, ViewModels —
+80%+) and accept lower for UI / DI / generated (30-50%).
+</Callout>
+
+---
+
+## Organizing tests
+
+```text
+src/
+├── main/kotlin/                       — production
+├── test/kotlin/                       — JVM unit tests (this chapter)
+├── androidTest/kotlin/                — instrumentation tests (next chapter)
+└── sharedTest/kotlin/                 — tests run in both source sets (rare)
+```
+
+One test class per production class. Test names describe behavior:
+
+```kotlin
+// Bad — describes implementation
+@Test fun test1() { /* ... */ }
+@Test fun testFetchUser() { /* ... */ }
+
+// Good — describes behavior
+@Test fun `returns user when repository succeeds`() { /* ... */ }
+@Test fun `propagates exception on network failure`() { /* ... */ }
+```
+
+Backticked names read in reports like sentences.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Test smells',
+    variant: 'old',
+    points: [
+      'runBlocking instead of runTest (real delays)',
+      'Thread.sleep() in tests',
+      'Mocking types you own (fake them instead)',
+      'One test asserting 15 things (fragile)',
+      'Tests without assertions (only verify calls)',
+      'Shared mutable state between tests'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Solid tests',
+    variant: 'new',
+    points: [
+      'runTest + advanceTimeBy for virtual time',
+      'TestDispatcher injection; no Thread.sleep',
+      'Fakes for your own interfaces; mocks for boundaries',
+      'One assertion per behavior; multiple tests',
+      'assertEquals / assertTrue / shouldBe in every test',
+      '@BeforeEach resets state; no class-level mutable fields'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Unit testing rules">
+- **JUnit 5** with `@ExtendWith` and `@Nested` for clear structure.
+- **runTest + TestDispatcher** for deterministic coroutine tests.
+- **Turbine** for asserting Flow emissions (`awaitItem`, `awaitComplete`).
+- **MockK** for mocking; **fakes** for your own types.
+- **`coEvery` / `coVerify`** for suspend function stubbing / verification.
+- **Inject dispatchers** — no `Dispatchers.IO` in testable code.
+- **Backticked test names** describing behavior, not implementation.
+- **Kover** for coverage with per-module thresholds; target logic, not UI.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Test a ViewModel', description: 'Pick a ViewModel with 3 intents. Write tests for loading, success, and error transitions using Turbine.' },
+  { title: 'Fake a repository', description: 'Replace a mockk<UserRepository> in a test with a FakeUserRepository. Compare readability.' },
+  { title: 'Virtual time debounce', description: 'Test that a 300ms debounce actually waits 300ms by using advanceTimeBy(299) — assert no call — then advanceTimeBy(1) — assert one call.' },
+  { title: 'Parameterized mapper', description: 'Write a @ParameterizedTest for a DTO→Domain mapper with 5+ cases via @CsvSource or @MethodSource.' },
+  { title: 'Kover threshold', description: 'Add Kover with a 70% minimum on :domain module. Run koverVerify and fix any gaps.' }
+]} />
+
+## Next
+
+Continue to **[Instrumentation Testing](./instrumentation-testing)** for device tests, or **[TDD & Code Coverage](./tdd-coverage)** for the methodology.

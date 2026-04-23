@@ -1,0 +1,535 @@
+---
+id: play-billing
+title: Play Billing — IAP & Subscriptions
+sidebar_label: Play Billing
+description: Google Play Billing Library 7 — one-time purchases, subscriptions, base plans, offers, receipt verification, entitlement sync, and real-time developer notifications.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Play Billing — IAP & Subscriptions
+
+Play Billing Library (PBL) is the only allowed way to charge users for
+digital content inside your Android app. This chapter covers the modern
+(v7+) API: queries, launching purchase flows, acknowledging purchases,
+subscription base plans + offers, receipt verification, and the backend
+architecture that makes everything trustworthy.
+
+## What Play Billing is for
+
+| Covered                          | Not covered                               |
+|----------------------------------|-------------------------------------------|
+| Digital goods consumed in-app    | Physical goods (use Google Pay)           |
+| Subscriptions to digital content | Service fees for real-world services     |
+| Unlocking features               | In-person goods                           |
+| Virtual currency                 | Cash payments for external services       |
+
+If unsure: **digital in-app = PBL**. Everything else may use other
+payment methods.
+
+---
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+billing = "7.1.1"
+
+billing-ktx = { module = "com.android.billingclient:billing-ktx", version.ref = "billing" }
+```
+
+```kotlin
+@Singleton
+class BillingClientProvider @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    val client: BillingClient = BillingClient.newBuilder(context)
+        .setListener(purchasesUpdatedListener)
+        .enablePendingPurchases(
+            PendingPurchasesParams.newBuilder()
+                .enableOneTimeProducts()
+                .build()
+        )
+        .build()
+
+    private val purchasesUpdatedListener = PurchasesUpdatedListener { result, purchases ->
+        // Handle purchase updates
+    }
+}
+```
+
+### Connecting
+
+```kotlin
+suspend fun BillingClient.connect() = suspendCoroutine<Unit> { cont ->
+    startConnection(object : BillingClientStateListener {
+        override fun onBillingSetupFinished(result: BillingResult) {
+            if (result.responseCode == BillingResponseCode.OK) cont.resume(Unit)
+            else cont.resumeWithException(BillingException(result))
+        }
+        override fun onBillingServiceDisconnected() {
+            // Retry with exponential backoff
+        }
+    })
+}
+```
+
+The client needs a persistent connection. Reconnect on
+`onBillingServiceDisconnected` — typical pattern is to expose a
+`StateFlow<BillingConnectionState>` and reconnect on disconnects.
+
+---
+
+## Declaring products in Play Console
+
+1. Play Console → Monetization → In-app products / Subscriptions
+2. Create products with stable, documented IDs:
+
+```text
+com.myapp.remove_ads        — one-time, non-consumable
+com.myapp.coins_100         — one-time, consumable
+com.myapp.premium_monthly   — subscription base plan
+com.myapp.premium_yearly    — subscription base plan
+```
+
+### Subscription structure (PBL 5+)
+
+```text
+Subscription Product: premium
+├── Base Plan: monthly    $9.99/mo renewing
+│   ├── Offer: intro     50% off first month
+│   └── Offer: upgrade   free trial when switching from Basic
+└── Base Plan: yearly     $89.99/yr renewing
+    └── Offer: intro     7-day free trial
+```
+
+Multiple base plans (monthly, yearly) under one subscription. Multiple
+offers (intro pricing, free trials, switches) per base plan.
+
+---
+
+## Querying products
+
+```kotlin
+suspend fun BillingClient.queryProducts(productIds: List<String>): List<ProductDetails> {
+    val params = QueryProductDetailsParams.newBuilder()
+        .setProductList(productIds.map {
+            QueryProductDetailsParams.Product.newBuilder()
+                .setProductId(it)
+                .setProductType(BillingClient.ProductType.INAPP)   // or .SUBS
+                .build()
+        })
+        .build()
+
+    val result = queryProductDetails(params)
+    return result.productDetailsList.orEmpty()
+}
+
+// Usage
+val products = client.queryProducts(listOf("com.myapp.remove_ads", "com.myapp.coins_100"))
+products.forEach { product ->
+    Log.d("Billing", "${product.productId}: ${product.oneTimePurchaseOfferDetails?.formattedPrice}")
+}
+```
+
+### For subscriptions — read offers
+
+```kotlin
+val subProducts = client.queryProducts(listOf("premium")).filter { it.productType == "subs" }
+
+subProducts.forEach { product ->
+    product.subscriptionOfferDetails?.forEach { offer ->
+        Log.d("Billing",
+            "Base plan: ${offer.basePlanId}, offer: ${offer.offerId ?: "none"}, " +
+                    "token: ${offer.offerToken}")
+
+        offer.pricingPhases.pricingPhaseList.forEach { phase ->
+            Log.d("Billing",
+                "  Phase: ${phase.formattedPrice} for ${phase.billingCycleCount} " +
+                        "billing cycles, period ${phase.billingPeriod}")
+        }
+    }
+}
+```
+
+Each `offerToken` is required to launch the purchase flow for that specific
+base plan + offer combination.
+
+---
+
+## Launching purchase flow
+
+```kotlin
+fun launchPurchase(activity: Activity, productDetails: ProductDetails, offerToken: String? = null) {
+    val paramsBuilder = BillingFlowParams.ProductDetailsParams.newBuilder()
+        .setProductDetails(productDetails)
+
+    offerToken?.let { paramsBuilder.setOfferToken(it) }
+
+    val flowParams = BillingFlowParams.newBuilder()
+        .setProductDetailsParamsList(listOf(paramsBuilder.build()))
+        .setObfuscatedAccountId(userId.hashed())     // helps with fraud detection
+        .setObfuscatedProfileId(profileId.hashed())
+        .build()
+
+    client.launchBillingFlow(activity, flowParams)
+}
+
+// Result arrives via the PurchasesUpdatedListener registered at client creation
+```
+
+### Handling purchases
+
+```kotlin
+private val purchasesUpdatedListener = PurchasesUpdatedListener { result, purchases ->
+    when (result.responseCode) {
+        BillingResponseCode.OK -> {
+            purchases?.forEach { purchase -> handlePurchase(purchase) }
+        }
+        BillingResponseCode.USER_CANCELED -> {
+            // User backed out — fine
+        }
+        BillingResponseCode.ITEM_ALREADY_OWNED -> {
+            // Existing purchase not consumed / acknowledged
+            scope.launch { restorePurchases() }
+        }
+        else -> {
+            // Network error, service unavailable, etc.
+        }
+    }
+}
+
+private suspend fun handlePurchase(purchase: Purchase) {
+    if (purchase.purchaseState != Purchase.PurchaseState.PURCHASED) return
+
+    // 1. Verify server-side (critical for security)
+    val verified = backend.verifyPurchase(
+        productId = purchase.products.first(),
+        purchaseToken = purchase.purchaseToken
+    )
+    if (!verified) return
+
+    // 2. Grant entitlement
+    entitlementRepo.grant(purchase.products.first(), purchase.purchaseToken)
+
+    // 3. Acknowledge (mandatory within 3 days or purchase reverts)
+    if (!purchase.isAcknowledged) {
+        client.acknowledgePurchase(
+            AcknowledgePurchaseParams.newBuilder()
+                .setPurchaseToken(purchase.purchaseToken)
+                .build()
+        )
+    }
+
+    // 4. For consumables, also consume
+    if (isConsumable(purchase.products.first())) {
+        client.consumePurchase(
+            ConsumeParams.newBuilder().setPurchaseToken(purchase.purchaseToken).build()
+        )
+    }
+}
+```
+
+<Callout kind="warning" title="Acknowledge within 3 days or lose the money">
+Purchases not acknowledged within 3 days are **refunded automatically**.
+This is your safety net against bugs, but in normal flow, acknowledge as
+soon as entitlement is granted.
+</Callout>
+
+---
+
+## Server-side verification
+
+**Never grant entitlement based on client-side success alone.** A rooted
+device can fake success. Always verify with Google Play Developer API from
+your backend:
+
+```javascript
+// Node backend
+const {google} = require('googleapis');
+const androidPublisher = google.androidpublisher({version: 'v3'});
+
+async function verifyPurchase(productId, purchaseToken) {
+  const auth = new google.auth.JWT({
+    keyFile: 'service-account.json',
+    scopes: ['https://www.googleapis.com/auth/androidpublisher']
+  });
+  await auth.authorize();
+
+  const response = await androidPublisher.purchases.products.get({
+    auth,
+    packageName: 'com.myapp',
+    productId,
+    token: purchaseToken
+  });
+
+  // Response: purchaseState (0 = purchased, 1 = canceled, 2 = pending)
+  return response.data.purchaseState === 0;
+}
+
+// For subscriptions
+const sub = await androidPublisher.purchases.subscriptionsv2.get({
+  auth,
+  packageName: 'com.myapp',
+  token: purchaseToken
+});
+// sub.data.subscriptionState, sub.data.lineItems[0].expiryTime, etc.
+```
+
+On the client, store the local purchase but route entitlement through
+backend-verified state.
+
+---
+
+## Real-time Developer Notifications (RTDN)
+
+Subscriptions change state continuously — renewals, cancellations, grace
+periods, expirations. Polling the Play Developer API is slow and
+expensive. **RTDN** pushes events to your backend via Google Cloud Pub/Sub:
+
+```javascript
+// Pub/Sub webhook
+app.post('/pubsub/billing', async (req, res) => {
+  const message = req.body.message;
+  const data = JSON.parse(Buffer.from(message.data, 'base64').toString());
+
+  // data.subscriptionNotification.notificationType — SUBSCRIPTION_RENEWED,
+  // CANCELED, ON_HOLD, IN_GRACE_PERIOD, RECOVERED, etc.
+
+  const subStatus = await androidPublisher.purchases.subscriptionsv2.get({
+    auth, packageName: 'com.myapp',
+    token: data.subscriptionNotification.purchaseToken
+  });
+
+  await db.updateSubscription(subStatus.data);
+  res.status(200).send();
+});
+```
+
+Set up in Play Console → Monetization → Real-time developer notifications.
+Map the product to a Cloud Pub/Sub topic your backend subscribes to.
+
+---
+
+## Consumable vs non-consumable
+
+| Type                        | Behavior                                                   |
+|-----------------------------|------------------------------------------------------------|
+| **Consumable**              | Can be bought repeatedly (coins, hints). Must `consume()` |
+| **Non-consumable**          | Bought once (remove ads, unlock feature). `acknowledge()` only |
+| **Subscription**            | Renewing payment. `acknowledge()` per renewal             |
+
+Declare in Play Console → In-app products → Managed vs Consumable.
+
+---
+
+## Restoring purchases
+
+When a user reinstalls / switches devices, show them their existing
+entitlements:
+
+```kotlin
+suspend fun restorePurchases() {
+    val result = client.queryPurchasesAsync(
+        QueryPurchasesParams.newBuilder()
+            .setProductType(BillingClient.ProductType.INAPP)
+            .build()
+    )
+
+    result.purchasesList
+        .filter { it.purchaseState == Purchase.PurchaseState.PURCHASED }
+        .forEach { handlePurchase(it) }
+
+    // Also query subs
+    val subs = client.queryPurchasesAsync(
+        QueryPurchasesParams.newBuilder()
+            .setProductType(BillingClient.ProductType.SUBS)
+            .build()
+    )
+    subs.purchasesList.forEach { handlePurchase(it) }
+}
+```
+
+Call this on app start (after billing client connects) and from a "Restore
+purchases" button in settings.
+
+---
+
+## Entitlement store — your app's view
+
+```kotlin
+@Serializable
+data class Entitlements(
+    val removeAds: Boolean = false,
+    val premium: Premium? = null,
+    val coins: Int = 0
+) {
+    @Serializable
+    data class Premium(
+        val basePlan: String,                 // "monthly" or "yearly"
+        val expiresAtMs: Long,
+        val autoRenewing: Boolean,
+        val inGracePeriod: Boolean,
+        val onHold: Boolean
+    ) {
+        val isActive: Boolean get() = System.currentTimeMillis() < expiresAtMs
+    }
+}
+
+@Singleton
+class EntitlementRepository @Inject constructor(
+    private val dataStore: DataStore<Entitlements>,
+    private val backend: BillingBackend
+) {
+    val entitlements: Flow<Entitlements> = dataStore.data
+
+    suspend fun refreshFromBackend() {
+        val fresh = backend.getEntitlements()
+        dataStore.updateData { fresh }
+    }
+
+    suspend fun grant(productId: String, token: String) {
+        val verified = backend.verifyPurchase(productId, token)
+        if (verified) refreshFromBackend()
+    }
+}
+```
+
+Expose `entitlements: Flow<Entitlements>` throughout your app. UI gates
+premium features based on observed state.
+
+---
+
+## Upgrade / downgrade / cross-grade
+
+```kotlin
+// User on monthly wants yearly
+val yearlyProduct = queryProduct("premium")
+val yearlyOfferToken = yearlyProduct.subscriptionOfferDetails!!.first { it.basePlanId == "yearly" }.offerToken
+
+val params = BillingFlowParams.newBuilder()
+    .setProductDetailsParamsList(listOf(
+        BillingFlowParams.ProductDetailsParams.newBuilder()
+            .setProductDetails(yearlyProduct)
+            .setOfferToken(yearlyOfferToken)
+            .build()
+    ))
+    .setSubscriptionUpdateParams(
+        BillingFlowParams.SubscriptionUpdateParams.newBuilder()
+            .setOldPurchaseToken(currentMonthlyToken)
+            .setSubscriptionReplacementMode(
+                BillingFlowParams.SubscriptionReplacementMode.CHARGE_PRORATED_PRICE
+            )
+            .build()
+    )
+    .build()
+
+client.launchBillingFlow(activity, params)
+```
+
+### Replacement modes
+
+| Mode                              | Behavior                                            |
+|-----------------------------------|-----------------------------------------------------|
+| `CHARGE_PRORATED_PRICE`           | Charge prorated difference now; start new plan     |
+| `WITHOUT_PRORATION`               | New plan starts at next billing; no charge now     |
+| `CHARGE_FULL_PRICE`               | Charge full new price now; apply unused credit     |
+| `DEFERRED`                        | Start new plan at end of current billing period    |
+| `WITH_TIME_PRORATION`             | Extend subscription length proportional to credit  |
+
+Pick per the UX you want — most apps use `CHARGE_PRORATED_PRICE` for
+upgrades and `WITHOUT_PRORATION` for downgrades.
+
+---
+
+## Testing with license testers
+
+Play Console → Setup → License testing → Add tester email.
+
+Testers can:
+- Purchase with "test card, always approves" / "test card, always declines"
+- Cancel subscriptions immediately via the Play Store app
+- Test subscriptions on accelerated schedule (day = 5 min, week = 30 min, etc.)
+
+Never test with real money on prod SKUs — use the fake cards.
+
+---
+
+## Pricing tiers and taxes
+
+Play Console sets the list price; Google collects country-appropriate tax
+automatically (shown to the user). The developer gets the **net** price
+minus Play's cut (15-30%).
+
+Your code sees the **formatted price** via `ProductDetails` — always use
+that, never hardcode:
+
+```kotlin
+// GOOD
+Text("Buy for ${productDetails.oneTimePurchaseOfferDetails!!.formattedPrice}")
+
+// BAD — wrong in EUR, JPY, etc.
+Text("Buy for $${price.toDouble() / 100}")
+```
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Billing mistakes',
+    variant: 'old',
+    points: [
+      'Granting entitlement on client-side success alone',
+      'Forgetting to acknowledge (purchase reverts in 3 days)',
+      'Hardcoded prices instead of formattedPrice',
+      'Polling Play Developer API for subscription state',
+      'No restorePurchases on new device / reinstall',
+      'One billing client instance per Activity'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production billing',
+    variant: 'new',
+    points: [
+      'Server-side verification via Play Developer API',
+      'acknowledge() / consume() immediately after granting',
+      'productDetails.*.formattedPrice always',
+      'Real-time developer notifications via Pub/Sub',
+      'queryPurchasesAsync on launch + "Restore" button',
+      '@Singleton BillingClient with reconnect logic'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Play Billing rules">
+- **Server-side verification** is non-negotiable; clients lie.
+- **Acknowledge within 3 days** or purchase reverts.
+- **Subscription structure**: Product → Base Plans → Offers.
+- **Real-time notifications** via Pub/Sub for renewals / cancels / grace periods.
+- **Entitlement store** (DataStore / backend) as the source of truth; UI gates on it.
+- **Restore purchases** on install + explicit button.
+- **Hardcoded prices are a localization bug** — always use `formattedPrice`.
+- **License testers** with fake cards — never real money in testing.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Buy a non-consumable', description: 'Create a remove_ads one-time product. Implement queryProducts, launchBillingFlow, acknowledge, and grant via Entitlements.' },
+  { title: 'Subscription with offers', description: 'Create a premium subscription with monthly + yearly base plans, plus an intro offer. Display offers with their pricing phases.' },
+  { title: 'Server verification', description: 'Set up a verifyPurchase endpoint on your backend using Play Developer API. Route all grants through it.' },
+  { title: 'RTDN webhook', description: 'Configure a Pub/Sub topic in Play Console. Build a backend webhook that updates entitlement state on renewal / cancel notifications.' },
+  { title: 'Restore purchases', description: 'Add queryPurchasesAsync on app start + a Settings button. Confirm entitlements restore after reinstall.' }
+]} />
+
+## Next
+
+Continue to **[App Bundles & Dynamic Delivery](./app-bundles)** for AAB, split APKs, asset packs, and Play Feature Delivery.

@@ -1,0 +1,630 @@
+---
+id: workmanager
+title: WorkManager Deep Dive
+sidebar_label: WorkManager
+description: WorkManager — one-time, periodic, expedited, long-running workers; constraints, chaining, input/output data, observers, and testing.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# WorkManager Deep Dive
+
+WorkManager is the Android-blessed way to schedule reliable background
+work. It replaces `JobScheduler`, `AlarmManager`, `GcmNetworkManager`,
+`SyncAdapter`, `IntentService`, and `Executors` for anything that must
+survive process death, reboot, or Doze. If a user-initiated action needs
+to complete "eventually" — sync an upload, process an image, retry a
+failed request — it goes through WorkManager.
+
+## When to use what
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│  Need to run WHILE the app is foreground, tied to UI?          │
+│    → viewModelScope.launch { }                                 │
+│                                                                │
+│  Need to run in the NEXT few seconds, even if app backgrounded?│
+│    → Foreground Service                                        │
+│                                                                │
+│  Need to run "eventually" (next hour, next network)?           │
+│    → WorkManager                                               │
+│                                                                │
+│  Need to run AT a specific wall-clock time (9:00 AM)?          │
+│    → AlarmManager                                              │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+workmanager = "2.10.0"
+hilt-work = "1.2.0"
+
+work-runtime-ktx = { module = "androidx.work:work-runtime-ktx", version.ref = "workmanager" }
+work-testing     = { module = "androidx.work:work-testing", version.ref = "workmanager" }
+hilt-work        = { module = "androidx.hilt:hilt-work", version.ref = "hilt-work" }
+hilt-compiler    = { module = "androidx.hilt:hilt-compiler", version.ref = "hilt-work" }
+```
+
+```kotlin
+@HiltAndroidApp
+class MyApp : Application(), Configuration.Provider {
+    @Inject lateinit var workerFactory: HiltWorkerFactory
+
+    override val workManagerConfiguration: Configuration
+        get() = Configuration.Builder()
+            .setWorkerFactory(workerFactory)
+            .setMinimumLoggingLevel(if (BuildConfig.DEBUG) Log.DEBUG else Log.INFO)
+            .build()
+}
+```
+
+```xml
+<!-- AndroidManifest — disable default init; we provide our own Configuration -->
+<provider
+    android:name="androidx.startup.InitializationProvider"
+    android:authorities="${applicationId}.androidx-startup"
+    tools:node="merge">
+    <meta-data
+        android:name="androidx.work.WorkManagerInitializer"
+        android:value="androidx.startup"
+        tools:node="remove"/>
+</provider>
+```
+
+---
+
+## Worker types
+
+### CoroutineWorker — the default
+
+```kotlin
+@HiltWorker
+class SyncWorker @AssistedInject constructor(
+    @Assisted ctx: Context,
+    @Assisted params: WorkerParameters,
+    private val repository: ProductRepository,
+    private val crashReporter: CrashReporter
+) : CoroutineWorker(ctx, params) {
+
+    override suspend fun doWork(): Result {
+        val since = inputData.getLong("since", 0L)
+
+        return try {
+            val synced = repository.syncSince(since)
+            Result.success(workDataOf("synced_count" to synced))
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: IOException) {
+            // Transient — retry with backoff
+            Result.retry()
+        } catch (e: Throwable) {
+            crashReporter.recordException(e)
+            Result.failure(workDataOf("error" to (e.message ?: "Unknown")))
+        }
+    }
+}
+```
+
+### CoroutineWorker with progress
+
+```kotlin
+class UploadWorker @AssistedInject constructor(
+    @Assisted ctx: Context,
+    @Assisted params: WorkerParameters
+) : CoroutineWorker(ctx, params) {
+
+    override suspend fun doWork(): Result {
+        val fileUri = inputData.getString("uri")?.toUri() ?: return Result.failure()
+        val bytes = fileUri.readBytes(applicationContext)
+        var uploaded = 0L
+
+        bytes.chunked(CHUNK_SIZE).forEach { chunk ->
+            uploadChunk(chunk)
+            uploaded += chunk.size
+            setProgress(workDataOf(
+                "progress" to uploaded,
+                "total" to bytes.size.toLong()
+            ))
+        }
+        return Result.success()
+    }
+}
+```
+
+### Long-running foreground workers
+
+For work that can't be interrupted (large uploads, continuous sync), make
+the worker **foreground** so the OS doesn't kill it:
+
+```kotlin
+class VideoUploadWorker @AssistedInject constructor(
+    @Assisted ctx: Context,
+    @Assisted params: WorkerParameters
+) : CoroutineWorker(ctx, params) {
+
+    override suspend fun doWork(): Result {
+        setForeground(createForegroundInfo("Uploading 0%"))
+        // ...
+    }
+
+    override suspend fun getForegroundInfo(): ForegroundInfo = createForegroundInfo("Uploading…")
+
+    private fun createForegroundInfo(text: String): ForegroundInfo {
+        val notification = NotificationCompat.Builder(applicationContext, "uploads")
+            .setContentTitle("Uploading video")
+            .setContentText(text)
+            .setSmallIcon(R.drawable.ic_upload)
+            .setProgress(100, 0, true)
+            .build()
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ForegroundInfo(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            ForegroundInfo(NOTIF_ID, notification)
+        }
+    }
+}
+```
+
+```xml
+<!-- AndroidManifest — declare the foreground service type -->
+<application>
+    <service
+        android:name="androidx.work.impl.foreground.SystemForegroundService"
+        android:foregroundServiceType="dataSync"
+        android:exported="false"
+        tools:node="merge"/>
+</application>
+```
+
+Android 14+ requires a `foregroundServiceType` for every foreground
+service. Pick the right one: `dataSync`, `mediaPlayback`, `location`, etc.
+
+---
+
+## Enqueueing work
+
+### One-time work
+
+```kotlin
+val request = OneTimeWorkRequestBuilder<SyncWorker>()
+    .setInputData(workDataOf("since" to lastSync))
+    .setConstraints(
+        Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .setRequiresBatteryNotLow(true)
+            .build()
+    )
+    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+    .addTag("sync")
+    .build()
+
+WorkManager.getInstance(context).enqueue(request)
+```
+
+### Unique work — deduplicate
+
+```kotlin
+WorkManager.getInstance(context).enqueueUniqueWork(
+    uniqueWorkName = "product_sync",
+    existingWorkPolicy = ExistingWorkPolicy.KEEP,   // or REPLACE / APPEND / APPEND_OR_REPLACE
+    request = syncRequest
+)
+```
+
+- `KEEP` — if a worker with this name is pending, ignore the new one
+- `REPLACE` — cancel the pending one, enqueue the new one
+- `APPEND` — chain after the pending one
+- `APPEND_OR_REPLACE` — chain, but replace if the pending one cancelled
+
+### Periodic work (minimum interval: 15 minutes)
+
+```kotlin
+val periodicRequest = PeriodicWorkRequestBuilder<CleanupWorker>(
+    repeatInterval = 6, repeatIntervalTimeUnit = TimeUnit.HOURS,
+    flexTimeInterval = 1, flexTimeIntervalUnit = TimeUnit.HOURS
+).setConstraints(Constraints.Builder()
+    .setRequiresBatteryNotLow(true)
+    .setRequiresDeviceIdle(true)
+    .build()
+).build()
+
+WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+    uniqueWorkName = "daily_cleanup",
+    existingPeriodicWorkPolicy = ExistingPeriodicWorkPolicy.KEEP,
+    request = periodicRequest
+)
+```
+
+### Expedited work (high-priority, runs within 10 minutes)
+
+```kotlin
+val expedited = OneTimeWorkRequestBuilder<NotificationWorker>()
+    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+    .build()
+```
+
+Expedited quota is per-app, per-day. If quota is exhausted, the worker
+runs as regular. Use for user-visible actions (message send) where lag
+hurts UX.
+
+---
+
+## Chaining workers
+
+```kotlin
+val wm = WorkManager.getInstance(context)
+
+wm.beginWith(decodeRequest)
+    .then(resizeRequest)
+    .then(uploadRequest)
+    .enqueue()
+
+// Diamond (multiple inputs)
+wm.beginWith(listOf(compressAudio, compressVideo))
+    .then(muxRequest)
+    .then(uploadRequest)
+    .enqueue()
+```
+
+Output of one worker becomes input of the next:
+
+```kotlin
+// In worker A
+Result.success(workDataOf("resized_uri" to resizedUri.toString()))
+
+// In worker B
+val uri = inputData.getString("resized_uri")?.toUri()
+```
+
+If any chained worker fails, downstream workers are cancelled.
+
+---
+
+## Observing work
+
+### From ViewModel
+
+```kotlin
+class UploadViewModel @Inject constructor(
+    @ApplicationContext context: Context
+) : ViewModel() {
+    private val wm = WorkManager.getInstance(context)
+
+    val uploadState: StateFlow<WorkInfo.State?> = wm
+        .getWorkInfosForUniqueWorkFlow("upload_${userId}")
+        .map { infos -> infos.firstOrNull()?.state }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    fun upload(fileUri: Uri) {
+        val request = OneTimeWorkRequestBuilder<UploadWorker>()
+            .setInputData(workDataOf("uri" to fileUri.toString()))
+            .build()
+        wm.enqueueUniqueWork("upload_${userId}", ExistingWorkPolicy.REPLACE, request)
+    }
+
+    fun cancel() {
+        wm.cancelUniqueWork("upload_${userId}")
+    }
+}
+
+@Composable
+fun UploadProgress(viewModel: UploadViewModel = hiltViewModel()) {
+    val state by viewModel.uploadState.collectAsStateWithLifecycle()
+    when (state) {
+        WorkInfo.State.RUNNING -> LinearProgressIndicator()
+        WorkInfo.State.SUCCEEDED -> Text("Done")
+        WorkInfo.State.FAILED -> Text("Failed")
+        WorkInfo.State.CANCELLED -> Text("Cancelled")
+        else -> {}
+    }
+}
+```
+
+### Progress observation
+
+```kotlin
+val progressFlow = wm.getWorkInfoByIdFlow(requestId)
+    .mapNotNull { info ->
+        if (info.state == WorkInfo.State.RUNNING) {
+            val progress = info.progress
+            Progress(
+                uploaded = progress.getLong("progress", 0),
+                total = progress.getLong("total", -1)
+            )
+        } else null
+    }
+```
+
+---
+
+## Cancellation
+
+```kotlin
+// By unique name
+wm.cancelUniqueWork("upload_123")
+
+// By tag
+wm.cancelAllWorkByTag("sync")
+
+// By ID
+wm.cancelWorkById(request.id)
+
+// Everything
+wm.cancelAllWork()
+```
+
+Cancellation flows through coroutine cancellation in the worker — `doWork`
+will throw `CancellationException` at the next suspension point.
+
+---
+
+## Input / output data
+
+```kotlin
+// Input — limited to primitives, arrays, and Strings. Max 10 KB.
+val data = workDataOf(
+    "userId" to "u1",
+    "retryCount" to 0,
+    "urls" to arrayOf("https://...", "https://...")
+)
+
+// Output same shape
+Result.success(workDataOf("orderId" to "o1", "itemCount" to 3L))
+```
+
+<Callout kind="warning" title="Don't pass large data through Data">
+10 KB limit. For large inputs (files, parsed JSON), save to disk or DB
+and pass a URI / ID through `Data`. Otherwise the worker will crash with
+`IllegalStateException`.
+</Callout>
+
+---
+
+## Constraints
+
+```kotlin
+val constraints = Constraints.Builder()
+    .setRequiredNetworkType(NetworkType.UNMETERED)       // Wi-Fi only
+    .setRequiresCharging(true)
+    .setRequiresBatteryNotLow(true)
+    .setRequiresDeviceIdle(true)                          // only when device is idle
+    .setRequiresStorageNotLow(true)
+    .addContentUriTrigger(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true)
+    .build()
+```
+
+Workers are deferred until **all** constraints are satisfied. If
+`setRequiresDeviceIdle(true)` + `setRequiresCharging(true)`, the work
+runs while the phone is charging and idle — typically overnight.
+
+### Network types
+
+| `NetworkType`        | When it runs                                  |
+|----------------------|------------------------------------------------|
+| `NOT_REQUIRED`       | Any network state                              |
+| `CONNECTED`          | Any connected network (Wi-Fi or mobile)        |
+| `UNMETERED`          | Wi-Fi or unmetered (won't use mobile data)     |
+| `METERED`            | Metered only (rare)                            |
+| `NOT_ROAMING`        | Connected and not roaming                      |
+
+---
+
+## Backoff & retry policies
+
+```kotlin
+.setBackoffCriteria(
+    backoffPolicy = BackoffPolicy.EXPONENTIAL,
+    backoffDelay = 30, backoffDelayTimeUnit = TimeUnit.SECONDS
+)
+```
+
+- `LINEAR` — retry after N, 2N, 3N, ... seconds
+- `EXPONENTIAL` — retry after N, 2N, 4N, 8N, ... seconds (capped at 5 hours)
+
+Default backoff: 30 seconds exponential. Retries run for up to 10 attempts
+by default (use `.setBackoffCriteria` + monitor `runAttemptCount`).
+
+```kotlin
+override suspend fun doWork(): Result {
+    if (runAttemptCount >= MAX_ATTEMPTS) {
+        return Result.failure(workDataOf("reason" to "max attempts"))
+    }
+    /* ... */
+}
+```
+
+---
+
+## Replacing AsyncTask / IntentService migration
+
+| Legacy                   | WorkManager replacement                       |
+|--------------------------|-----------------------------------------------|
+| `AsyncTask`              | `viewModelScope.launch` OR `CoroutineWorker`  |
+| `IntentService`          | `CoroutineWorker` (probably with foreground)  |
+| `JobIntentService`       | `CoroutineWorker`                              |
+| `SyncAdapter`            | Periodic `CoroutineWorker` + Constraints      |
+| `GcmNetworkManager`      | Periodic `CoroutineWorker`                    |
+| `AlarmManager` (non-clock)| Periodic `CoroutineWorker`                   |
+| `AlarmManager` (exact time)| `AlarmManager` still valid for alarms      |
+
+---
+
+## Testing
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class SyncWorkerTest {
+    private lateinit var context: Context
+
+    @Before fun setup() {
+        context = ApplicationProvider.getApplicationContext()
+        val config = Configuration.Builder()
+            .setMinimumLoggingLevel(Log.DEBUG)
+            .setExecutor(SynchronousExecutor())
+            .build()
+        WorkManagerTestInitHelper.initializeTestWorkManager(context, config)
+    }
+
+    @Test fun sync_success() {
+        val request = OneTimeWorkRequestBuilder<SyncWorker>()
+            .setInputData(workDataOf("since" to 0L))
+            .build()
+
+        val wm = WorkManager.getInstance(context)
+        wm.enqueue(request).result.get()
+
+        val info = wm.getWorkInfoById(request.id).get()
+        assertEquals(WorkInfo.State.SUCCEEDED, info.state)
+    }
+
+    @Test fun sync_retries_on_network_failure() {
+        val driver = WorkManagerTestInitHelper.getTestDriver(context)!!
+        val request = OneTimeWorkRequestBuilder<SyncWorker>()
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .build()
+
+        WorkManager.getInstance(context).enqueue(request).result.get()
+
+        driver.setAllConstraintsMet(request.id)
+        // ... assert retry
+    }
+}
+```
+
+### Testing a CoroutineWorker directly
+
+```kotlin
+@Test fun doWork_returns_success() = runTest {
+    val worker = TestListenableWorkerBuilder<SyncWorker>(context)
+        .setInputData(workDataOf("since" to 0L))
+        .setWorkerFactory(object : WorkerFactory() {
+            override fun createWorker(
+                appContext: Context, workerClassName: String, workerParameters: WorkerParameters
+            ): ListenableWorker = SyncWorker(appContext, workerParameters, fakeRepo, fakeCrashReporter)
+        })
+        .build()
+
+    val result = worker.doWork()
+    assertEquals(Result.success(), result)
+}
+```
+
+---
+
+## Common patterns
+
+### Outbox pattern (offline-first writes)
+
+See [Offline-First Architecture](/docs/architecture-patterns/offline-first).
+Client inserts into a local outbox table; WorkManager flushes it to the
+backend when network is available.
+
+### Device-wide periodic sync
+
+```kotlin
+// Called once in Application.onCreate
+val sync = PeriodicWorkRequestBuilder<SyncWorker>(6, TimeUnit.HOURS)
+    .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+    .build()
+
+WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+    "background_sync",
+    ExistingPeriodicWorkPolicy.KEEP,
+    sync
+)
+```
+
+### Media processing pipeline
+
+```kotlin
+wm.beginWith(decodeRequest)
+    .then(resizeRequest)
+    .then(watermarkRequest)
+    .then(uploadRequest)
+    .enqueue()
+```
+
+Break heavy work into chained workers. Each can retry independently with
+its own backoff.
+
+### Push → WorkManager → local state update
+
+```kotlin
+// In FCM service
+override fun onMessageReceived(message: RemoteMessage) {
+    if (message.data["sync"] == "true") {
+        val req = OneTimeWorkRequestBuilder<SyncWorker>()
+            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            .build()
+        WorkManager.getInstance(applicationContext).enqueue(req)
+    }
+}
+```
+
+Push triggers sync, worker runs expedited, Flow in UI updates.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'WorkManager mistakes',
+    variant: 'old',
+    points: [
+      'Using for short foreground-only work (wasteful)',
+      'No unique name — multiple duplicate workers pile up',
+      'Large inputData (> 10 KB)',
+      'Not re-throwing CancellationException',
+      'Foreground worker without correct foregroundServiceType',
+      'No backoff — retries every 30s forever'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production patterns',
+    variant: 'new',
+    points: [
+      'viewModelScope for screen-scoped work',
+      'enqueueUniqueWork with ExistingWorkPolicy',
+      'Pass IDs / URIs in inputData; large data via DB',
+      'Re-throw CancellationException; return Result.retry() on transients',
+      'Declare foregroundServiceType in manifest',
+      'EXPONENTIAL backoff + maxAttempts check'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="WorkManager rules">
+- **Use it** for any work that must survive process death or run across Doze.
+- **CoroutineWorker** is the default; **foreground worker** for user-visible long-running work.
+- **enqueueUniqueWork** with `ExistingWorkPolicy` — no duplicates.
+- **Chain with `beginWith().then()`** for pipelines; outputs flow as inputs.
+- **Constraints + backoff** — the OS decides when, you decide how to retry.
+- **Observe via Flow** from ViewModel; surface progress in the UI.
+- **Test with `WorkManagerTestInitHelper`** + `SynchronousExecutor`.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Outbox flush', description: 'Build an OutboxWorker that reads pending rows from Room and POSTs them. Retry with EXPONENTIAL backoff on IOException.' },
+  { title: 'Periodic sync', description: 'Schedule a 6-hour periodic sync with network + battery constraints. Verify it runs through Doze.' },
+  { title: 'Chained pipeline', description: 'Chain decode → resize → watermark → upload workers. Pass output URIs as inputData between them.' },
+  { title: 'Foreground upload', description: 'Build a foreground upload worker with progress notifications. Declare foregroundServiceType=dataSync.' },
+  { title: 'Test with helper', description: 'Write a test using WorkManagerTestInitHelper. Verify a worker succeeds and produces expected output data.' }
+]} />
+
+## Next
+
+Continue to **[Services & Notifications](./services-notifications)** for the full foreground service story, or **[Permissions & Biometric](./permissions-biometric)** for runtime permissions.

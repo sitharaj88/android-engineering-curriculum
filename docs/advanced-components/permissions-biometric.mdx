@@ -1,0 +1,544 @@
+---
+id: permissions-biometric
+title: Permissions & Biometric
+sidebar_label: Permissions & Biometric
+description: Runtime permissions on Android 13+/14+, rationale UX, permission groups, location background, media partial access, and biometric authentication with BiometricPrompt.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Permissions & Biometric
+
+Modern Android permissions are **runtime** — declared in the manifest
+but requested when needed. Android 13+ added per-media-type permissions;
+Android 14+ added **partial photo access**. Biometric authentication is
+its own separate system built on the Android Keystore.
+
+## Permission lifecycle
+
+```text
+Manifest declaration → Runtime request (Compose / Activity Result API) →
+Granted / Denied / Permanently denied → Use the protected API
+                                           ↑
+                             Handle SecurityException gracefully
+```
+
+You **must** declare permissions in the manifest; otherwise runtime
+requests silently fail.
+
+---
+
+## Requesting permissions in Compose
+
+### Single permission
+
+```kotlin
+@Composable
+fun CameraButton(onCameraReady: () -> Unit) {
+    val context = LocalContext.current
+    var showRationale by remember { mutableStateOf(false) }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) onCameraReady()
+        else if (ActivityCompat.shouldShowRequestPermissionRationale(
+                context as Activity, Manifest.permission.CAMERA)
+        ) {
+            showRationale = true       // user denied once; re-explain
+        } else {
+            // Permanently denied — open Settings
+            openAppSettings(context)
+        }
+    }
+
+    Button(onClick = {
+        when {
+            ContextCompat.checkSelfPermission(
+                context, Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED -> onCameraReady()
+
+            (context as Activity).shouldShowRequestPermissionRationale(Manifest.permission.CAMERA) -> {
+                showRationale = true
+            }
+
+            else -> permissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }) { Text("Take photo") }
+
+    if (showRationale) {
+        AlertDialog(
+            onDismissRequest = { showRationale = false },
+            title = { Text("Camera needed") },
+            text = { Text("We use the camera to capture product barcodes. Nothing is stored.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showRationale = false
+                    permissionLauncher.launch(Manifest.permission.CAMERA)
+                }) { Text("Allow") }
+            },
+            dismissButton = { TextButton(onClick = { showRationale = false }) { Text("Not now") } }
+        )
+    }
+}
+
+fun openAppSettings(context: Context) {
+    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+        data = Uri.fromParts("package", context.packageName, null)
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+    }
+    context.startActivity(intent)
+}
+```
+
+### Multiple permissions
+
+```kotlin
+val launcher = rememberLauncherForActivityResult(
+    ActivityResultContracts.RequestMultiplePermissions()
+) { results ->
+    val allGranted = results.all { it.value }
+    if (allGranted) { /* ... */ }
+}
+
+Button(onClick = {
+    launcher.launch(arrayOf(
+        Manifest.permission.CAMERA,
+        Manifest.permission.RECORD_AUDIO
+    ))
+}) { Text("Start video call") }
+```
+
+### Accompanist PermissionState (popular wrapper)
+
+```kotlin
+// libs.versions.toml
+accompanist-permissions = { module = "com.google.accompanist:accompanist-permissions", version = "0.36.0" }
+
+@OptIn(ExperimentalPermissionsApi::class)
+@Composable
+fun CameraScreen() {
+    val perm = rememberPermissionState(Manifest.permission.CAMERA)
+
+    when {
+        perm.status.isGranted -> CameraPreview()
+        perm.status.shouldShowRationale -> RationaleView(onAllow = { perm.launchPermissionRequest() })
+        else -> RequestView(onRequest = { perm.launchPermissionRequest() })
+    }
+}
+```
+
+<Callout kind="tip" title="Accompanist is convenient, but the plain Activity Result API is often cleaner">
+For a single permission flow, the plain launcher + `checkSelfPermission`
+avoids an extra dependency. Use Accompanist when you need permission
+state cached across rotations or want a declarative abstraction.
+</Callout>
+
+---
+
+## Android 13+ media permissions
+
+Pre-13 — one permission (`READ_EXTERNAL_STORAGE`) gave access to all media.
+13+ splits it by type:
+
+```xml
+<!-- Android 13+ -->
+<uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+<uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+<uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
+
+<!-- Android 12 and below -->
+<uses-permission
+    android:name="android.permission.READ_EXTERNAL_STORAGE"
+    android:maxSdkVersion="32"/>
+```
+
+### Android 14+ partial access
+
+Users can grant access to **selected** photos/videos instead of all:
+
+```xml
+<uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED"/>
+```
+
+```kotlin
+val permissions = buildList {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        add(Manifest.permission.READ_MEDIA_IMAGES)
+        add(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
+    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        add(Manifest.permission.READ_MEDIA_IMAGES)
+    } else {
+        add(Manifest.permission.READ_EXTERNAL_STORAGE)
+    }
+}
+```
+
+Even better: **use Photo Picker** for "pick an image" flows — no
+permission required. See [Files & MediaStore](/docs/data-persistence/files-and-media).
+
+---
+
+## Location permissions
+
+```xml
+<!-- Coarse: ~2 km radius -->
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+
+<!-- Fine: GPS-level accuracy -->
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+
+<!-- Background (Android 10+) — separate approval -->
+<uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
+```
+
+Users can:
+- Grant **coarse or fine** (Android 12+ lets them pick; ask for coarse if that's enough)
+- Grant **"while using the app"** vs **"only this time"** (Android 10+)
+- Grant **background** separately — redirects to Settings app, can't be prompted
+
+### The correct background flow
+
+1. Ask for foreground location (`ACCESS_FINE_LOCATION`) in context
+2. Start the feature using location
+3. After user sees value, ask separately for background via Settings intent
+4. Never ask for both in one request — system rejects it
+
+```kotlin
+fun requestBackgroundLocation(activity: Activity) {
+    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+        data = Uri.fromParts("package", activity.packageName, null)
+    }
+    activity.startActivity(intent)
+    // Show an in-app message: "Select 'Allow all the time' in Permissions"
+}
+```
+
+### Approximate-only fallback
+
+If the user granted only coarse location, accept it:
+
+```kotlin
+val hasFine = ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION) == PERMISSION_GRANTED
+val hasCoarse = ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_COARSE_LOCATION) == PERMISSION_GRANTED
+
+val priority = if (hasFine) Priority.PRIORITY_HIGH_ACCURACY else Priority.PRIORITY_BALANCED_POWER_ACCURACY
+```
+
+---
+
+## Notification permission (Android 13+)
+
+Covered in [Services & Notifications](./services-notifications). Quick
+reference:
+
+```kotlin
+if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+    launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+}
+```
+
+Ask in context (after user opts in to push for a feature), never at
+first launch.
+
+---
+
+## Special / sensitive permissions
+
+These require extra steps beyond a runtime dialog:
+
+| Permission                              | Mechanism                                       |
+|-----------------------------------------|-------------------------------------------------|
+| `SYSTEM_ALERT_WINDOW` (overlay)         | `ACTION_MANAGE_OVERLAY_PERMISSION` Settings     |
+| `WRITE_SETTINGS`                        | `ACTION_MANAGE_WRITE_SETTINGS` Settings         |
+| `SCHEDULE_EXACT_ALARM`                  | `ACTION_REQUEST_SCHEDULE_EXACT_ALARM` (Android 14+) |
+| `USE_EXACT_ALARM` (auto-granted Android 13+, if declared) | —                     |
+| `PACKAGE_USAGE_STATS`                   | Usage access Settings screen                    |
+| Accessibility service                   | User enables from Accessibility settings        |
+| `MANAGE_EXTERNAL_STORAGE`               | Special Settings screen, Play-restricted        |
+
+### Exact alarms (Android 14+)
+
+```kotlin
+val alarmMgr = context.getSystemService(AlarmManager::class.java)
+if (!alarmMgr.canScheduleExactAlarms()) {
+    context.startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM).apply {
+        data = Uri.fromParts("package", context.packageName, null)
+    })
+}
+```
+
+Exact alarms are tightly restricted; Google rejects apps that request
+them without a clock/calendar use case.
+
+---
+
+## Health Connect permissions
+
+```xml
+<uses-permission android:name="android.permission.health.READ_STEPS"/>
+<uses-permission android:name="android.permission.health.WRITE_STEPS"/>
+<uses-permission android:name="android.permission.health.READ_HEART_RATE"/>
+```
+
+Requires the Health Connect app installed (pre-Android 14; bundled after).
+Request via the Health Connect SDK:
+
+```kotlin
+val permissions = setOf(
+    HealthPermission.getReadPermission(StepsRecord::class),
+    HealthPermission.getWritePermission(StepsRecord::class)
+)
+
+val launcher = rememberLauncherForActivityResult(
+    PermissionController.createRequestPermissionResultContract()
+) { granted -> /* ... */ }
+
+launcher.launch(permissions)
+```
+
+See [Module 12 — Wear OS & Health Connect](/docs/advanced-trending/overview).
+
+---
+
+## Biometric authentication
+
+### The stack
+
+- **BiometricPrompt** — the official API; handles fingerprint, face,
+  iris across vendors.
+- **Hardware-backed keys** — Keystore keys that require biometric auth
+  for each use.
+- **Crypto object** — links the biometric auth to a specific crypto
+  operation.
+
+### Check availability
+
+```kotlin
+fun biometricStatus(context: Context): BiometricAvailability {
+    val manager = BiometricManager.from(context)
+    return when (manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)) {
+        BiometricManager.BIOMETRIC_SUCCESS -> BiometricAvailability.Available
+        BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE -> BiometricAvailability.NoHardware
+        BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> BiometricAvailability.HardwareUnavailable
+        BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> BiometricAvailability.NotEnrolled
+        BiometricManager.BIOMETRIC_ERROR_SECURITY_UPDATE_REQUIRED -> BiometricAvailability.UpdateRequired
+        else -> BiometricAvailability.Unknown
+    }
+}
+
+sealed interface BiometricAvailability {
+    data object Available : BiometricAvailability
+    data object NoHardware : BiometricAvailability
+    data object HardwareUnavailable : BiometricAvailability
+    data object NotEnrolled : BiometricAvailability
+    data object UpdateRequired : BiometricAvailability
+    data object Unknown : BiometricAvailability
+}
+```
+
+### Authenticator strengths
+
+| Strength                 | What it accepts                                   |
+|--------------------------|---------------------------------------------------|
+| `BIOMETRIC_STRONG` (Class 3) | Strong biometric (most fingerprint sensors, Pixel Face Unlock) |
+| `BIOMETRIC_WEAK` (Class 2)   | Face Unlock on older devices                   |
+| `DEVICE_CREDENTIAL`      | PIN/Pattern/Password fallback                      |
+
+For **crypto-backed auth** (protecting Keystore keys), use `BIOMETRIC_STRONG`.
+For **app unlock** (no crypto), `BIOMETRIC_WEAK or DEVICE_CREDENTIAL` is OK.
+
+### Simple prompt (no crypto binding)
+
+```kotlin
+fun authenticateForUnlock(activity: FragmentActivity, onSuccess: () -> Unit) {
+    val executor = ContextCompat.getMainExecutor(activity)
+    val callback = object : BiometricPrompt.AuthenticationCallback() {
+        override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+            onSuccess()
+        }
+        override fun onAuthenticationError(code: Int, errString: CharSequence) {
+            // USER_CANCELED, LOCKOUT, etc.
+        }
+    }
+
+    val prompt = BiometricPrompt(activity, executor, callback)
+    val info = BiometricPrompt.PromptInfo.Builder()
+        .setTitle("Unlock")
+        .setSubtitle("Confirm it's you")
+        .setAllowedAuthenticators(
+            BiometricManager.Authenticators.BIOMETRIC_STRONG or
+                    BiometricManager.Authenticators.DEVICE_CREDENTIAL
+        )
+        .build()
+
+    prompt.authenticate(info)
+}
+```
+
+### Crypto-bound prompt (unlocks a Keystore key)
+
+```kotlin
+fun createBiometricKey() {
+    val spec = KeyGenParameterSpec.Builder(
+        "payment_key",
+        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+    )
+        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+        .setUserAuthenticationRequired(true)
+        .setUserAuthenticationParameters(
+            0,                                     // must auth for every use
+            KeyProperties.AUTH_BIOMETRIC_STRONG
+        )
+        .setInvalidatedByBiometricEnrollment(true)
+        .build()
+
+    val keyGen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+    keyGen.init(spec)
+    keyGen.generateKey()
+}
+
+suspend fun authorizePayment(activity: FragmentActivity, payload: ByteArray): ByteArray =
+    suspendCancellableCoroutine { cont ->
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val key = keyStore.getKey("payment_key", null) as SecretKey
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key) }
+
+        val prompt = BiometricPrompt(
+            activity,
+            ContextCompat.getMainExecutor(activity),
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    val authedCipher = result.cryptoObject!!.cipher!!
+                    val ciphertext = authedCipher.doFinal(payload)
+                    cont.resume(ciphertext)
+                }
+                override fun onAuthenticationError(code: Int, errString: CharSequence) {
+                    cont.resumeWithException(BiometricException(code, errString.toString()))
+                }
+            }
+        )
+
+        val info = BiometricPrompt.PromptInfo.Builder()
+            .setTitle("Authorize payment")
+            .setSubtitle("Confirm ₹3,499 charge")
+            .setNegativeButtonText("Cancel")
+            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+            .build()
+
+        prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
+    }
+
+class BiometricException(val code: Int, override val message: String) : Exception(message)
+```
+
+The cipher only becomes usable **after** successful biometric auth —
+nobody can decrypt by bypassing the prompt.
+
+### Handling errors
+
+| Code                                      | Meaning                                      |
+|-------------------------------------------|----------------------------------------------|
+| `ERROR_USER_CANCELED`                     | User dismissed prompt                        |
+| `ERROR_NEGATIVE_BUTTON`                   | User tapped the cancel button                |
+| `ERROR_LOCKOUT`                           | Too many failed attempts; wait 30 seconds    |
+| `ERROR_LOCKOUT_PERMANENT`                 | Must use device credential to unlock         |
+| `ERROR_NO_BIOMETRICS`                     | No biometrics enrolled                       |
+| `ERROR_HW_UNAVAILABLE`                    | Hardware temporarily unavailable             |
+| `ERROR_UNABLE_TO_PROCESS`                 | Sensor failed to read                        |
+
+### Setting up biometric with new enrollment
+
+When a user enrolls a new fingerprint, keys created with
+`setInvalidatedByBiometricEnrollment(true)` are deleted — prompting a
+re-enrollment flow. This prevents "a friend adds their fingerprint and
+can use my saved keys".
+
+---
+
+## Storing permission state
+
+Some permission decisions persist; surfacing them in UI helps users
+understand what's granted:
+
+```kotlin
+class PermissionStateStore @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val dataStore: DataStore<Preferences>
+) {
+    private object Keys {
+        val CAMERA_REQUESTED_AT = longPreferencesKey("camera_requested_at")
+        val BACKGROUND_LOCATION_SHOWN_COUNT = intPreferencesKey("bg_location_shown")
+    }
+
+    suspend fun markRequested(permission: String) {
+        dataStore.edit { it[Keys.CAMERA_REQUESTED_AT] = System.currentTimeMillis() }
+    }
+
+    fun hasPermission(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+}
+```
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Permission mistakes',
+    variant: 'old',
+    points: [
+      'Asking all permissions on splash screen',
+      'Asking background location in one request with foreground',
+      'No rationale UI — just another dialog',
+      'Crashing on SecurityException instead of handling',
+      'Using deprecated FingerprintManager instead of BiometricPrompt',
+      'Reusing Keystore keys across users on one device'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production patterns',
+    variant: 'new',
+    points: [
+      'Ask in context (when feature is used)',
+      'Request foreground first, then background via Settings intent',
+      'Show rationale before a second request; Settings on permanent denial',
+      'Wrap permission checks; degrade feature gracefully',
+      'BiometricPrompt with Authenticators.BIOMETRIC_STRONG',
+      'Delete Keystore entries on user sign-out'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Permissions & biometric rules">
+- **Declare in manifest + request at runtime** — both required.
+- **Ask in context**, not at splash. Explain *why* via rationale.
+- **Android 13+** per-media-type permissions; **Photo Picker** avoids needing them.
+- **Background location** is a two-step flow — never in one request.
+- **POST_NOTIFICATIONS** runtime permission on Android 13+; ask when user opts into push.
+- **BiometricPrompt** is the only biometric API to use; FingerprintManager is deprecated.
+- **Crypto-bound prompts** link biometric auth to a Keystore key — payments, secrets.
+- **`setInvalidatedByBiometricEnrollment(true)`** prevents "new fingerprint = key access".
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Contextual camera request', description: 'Implement a camera flow that checks permission, shows a rationale dialog if denied once, and opens Settings on permanent denial.' },
+  { title: 'Partial photo access', description: 'Use READ_MEDIA_VISUAL_USER_SELECTED on Android 14+. Fall back to full READ_MEDIA_IMAGES on 13. Fall back to READ_EXTERNAL_STORAGE below.' },
+  { title: 'Biometric unlock', description: 'Build an \"Unlock app\" screen using BiometricPrompt with BIOMETRIC_STRONG or DEVICE_CREDENTIAL. Show error reasons for lockout / no enrollment.' },
+  { title: 'Crypto-bound payment', description: 'Create a biometric-bound Keystore AES key. Require biometric before encrypting a payment payload. Verify invalidation on new fingerprint enroll.' },
+  { title: 'Audit permissions', description: 'List every runtime permission your app requests. For each, document when you ask and what fallback you provide if denied.' }
+]} />
+
+## Next
+
+Continue to **[CameraX & Sensors](./camerax-sensors)** for camera and sensor integration.

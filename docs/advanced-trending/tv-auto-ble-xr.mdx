@@ -1,0 +1,532 @@
+---
+id: tv-auto-ble-xr
+title: Android TV, Auto, BLE & XR
+sidebar_label: TV, Auto, BLE, XR
+description: Android TV with Compose for TV, Android Auto / Automotive OS, Bluetooth Low Energy (BLE), Nearby Connections, and Android XR (AR/VR headsets).
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Android TV, Auto, BLE & XR
+
+Android runs on more than phones and watches. This chapter covers the
+rest of the platform ecosystem: **Android TV** (living rooms), **Android
+Auto / Automotive OS** (cars), **BLE and Nearby** (IoT and peer devices),
+and **Android XR** (the newest platform — AR/VR headsets). For each, the
+fundamentals and the 2025-best-practice patterns.
+
+## Android TV
+
+### Leanback vs Compose for TV
+
+Historically, TV apps used the **Leanback** library — XML + Fragment-heavy.
+Modern apps use **Compose for TV** (`androidx.tv.*`):
+
+```kotlin
+// libs.versions.toml
+tv-foundation   = { module = "androidx.tv:tv-foundation", version = "1.0.0-alpha11" }
+tv-material     = { module = "androidx.tv:tv-material", version = "1.0.0" }
+```
+
+```kotlin
+@Composable
+fun TvApp() {
+    TvMaterialTheme {
+        Surface(Modifier.fillMaxSize()) {
+            BrowsingPane()
+        }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun BrowsingPane() {
+    TvLazyColumn(modifier = Modifier.fillMaxSize()) {
+        item { NavigationDrawer() }
+
+        items(categories) { category ->
+            Column {
+                Text(category.name, style = MaterialTheme.typography.headlineSmall)
+
+                TvLazyRow {
+                    items(category.items) { item ->
+                        TvCard(
+                            onClick = { play(item) },
+                            modifier = Modifier.size(240.dp, 135.dp)
+                        ) {
+                            AsyncImage(model = item.thumbnail, contentDescription = null)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+### D-pad focus — the TV challenge
+
+TV has **no touch**; users navigate with a remote's D-pad. Every
+interactive element needs focus management.
+
+Compose for TV handles focus traversal automatically for most layouts.
+Customize with `Modifier.focusRestorer()`, `focusProperties`:
+
+```kotlin
+@Composable
+fun TvCard(onClick: () -> Unit) {
+    Card(
+        onClick = onClick,
+        modifier = Modifier
+            .focusProperties {
+                previous = previousFocusRequester
+                next = nextFocusRequester
+            }
+            .focusable()
+            .onFocusChanged { /* animate focus */ },
+        colors = CardDefaults.colors(
+            containerColor = Color.Transparent,
+            focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant
+        )
+    ) { /* ... */ }
+}
+```
+
+### Manifest — declare TV support
+
+```xml
+<uses-feature
+    android:name="android.software.leanback"
+    android:required="false"/>
+<uses-feature
+    android:name="android.hardware.touchscreen"
+    android:required="false"/>
+
+<application android:banner="@drawable/app_banner">
+    <activity
+        android:name=".TvMainActivity"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
+        </intent-filter>
+    </activity>
+</application>
+```
+
+`android:banner` is the 320x180 icon shown on the home screen — required
+for TV apps.
+
+### Media playback — ExoPlayer
+
+TV apps mostly play media. Use **Media3 / ExoPlayer**:
+
+```kotlin
+val player = ExoPlayer.Builder(context).build().apply {
+    setMediaItem(MediaItem.fromUri(streamUri))
+    prepare()
+    playWhenReady = true
+}
+
+AndroidView(
+    factory = { ctx -> PlayerView(ctx).apply { this.player = player } },
+    modifier = Modifier.fillMaxSize()
+)
+```
+
+DRM (Widevine), subtitle tracks, DASH/HLS manifests — all handled by
+Media3 out of the box. See [Media3 & ExoPlayer](/docs/performance/overview)
+for the full media pipeline.
+
+### Publishing
+
+Play Console has a separate track for TV apps. Required:
+- Banner image (320x180)
+- Screenshots at TV resolution (1920x1080)
+- Declared input methods (D-pad, game controller)
+
+---
+
+## Android Auto vs Android Automotive OS
+
+### Two different targets
+
+| | Android Auto                          | Android Automotive OS                  |
+|-|---------------------------------------|----------------------------------------|
+| Where | Phone projects to car display   | Full OS runs on car hardware          |
+| App runs on | Phone                           | Car                                    |
+| Examples | 2015-2024 cars + Google apps   | Polestar, Volvo XC40, Ford Mach-E     |
+| Your app | Uses Car App Library            | Native Automotive app with extra permissions |
+
+Most teams target **Android Auto** (phone-projected) first. Automotive
+OS is a secondary target.
+
+### Car App Library
+
+```kotlin
+// libs.versions.toml
+car-app = { module = "androidx.car.app:app", version = "1.7.0" }
+car-app-projected = { module = "androidx.car.app:app-projected", version = "1.7.0" }
+```
+
+```kotlin
+class MyCarAppService : CarAppService() {
+    override fun createHostValidator(): HostValidator =
+        HostValidator.ALLOW_ALL_HOSTS_VALIDATOR   // use allow-list in prod
+
+    override fun onCreateSession(): Session = MainSession()
+}
+
+class MainSession : Session() {
+    override fun onCreateScreen(intent: Intent): Screen = MainScreen(carContext)
+}
+
+class MainScreen(ctx: CarContext) : Screen(ctx) {
+    override fun onGetTemplate(): Template {
+        return ListTemplate.Builder()
+            .setTitle("Home")
+            .setSingleList(ItemList.Builder().apply {
+                addItem(Row.Builder()
+                    .setTitle("Navigation")
+                    .setOnClickListener { screenManager.push(NavScreen(carContext)) }
+                    .build())
+                addItem(Row.Builder()
+                    .setTitle("Music")
+                    .setOnClickListener { screenManager.push(MusicScreen(carContext)) }
+                    .build())
+            }.build())
+            .setHeaderAction(Action.APP_ICON)
+            .build()
+    }
+}
+```
+
+```xml
+<service
+    android:name=".MyCarAppService"
+    android:exported="true">
+    <intent-filter>
+        <action android:name="androidx.car.app.CarAppService"/>
+        <category android:name="androidx.car.app.category.NAVIGATION"/>
+    </intent-filter>
+    <meta-data
+        android:name="androidx.car.app.minCarApiLevel"
+        android:value="1"/>
+</service>
+```
+
+### Car App Library — key templates
+
+- `ListTemplate` — scrollable list (playlists, places)
+- `PaneTemplate` — key-value pairs (settings, now-playing)
+- `PlaceListMapTemplate` — list alongside a map (nav destinations)
+- `NavigationTemplate` — turn-by-turn navigation
+- `MessageTemplate` — important message with actions
+- `SignInTemplate` — sign-in screens (PIN, QR)
+
+The Car App Library is **template-based, not Compose** — cars display a
+restricted, safety-tested UI; apps can't render arbitrary Compose.
+
+### Automotive OS extensions
+
+For Automotive OS (full OS in the car), apps can additionally:
+- Run as **services** (media playback, navigation, assistants)
+- Access vehicle properties (`CarPropertyManager`): speed, fuel, climate
+- Publish media to the car's built-in system
+
+---
+
+## Bluetooth Low Energy (BLE)
+
+BLE is for connecting to sensors, fitness equipment, smart locks, IoT
+beacons. Modern Android uses **Kotlin coroutine wrappers** over the
+legacy `BluetoothGatt` callbacks.
+
+### Permissions (Android 12+)
+
+```xml
+<uses-feature android:name="android.hardware.bluetooth_le" android:required="true"/>
+
+<!-- Android 12+ -->
+<uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+    android:usesPermissionFlags="neverForLocation"/>
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+<uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE"/>
+
+<!-- Older Android -->
+<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
+<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30"/>
+```
+
+### Scanning for devices
+
+```kotlin
+class BleScanner @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    private val bluetoothManager = context.getSystemService(BluetoothManager::class.java)
+    private val scanner = bluetoothManager.adapter.bluetoothLeScanner
+
+    @SuppressLint("MissingPermission")
+    fun scan(serviceUuid: ParcelUuid): Flow<BleDevice> = callbackFlow {
+        val callback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                trySend(BleDevice(
+                    name = result.device.name ?: "Unknown",
+                    address = result.device.address,
+                    rssi = result.rssi
+                ))
+            }
+            override fun onScanFailed(errorCode: Int) { close(BleException("Scan failed: $errorCode")) }
+        }
+
+        val filters = listOf(ScanFilter.Builder().setServiceUuid(serviceUuid).build())
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+
+        scanner.startScan(filters, settings, callback)
+        awaitClose { scanner.stopScan(callback) }
+    }
+}
+
+data class BleDevice(val name: String, val address: String, val rssi: Int)
+```
+
+### Connecting and reading
+
+```kotlin
+class BleClient @Inject constructor(@ApplicationContext private val context: Context) {
+
+    @SuppressLint("MissingPermission")
+    fun connect(device: BluetoothDevice, serviceUuid: UUID, charUuid: UUID): Flow<ByteArray> = callbackFlow {
+        val gatt = device.connectGatt(context, false, object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    gatt.discoverServices()
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    close()
+                }
+            }
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                val char = gatt.getService(serviceUuid)?.getCharacteristic(charUuid)
+                char?.let {
+                    gatt.setCharacteristicNotification(it, true)
+                    val descriptor = it.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+                    gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                }
+            }
+            override fun onCharacteristicChanged(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, value: ByteArray) {
+                trySend(value)
+            }
+        })
+
+        awaitClose {
+            gatt.disconnect()
+            gatt.close()
+        }
+    }
+}
+```
+
+### Recommended libraries
+
+- **Nordic Android BLE Library** (`no.nordicsemi.android:ble`) — excellent,
+  battle-tested wrapper with sequential operations
+- **Kable** (`com.juul.kable:core`) — pure Kotlin/Flow API across KMP
+
+For production BLE, use one of these rather than raw `BluetoothGatt` —
+the callback soup is error-prone.
+
+---
+
+## Nearby Connections
+
+For peer-to-peer without pairing (phone-to-phone, multiplayer games):
+
+```kotlin
+// libs.versions.toml
+nearby-connections = { module = "com.google.android.gms:play-services-nearby", version = "19.3.0" }
+```
+
+```kotlin
+val client = Nearby.getConnectionsClient(context)
+
+// Advertise (receiver)
+client.startAdvertising(
+    "MyDevice",
+    SERVICE_ID,
+    connectionLifecycleCallback,
+    AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+)
+
+// Discover (sender)
+client.startDiscovery(
+    SERVICE_ID,
+    endpointDiscoveryCallback,
+    DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+)
+
+// Connect
+client.requestConnection("MyDevice", endpointId, connectionLifecycleCallback)
+
+// Send payload once connected
+client.sendPayload(endpointId, Payload.fromBytes(bytes))
+```
+
+Nearby Connections uses Bluetooth + Wi-Fi Direct under the hood, picks
+the best transport automatically. Good for:
+- LAN party / local multiplayer
+- File transfer between phones
+- Appliance pairing
+
+---
+
+## Android XR
+
+Android XR is Google's platform for AR/VR headsets — announced 2024, with
+Samsung's Galaxy XR as the first consumer device. Uses **Jetpack Compose
++ extensions for spatial UI**.
+
+### Setup
+
+```kotlin
+// libs.versions.toml
+xr-scene-core      = { module = "androidx.xr.scenecore:scenecore", version = "1.0.0-alpha04" }
+xr-compose         = { module = "androidx.xr.compose:compose", version = "1.0.0-alpha04" }
+xr-arcore          = { module = "androidx.xr.arcore:arcore", version = "1.0.0-alpha04" }
+```
+
+### Three modes
+
+1. **Home space** — 2D UI floating in 3D; apps can run as windows
+2. **Full space** — immersive; your app gets the full 3D environment
+3. **Pass-through** — blended real + virtual
+
+### Spatial Compose
+
+```kotlin
+@Composable
+fun MyXrApp() {
+    Subspace {    // opts into 3D coordinates
+        SpatialPanel(
+            size = DpVolumeSize(width = 800.dp, height = 600.dp, depth = 0.dp),
+            pose = Pose(Vector3(0f, 0f, -2f))        // 2 meters in front of user
+        ) {
+            ShoppingCatalog()
+        }
+
+        SpatialPanel(
+            pose = Pose(Vector3(1.5f, 0f, -2f)),
+            rotation = Quaternion.fromEuler(0f, -30f, 0f)
+        ) {
+            ShoppingCart()
+        }
+    }
+}
+```
+
+The same Compose code renders as a floating 2D panel in XR. Two-pane apps
+become two **independent floating panels** users can arrange.
+
+### 3D models with ARCore
+
+```kotlin
+@Composable
+fun Model3D(assetPath: String) {
+    val session = LocalSession.current
+
+    GltfModel(
+        modelPath = assetPath,
+        modifier = SubspaceModifier
+            .movable()
+            .resizable()
+            .offset(x = 0.dp, y = 0.dp, z = (-1).dp)
+    )
+}
+```
+
+### Hand tracking and gestures
+
+XR devices track hands. Compose-XR translates gaze + pinch into click
+events for standard composables — no changes needed to make an existing
+app "work" in XR.
+
+For custom gestures (grab, rotate, scale), use the spatial gesture API:
+
+```kotlin
+Modifier.pointerInput(Unit) {
+    detectTransformGestures { _, pan, zoom, rotation ->
+        // pan, zoom, rotation now include 3D dimensions
+    }
+}
+```
+
+### Status — early days
+
+XR is alpha. Galaxy XR launched in 2025; other devices shortly after.
+For apps wanting to be on the first wave, start with Compose-XR today —
+the SDK is forward-compatible but not yet ideal for production without
+Google's support.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Platform-specific mistakes',
+    variant: 'old',
+    points: [
+      'Porting phone UI to TV without D-pad focus work',
+      'Custom Compose UI for Android Auto (will be rejected)',
+      'Raw BluetoothGatt callbacks (spaghetti)',
+      'Nearby Connections without service ID matching',
+      'Asking BLE permissions without neverForLocation flag',
+      'Hardcoded hand-gestures in Compose XR'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Modern patterns',
+    variant: 'new',
+    points: [
+      'Compose for TV with focus management APIs',
+      'Car App Library templates (predefined, safety-tested)',
+      'Nordic BLE or Kable library wrappers',
+      'Declare service UUIDs + advertise with tags',
+      'Android 12+: usesPermissionFlags=neverForLocation',
+      'Let Compose-XR translate gaze/pinch to standard click'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Platform ecosystem rules">
+- **Android TV** uses Compose for TV + D-pad focus; banner + Leanback launcher in manifest.
+- **Android Auto** uses Car App Library templates, not Compose; **Automotive OS** gets native + vehicle properties.
+- **BLE**: declare Android 12+ permissions with `neverForLocation`; use Nordic or Kable over raw `BluetoothGatt`.
+- **Nearby Connections** for peer-to-peer without pairing — great for LAN + local multiplayer.
+- **Android XR** extends Compose with `Subspace` + `SpatialPanel` — same Kotlin code, 3D presentation.
+- **Media3 / ExoPlayer** is the standard video stack across TV, Auto, and phone.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'TV browse pane', description: 'Build a Compose-for-TV BrowsingPane with horizontal rows of cards. Verify D-pad navigation works end-to-end.' },
+  { title: 'Car App Library', description: 'Create a simple CarAppService with a ListTemplate showing 3 destinations. Test via Desktop Head Unit (DHU).' },
+  { title: 'BLE scan', description: 'Write a BleScanner.scan(serviceUuid) Flow using Nordic BLE library. Scan for heart-rate sensors (service 0x180D).' },
+  { title: 'Nearby Connections demo', description: 'Two phones: one advertises, one discovers. Once connected, send a Payload.fromBytes between them.' },
+  { title: 'XR spatial panel', description: 'Wrap your existing app in Subspace. Show the primary screen as a SpatialPanel 2m in front. Confirm it works in the XR emulator.' }
+]} />
+
+## Next
+
+Return to **[Module 12 Overview](./overview)** or continue to
+**[Module 13 — Version Control & Collaboration](/docs/version-control/overview)**.

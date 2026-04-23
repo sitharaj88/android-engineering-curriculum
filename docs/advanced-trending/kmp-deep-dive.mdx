@@ -1,0 +1,616 @@
+---
+id: kmp-deep-dive
+title: Kotlin Multiplatform Deep Dive
+sidebar_label: Kotlin Multiplatform
+description: KMP architecture — expect/actual, source sets, sharing domain + data layers across Android and iOS, Ktor + SQLDelight + kotlinx.serialization stack.
+---
+
+import { Callout, ComparisonCard, StepList, Diagram, KmpSharedModuleDiagram } from '@site/src/components/Doc';
+
+# Kotlin Multiplatform Deep Dive
+
+Kotlin Multiplatform (KMP) lets you write **one codebase** that compiles
+to JVM, iOS (via Kotlin/Native), Desktop, and Web. For most mobile teams
+the win is sharing **domain + data layers** between Android and iOS —
+writing business logic once, with platform-specific UI.
+
+## What KMP is (and isn't)
+
+<ComparisonCard
+  left={{
+    label: 'KMP is',
+    title: 'Realistic scope',
+    variant: 'new',
+    points: [
+      'Share domain logic (entities, use cases, formulas)',
+      'Share data layer (Ktor + SQLDelight + Serialization)',
+      'Share networking + parsing + caching',
+      'Platform UI (Compose on Android, SwiftUI on iOS)',
+      'Or share UI too via Compose Multiplatform (separate chapter)'
+    ]
+  }}
+  right={{
+    label: 'KMP isn\'t',
+    title: 'Misconceptions',
+    variant: 'old',
+    points: [
+      'A full cross-platform UI framework by itself',
+      'Like React Native — you still write two UIs',
+      'Zero iOS effort — setup and debugging have a learning curve',
+      'A way to avoid writing Swift — you\'ll still write some',
+      'Suitable for teams with no iOS expertise'
+    ]
+  }}
+/>
+
+---
+
+## The source set model
+
+<Diagram title="KMP source sets" caption="Code flows from common down to platform-specific modules; actuals bind expects.">
+  <KmpSharedModuleDiagram />
+</Diagram>
+
+```text
+commonMain/            — pure Kotlin, no platform APIs
+  ↓ inherits from
+  androidMain/         — JVM + Android APIs
+  iosMain/             — Kotlin/Native + iOS framework interop
+    ↓ inherits from
+    iosArm64Main/      — real device
+    iosX64Main/        — simulator (Intel Macs)
+    iosSimulatorArm64Main/ — simulator (Apple Silicon)
+```
+
+Tests mirror this: `commonTest`, `androidUnitTest`, `iosTest`.
+
+---
+
+## Setup — `shared` module
+
+```kotlin
+// build.gradle.kts (shared module)
+plugins {
+    alias(libs.plugins.kotlin.multiplatform)
+    alias(libs.plugins.android.library)
+    alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.sqldelight)
+}
+
+kotlin {
+    androidTarget {
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_17)
+        }
+    }
+
+    listOf(iosX64(), iosArm64(), iosSimulatorArm64()).forEach { target ->
+        target.binaries.framework {
+            baseName = "Shared"
+            isStatic = true
+        }
+    }
+
+    sourceSets {
+        commonMain.dependencies {
+            implementation(libs.kotlinx.coroutines.core)
+            implementation(libs.kotlinx.serialization.json)
+            implementation(libs.ktor.client.core)
+            implementation(libs.ktor.client.content.negotiation)
+            implementation(libs.ktor.serialization.kotlinx.json)
+            implementation(libs.sqldelight.runtime)
+            implementation(libs.sqldelight.coroutines.extensions)
+        }
+
+        androidMain.dependencies {
+            implementation(libs.ktor.client.okhttp)
+            implementation(libs.sqldelight.android.driver)
+        }
+
+        iosMain.dependencies {
+            implementation(libs.ktor.client.darwin)
+            implementation(libs.sqldelight.native.driver)
+        }
+
+        commonTest.dependencies {
+            implementation(libs.kotlin.test)
+            implementation(libs.kotlinx.coroutines.test)
+        }
+    }
+}
+
+android {
+    namespace = "com.myapp.shared"
+    compileSdk = 35
+    defaultConfig { minSdk = 24 }
+}
+
+sqldelight {
+    databases {
+        create("AppDatabase") {
+            packageName.set("com.myapp.shared.db")
+        }
+    }
+}
+```
+
+---
+
+## expect / actual — platform primitives
+
+When code needs platform-specific behavior, declare `expect` in
+`commonMain` and provide `actual` per platform:
+
+```kotlin
+// commonMain/kotlin/Platform.kt
+expect class Platform() {
+    val name: String
+}
+
+expect fun currentTimeMillis(): Long
+
+expect fun randomUUID(): String
+```
+
+```kotlin
+// androidMain/kotlin/Platform.kt
+actual class Platform actual constructor() {
+    actual val name: String = "Android ${android.os.Build.VERSION.SDK_INT}"
+}
+
+actual fun currentTimeMillis(): Long = System.currentTimeMillis()
+
+actual fun randomUUID(): String = java.util.UUID.randomUUID().toString()
+```
+
+```kotlin
+// iosMain/kotlin/Platform.kt
+import platform.UIKit.UIDevice
+
+actual class Platform actual constructor() {
+    actual val name: String = UIDevice.currentDevice.systemName() + " " +
+            UIDevice.currentDevice.systemVersion
+}
+
+actual fun currentTimeMillis(): Long =
+    (NSDate().timeIntervalSince1970 * 1000).toLong()
+
+actual fun randomUUID(): String = NSUUID().UUIDString
+```
+
+### `expect` minimally; prefer interfaces + DI
+
+expect/actual has quirks — classes can't have open members, no default
+values on expect functions. For anything complex, **use an interface +
+platform-specific implementations**:
+
+```kotlin
+// commonMain
+interface Logger {
+    fun log(level: Level, message: String)
+}
+
+// androidMain
+class AndroidLogger(private val tag: String) : Logger {
+    override fun log(level: Level, message: String) {
+        android.util.Log.println(level.toAndroid(), tag, message)
+    }
+}
+
+// iosMain
+class IosLogger : Logger {
+    override fun log(level: Level, message: String) {
+        platform.Foundation.NSLog("[${level.name}] %@", message)
+    }
+}
+```
+
+Platform-specific code provides the concrete implementation; common code
+depends on the interface.
+
+---
+
+## The modern KMP stack
+
+### Networking — Ktor Client
+
+```kotlin
+// commonMain
+val client = HttpClient {
+    install(ContentNegotiation) {
+        json(Json {
+            ignoreUnknownKeys = true
+            isLenient = true
+        })
+    }
+    install(Logging) {
+        level = LogLevel.INFO
+    }
+    defaultRequest {
+        url("https://api.example.com/")
+    }
+}
+
+@Serializable
+data class ProductDto(val id: String, val name: String, val priceCents: Long)
+
+suspend fun fetchProduct(id: String): ProductDto = client.get("products/$id").body()
+```
+
+Platform engines: OkHttp (Android), Darwin (iOS), CIO (Desktop/Wasm).
+
+### Database — SQLDelight
+
+```sql
+-- shared/src/commonMain/sqldelight/.../AppDatabase.sq
+CREATE TABLE Product (
+    id TEXT NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL,
+    priceCents INTEGER NOT NULL,
+    fetchedAt INTEGER NOT NULL
+);
+
+selectAll:
+SELECT * FROM Product;
+
+selectById:
+SELECT * FROM Product WHERE id = :id;
+
+upsert:
+INSERT OR REPLACE INTO Product (id, name, priceCents, fetchedAt) VALUES ?;
+
+deleteOlderThan:
+DELETE FROM Product WHERE fetchedAt < :threshold;
+```
+
+SQLDelight generates type-safe Kotlin APIs from SQL:
+
+```kotlin
+class ProductLocalSource(private val db: AppDatabase) {
+    fun observeAll(): Flow<List<Product>> =
+        db.productQueries.selectAll().asFlow().mapToList(Dispatchers.Default)
+            .map { rows -> rows.map { it.toDomain() } }
+
+    suspend fun upsert(product: Product) = withContext(Dispatchers.Default) {
+        db.productQueries.upsert(product.toEntity())
+    }
+}
+```
+
+### Serialization — kotlinx.serialization
+
+Multiplatform-native; replaces Moshi on Android and Codable on iOS:
+
+```kotlin
+@Serializable
+data class Product(val id: String, val name: String, val price: Money)
+
+@Serializable
+@JvmInline
+value class Money(val cents: Long)
+
+val json = Json { ignoreUnknownKeys = true }
+
+val product = json.decodeFromString<Product>(raw)
+val string = json.encodeToString(product)
+```
+
+### Coroutines and Flow
+
+Identical API on all platforms. `StateFlow<T>` and `Flow<T>` in shared
+code; consumed natively on each platform:
+
+```kotlin
+class ProductRepository(
+    private val api: ProductApi,
+    private val local: ProductLocalSource
+) {
+    fun observe(id: String): Flow<Product> = local.observe(id)
+        .onStart { runCatching { refresh(id) } }
+
+    suspend fun refresh(id: String) {
+        val dto = api.fetchProduct(id)
+        local.upsert(dto.toDomain())
+    }
+}
+```
+
+### DI — Koin (simplest cross-platform option)
+
+Hilt is Android-only. On KMP, use Koin (interpreted) or Kotlin-Inject
+(compile-time):
+
+```kotlin
+val sharedModule = module {
+    single { HttpClient { /* ... */ } }
+    single { AppDatabase(get()) }
+    single { ProductLocalSource(get()) }
+    single { ProductApi(get()) }
+    single { ProductRepository(get(), get()) }
+}
+
+// androidApp
+startKoin {
+    androidContext(this@App)
+    modules(sharedModule, androidModule)
+}
+
+// iosApp — in Swift
+KoinKt.doInitKoin()
+```
+
+---
+
+## Consuming shared code
+
+### From Android
+
+The shared module appears as a regular Kotlin library:
+
+```kotlin
+// androidApp/app/build.gradle.kts
+dependencies {
+    implementation(projects.shared)
+}
+```
+
+```kotlin
+// Compose screen
+@Composable
+fun ProductScreen(viewModel: ProductViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    when (state) {
+        is Loading -> Loader()
+        is Content -> ProductDetail(state.product)
+    }
+}
+
+class ProductViewModel(private val repository: ProductRepository) : ViewModel() {
+    val state: StateFlow<ProductState> = repository.observe("p1")
+        .map { ProductState.Content(it) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, ProductState.Loading)
+}
+```
+
+### From iOS — Swift interop
+
+KMP produces an `.xcframework`. Link in Xcode; import as a module:
+
+```swift
+import Shared
+
+class ProductViewModel: ObservableObject {
+    @Published var state: ProductState = .loading
+
+    private let repository: ProductRepository
+    private var job: Kotlinx_coroutines_coreJob?
+
+    init(repository: ProductRepository) {
+        self.repository = repository
+        observeProduct()
+    }
+
+    private func observeProduct() {
+        // Use Kotlin Flow via a wrapper
+        job = FlowUtils.shared.collect(flow: repository.observe(id: "p1"),
+                                       consumer: { [weak self] product in
+            DispatchQueue.main.async {
+                self?.state = .content(product as! Product)
+            }
+        })
+    }
+
+    deinit {
+        job?.cancel(cause: nil)
+    }
+}
+```
+
+### Flow bridge helpers
+
+Kotlin Flow isn't directly Swift-friendly. Wrap it:
+
+```kotlin
+// commonMain
+class FlowWrapper<T>(private val flow: Flow<T>) {
+    fun collect(onEach: (T) -> Unit, onCompletion: () -> Unit, scope: CoroutineScope): Job {
+        return flow.onEach(onEach).onCompletion { onCompletion() }.launchIn(scope)
+    }
+}
+
+fun <T> Flow<T>.wrap() = FlowWrapper(this)
+```
+
+Or use **Kotlin Multiplatform Flow Swift interop libraries** like
+`KMP-NativeCoroutines` or `SKIE` — they auto-generate Swift-friendly
+wrappers.
+
+### SKIE — recommended
+
+[SKIE](https://skie.touchlab.co/) generates Swift-native bridges for
+sealed classes, coroutines, Flow, and generics. Makes iOS consumption
+dramatically cleaner.
+
+```kotlin
+// build.gradle.kts
+plugins {
+    id("co.touchlab.skie") version "0.9.7"
+}
+```
+
+```swift
+// iOS — sealed class appears as native Swift enum
+switch state {
+case .loading: Loader()
+case .content(let s): ProductDetail(product: s.product)
+case .error(let s): ErrorView(message: s.message)
+}
+```
+
+---
+
+## ViewModel on iOS
+
+iOS has no Android-style ViewModel. Pattern: shared `StateFlow` + Swift
+`ObservableObject`:
+
+```kotlin
+// commonMain — a shared "presenter" that exposes state as StateFlow
+class ProductPresenter(
+    private val repository: ProductRepository,
+    scope: CoroutineScope
+) {
+    val state: StateFlow<ProductState> = repository.observe("p1")
+        .map { ProductState.Content(it) }
+        .stateIn(scope, SharingStarted.Eagerly, ProductState.Loading)
+
+    fun refresh() = scope.launch { repository.refresh("p1") }
+}
+```
+
+Android uses it inside a ViewModel; iOS uses it directly in a Swift
+`ObservableObject`.
+
+---
+
+## Testing shared code
+
+```kotlin
+// commonTest
+class ProductRepositoryTest {
+    @Test
+    fun `fetch caches to local`() = runTest {
+        val api = FakeProductApi()
+        val local = InMemoryProductLocalSource()
+        val repo = ProductRepository(api, local)
+
+        api.stub("p1", ProductDto("p1", "Test", 1000))
+        repo.refresh("p1")
+
+        assertEquals("Test", local.get("p1")?.name)
+    }
+}
+```
+
+Runs on JVM, iOS simulator, and any other target. `./gradlew allTests`
+runs everything.
+
+---
+
+## Gotchas
+
+### Dates
+
+`kotlinx-datetime` is the KMP date/time library:
+
+```kotlin
+implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.6.1")
+
+val now: Instant = Clock.System.now()
+val tz = TimeZone.currentSystemDefault()
+val date: LocalDate = now.toLocalDateTime(tz).date
+```
+
+Don't use `java.time.*` in `commonMain` — it's JVM-only.
+
+### Threading
+
+Kotlin/Native 1.9+ switched to a permissive memory model (no more frozen
+state). Shared mutable state works as expected on iOS.
+
+### iOS framework size
+
+The shared framework adds ~3-6 MB to the iOS app. Strip debug symbols in
+release (`isStatic = true`, `linkerOpts += "-dead_strip"`).
+
+### Debugging
+
+- Android: Android Studio breakpoints work in `commonMain` and `androidMain`
+- iOS: Xcode → Edit Scheme → Debug → attach source map; breakpoints in
+  Swift wrapper; Kotlin source requires enabling Kotlin sources in the
+  framework
+
+---
+
+## When KMP pays off
+
+<Callout kind="tip" title="The ROI calculation">
+KMP pays off when:
+- You maintain both Android and iOS apps that share > 30% logic
+- Logic is stable enough that duplicate code goes out of sync
+- You have a Kotlin-literate team willing to learn iOS basics
+
+KMP doesn't pay off for:
+- Solo dev / small team building one platform
+- Apps where UI is 80%+ of the code
+- Logic that naturally diverges per platform
+- Teams with zero iOS experience (Xcode, Swift, App Store) — the setup
+  cost alone is weeks
+</Callout>
+
+### Realistic sharing percentages
+
+- **80%+ shared** — networking, parsing, data layer, business logic
+- **20-40% shared** — domain logic if platform-specific (location, permissions wrap diverge)
+- **0-20% shared** — pure UI (unless using Compose Multiplatform)
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'KMP mistakes',
+    variant: 'old',
+    points: [
+      'Heavy expect/actual where interface + DI fits better',
+      'java.time.* in commonMain (doesn\'t compile for iOS)',
+      'Manual Flow-to-Swift bridges (use SKIE)',
+      'Mixing java.util.UUID with kotlin.uuid.Uuid',
+      'ViewModels in shared module (Android-specific)',
+      'Using Hilt in shared module (Android-only)'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Modern KMP',
+    variant: 'new',
+    points: [
+      'Interface + DI-provided platform impls',
+      'kotlinx-datetime for dates across platforms',
+      'SKIE for Swift-native bridges to Flow / sealed',
+      'kotlin.uuid.Uuid (Kotlin 2.0+) everywhere',
+      'Shared Presenter / UseCase; ViewModel in platform code',
+      'Koin or Kotlin-Inject for cross-platform DI'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="KMP rules">
+- Share **domain + data layers**, write UI natively per platform.
+- **Common → Android / iOS** source sets; expect/actual sparingly.
+- Modern stack: **Ktor + SQLDelight + kotlinx.serialization + kotlinx-coroutines + kotlinx-datetime**.
+- **SKIE** for Swift interop with Flow / sealed / coroutines.
+- **Koin / Kotlin-Inject** for DI; Hilt is Android-only.
+- Share **Presenters / UseCases**; Android uses ViewModel, iOS uses ObservableObject.
+- ROI kicks in at > 30% shared code across two actively-maintained apps.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Bootstrap a shared module', description: 'Add a shared KMP module with Android + iOS targets. Put one domain model and one repository in commonMain.' },
+  { title: 'Networking with Ktor', description: 'Move your Retrofit data source into Ktor Client in commonMain. Use OkHttp engine on Android, Darwin on iOS.' },
+  { title: 'SQLDelight database', description: 'Migrate one Room entity + DAO to SQLDelight. Confirm the same queries work on Android and iOS simulator.' },
+  { title: 'Expose to Swift via SKIE', description: 'Add SKIE. Write a Swift app that consumes the shared Presenter\'s StateFlow directly.' },
+  { title: 'Shared test suite', description: 'Write a test in commonTest that runs on both Android and iOS. Run via ./gradlew allTests.' }
+]} />
+
+## Next
+
+Continue to **[Compose Multiplatform](./compose-multiplatform)** for sharing UI too, or **[Wear OS & Health Connect](./wear-health)** for wearable integration.

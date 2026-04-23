@@ -1,0 +1,494 @@
+---
+id: encrypted-storage
+title: Encrypted & Secure Storage
+sidebar_label: Encrypted Storage
+description: Securing local data — Android Keystore, EncryptedSharedPreferences, encrypted DataStore, SQLCipher for Room, biometric-gated keys, and threat modeling.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Encrypted & Secure Storage
+
+Local data is not secure by default. Any file in your app's internal
+storage can be read by:
+
+- Apps with `READ_EXTERNAL_STORAGE` (before scoped storage)
+- A rooted device owner
+- A USB debugging session on a debug-signed build
+- A backup (`adb backup`) if `allowBackup="true"`
+- Another process on the same device via a shared UID
+
+If you store authentication tokens, PII, payment credentials, health data,
+or anything subject to GDPR/HIPAA/PCI — encrypt it. This chapter shows
+every primitive and how to wire them together.
+
+## The threat model
+
+<Callout kind="tip" title="What you can't defend against">
+Physical device compromise with root + full disk extraction is out of
+scope for app-level encryption. Encrypted storage protects against:
+- Casual access (lost phone, unlocked)
+- Other apps on the same device
+- Malicious backups
+- Memory analysis of uninstalled apps
+
+For "attacker has root + can extract Keystore-backed keys" — use a
+hardware-backed key with `setUserAuthenticationRequired(true)` and accept
+that some attack surface remains. Do not trust the client.
+</Callout>
+
+---
+
+## Android Keystore — the hardware-backed foundation
+
+The Android Keystore is a system service that stores cryptographic keys
+**outside your app's sandbox** — ideally in the TEE (Trusted Execution
+Environment) or a dedicated StrongBox secure element on supported devices.
+
+```kotlin
+class KeystoreCrypto {
+    companion object {
+        private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        private const val KEY_ALIAS = "my_app_master_key"
+        private const val TRANSFORMATION = "AES/GCM/NoPadding"
+        private const val GCM_IV_LENGTH = 12
+        private const val GCM_TAG_LENGTH = 128
+    }
+
+    private val keyStore: KeyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+
+    fun getOrCreateKey(): SecretKey {
+        (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+
+        val spec = KeyGenParameterSpec.Builder(
+            KEY_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        )
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256)
+            .setRandomizedEncryptionRequired(true)
+            // Harden further:
+            .setUserAuthenticationRequired(false)        // set true for biometric-gated keys
+            .apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    setIsStrongBoxBacked(true)           // hardware secure element if available
+                }
+            }
+            .build()
+
+        val keyGen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+        keyGen.init(spec)
+        return keyGen.generateKey()
+    }
+
+    fun encrypt(plaintext: ByteArray): EncryptedPayload {
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
+        val ciphertext = cipher.doFinal(plaintext)
+        return EncryptedPayload(ciphertext = ciphertext, iv = cipher.iv)
+    }
+
+    fun decrypt(payload: EncryptedPayload): ByteArray {
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        val spec = GCMParameterSpec(GCM_TAG_LENGTH, payload.iv)
+        cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), spec)
+        return cipher.doFinal(payload.ciphertext)
+    }
+}
+
+data class EncryptedPayload(val ciphertext: ByteArray, val iv: ByteArray)
+```
+
+### Key properties worth knowing
+
+| Property                                    | Effect                                                |
+|---------------------------------------------|-------------------------------------------------------|
+| `setUserAuthenticationRequired(true)`       | Requires device unlock or biometric before each use  |
+| `setUserAuthenticationValidityDurationSeconds(N)` | Key usable for N seconds after unlock           |
+| `setIsStrongBoxBacked(true)`                | Use secure element (Pixel 3+)                         |
+| `setInvalidatedByBiometricEnrollment(true)` | Key deleted if user enrolls a new fingerprint         |
+| `setUnlockedDeviceRequired(true)`           | Key only usable when device is unlocked               |
+
+---
+
+## EncryptedSharedPreferences
+
+For small key-value secrets (tokens, API keys, PINs). Jetpack Security
+wraps SharedPreferences with Tink-based encryption:
+
+```kotlin
+// build.gradle
+implementation("androidx.security:security-crypto:1.1.0-alpha06")
+```
+
+```kotlin
+class SecurePreferences @Inject constructor(
+    @ApplicationContext context: Context
+) {
+    private val masterKey = MasterKey.Builder(context)
+        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+        .setUserAuthenticationRequired(false)              // set true to require unlock
+        .build()
+
+    private val prefs = EncryptedSharedPreferences.create(
+        context,
+        "secure_prefs",
+        masterKey,
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+    )
+
+    fun setAccessToken(token: String) {
+        prefs.edit { putString(KEY_ACCESS_TOKEN, token) }
+    }
+
+    fun getAccessToken(): String? = prefs.getString(KEY_ACCESS_TOKEN, null)
+
+    companion object {
+        private const val KEY_ACCESS_TOKEN = "access_token"
+    }
+}
+```
+
+<Callout kind="warning" title="Migration note">
+Jetpack Security 1.1+ deprecated the original `EncryptedSharedPreferences`
+in favor of Tink-backed DataStore wrappers. For new code, prefer the
+encrypted DataStore approach below — or use the library and plan a
+migration path.
+</Callout>
+
+---
+
+## Encrypted DataStore (Tink)
+
+```kotlin
+// build.gradle
+implementation("com.google.crypto.tink:tink-android:1.15.0")
+```
+
+```kotlin
+class EncryptedBytesSerializer(
+    context: Context
+) : Serializer<SecurePayload> {
+
+    private val keysetName = "secure_keyset"
+    private val prefFile = "secure_keyset_prefs"
+    private val masterKeyUri = "android-keystore://secure_master_key"
+
+    private val aead: Aead = AndroidKeysetManager.Builder()
+        .withSharedPref(context, keysetName, prefFile)
+        .withKeyTemplate(KeyTemplates.get("AES256_GCM"))
+        .withMasterKeyUri(masterKeyUri)
+        .build()
+        .keysetHandle
+        .getPrimitive(Aead::class.java)
+
+    override val defaultValue: SecurePayload = SecurePayload.getDefaultInstance()
+
+    override suspend fun readFrom(input: InputStream): SecurePayload {
+        val encrypted = input.readBytes()
+        if (encrypted.isEmpty()) return defaultValue
+        val decrypted = aead.decrypt(encrypted, associatedData)
+        return SecurePayload.parseFrom(decrypted)
+    }
+
+    override suspend fun writeTo(t: SecurePayload, output: OutputStream) {
+        val encrypted = aead.encrypt(t.toByteArray(), associatedData)
+        output.write(encrypted)
+    }
+
+    companion object {
+        private val associatedData: ByteArray = "secure_payload_v1".toByteArray()
+    }
+}
+
+val Context.secureDataStore: DataStore<SecurePayload> by dataStore(
+    fileName = "secure_data.pb",
+    serializer = EncryptedBytesSerializer(this)
+)
+```
+
+The **master key lives in Keystore**, unlocks a **keyset** stored in
+SharedPreferences, which decrypts the actual `.pb` file on disk. Three
+layers of key hierarchy — the standard envelope encryption pattern.
+
+---
+
+## Encrypted Room via SQLCipher
+
+When you need encryption-at-rest for an entire Room database:
+
+```kotlin
+// build.gradle
+implementation("net.zetetic:android-database-sqlcipher:4.5.4")
+implementation("androidx.sqlite:sqlite-ktx:2.4.0")
+```
+
+```kotlin
+@Provides @Singleton
+fun provideDatabase(
+    @ApplicationContext context: Context,
+    secrets: SecurePreferences
+): AppDatabase {
+    val passphrase = secrets.getDatabasePassphrase() ?: generateAndStorePassphrase(secrets)
+    val factory = SupportFactory(SQLiteDatabase.getBytes(passphrase.toCharArray()))
+
+    return Room.databaseBuilder(context, AppDatabase::class.java, "app.db")
+        .openHelperFactory(factory)
+        .addMigrations(*AllMigrations)
+        .build()
+}
+
+private fun generateAndStorePassphrase(secrets: SecurePreferences): String {
+    val bytes = ByteArray(32)
+    SecureRandom().nextBytes(bytes)
+    val passphrase = Base64.encodeToString(bytes, Base64.NO_WRAP)
+    secrets.setDatabasePassphrase(passphrase)
+    return passphrase
+}
+```
+
+SQLCipher encrypts every page of the SQLite file. A dump of the disk
+reveals only ciphertext. The passphrase itself is stored in
+EncryptedSharedPreferences (Keystore-backed).
+
+<Callout kind="tip" title="Don't hardcode the passphrase">
+A hardcoded passphrase in your APK is trivial to extract via decompilation.
+Generate per-install and store via Keystore-backed preferences — then the
+key only exists on that device.
+</Callout>
+
+---
+
+## Biometric-gated keys
+
+For payment authorization or high-value operations, require biometric
+confirmation before each crypto operation:
+
+```kotlin
+class PaymentAuthCrypto {
+    companion object {
+        private const val KEY_ALIAS = "payment_auth_key"
+    }
+
+    fun createBiometricKey() {
+        val spec = KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_SIGN)
+            .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+            .setDigests(KeyProperties.DIGEST_SHA256)
+            .setUserAuthenticationRequired(true)
+            .setUserAuthenticationParameters(
+                0,                                    // must auth for every use
+                KeyProperties.AUTH_BIOMETRIC_STRONG
+            )
+            .setInvalidatedByBiometricEnrollment(true)
+            .build()
+
+        val keyGen = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
+        keyGen.initialize(spec)
+        keyGen.generateKeyPair()
+    }
+
+    suspend fun signPayment(activity: FragmentActivity, payload: ByteArray): ByteArray {
+        val signature = Signature.getInstance("SHA256withECDSA").apply {
+            val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            val key = keyStore.getKey(KEY_ALIAS, null) as PrivateKey
+            initSign(key)
+        }
+
+        val prompt = BiometricPrompt(
+            activity,
+            ContextCompat.getMainExecutor(activity),
+            biometricCallback
+        )
+        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+            .setTitle("Authorize payment")
+            .setSubtitle("Confirm ₹3,499 charge")
+            .setNegativeButtonText("Cancel")
+            .build()
+
+        // Runs the prompt; the key becomes usable only after successful auth
+        return suspendCoroutine { cont ->
+            biometricCallback = object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    val signer = result.cryptoObject!!.signature!!
+                    signer.update(payload)
+                    cont.resume(signer.sign())
+                }
+                override fun onAuthenticationError(code: Int, message: CharSequence) {
+                    cont.resumeWithException(BiometricException(code, message.toString()))
+                }
+            }
+            prompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(signature))
+        }
+    }
+
+    private var biometricCallback: BiometricPrompt.AuthenticationCallback? = null
+}
+```
+
+The server verifies the signature against the public key registered at
+enrollment. Replay attacks are mitigated by including a nonce in the
+payload.
+
+---
+
+## File-level encryption — arbitrary files
+
+For larger blobs (attachments, cached media), use `EncryptedFile`:
+
+```kotlin
+class AttachmentStore @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    private val masterKey = MasterKey.Builder(context)
+        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+        .build()
+
+    fun encryptedFile(name: String): EncryptedFile {
+        val file = File(context.filesDir, name)
+        return EncryptedFile.Builder(
+            context,
+            file,
+            masterKey,
+            EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
+        ).build()
+    }
+
+    suspend fun save(name: String, bytes: ByteArray) = withContext(Dispatchers.IO) {
+        encryptedFile(name).openFileOutput().use { it.write(bytes) }
+    }
+
+    suspend fun load(name: String): ByteArray = withContext(Dispatchers.IO) {
+        encryptedFile(name).openFileInput().use { it.readBytes() }
+    }
+}
+```
+
+---
+
+## Disabling ADB backup
+
+Prevent `adb backup` from pulling your encrypted files:
+
+```xml
+<!-- AndroidManifest.xml -->
+<application
+    android:allowBackup="false"                   <!-- no default backup -->
+    android:fullBackupContent="@xml/backup_rules">
+    <!-- ... -->
+</application>
+```
+
+```xml
+<!-- res/xml/backup_rules.xml — if you do want backup, exclude sensitive files -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="secure_prefs.xml"/>
+    <exclude domain="file" path="secure_data.pb"/>
+    <exclude domain="database" path="app.db"/>
+</full-backup-content>
+```
+
+---
+
+## Clearing keys on sign-out
+
+```kotlin
+fun signOut() {
+    // Delete files
+    context.filesDir.listFiles()?.forEach { it.delete() }
+
+    // Clear EncryptedSharedPreferences
+    context.getSharedPreferences("secure_prefs", 0).edit().clear().apply()
+
+    // Remove Keystore keys
+    val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+    keyStore.deleteEntry("my_app_master_key")
+    keyStore.deleteEntry("payment_auth_key")
+
+    // Clear Room database
+    context.deleteDatabase("app.db")
+}
+```
+
+---
+
+## Memory hygiene
+
+Plaintext in memory is only as safe as the OS allows. To minimize exposure:
+
+```kotlin
+// Use CharArray for passwords/PINs — wipe after use
+val password: CharArray = readPassword()
+try {
+    cipher.init(Cipher.ENCRYPT_MODE, keyFromPassword(password))
+    // encrypt
+} finally {
+    password.fill(' ')        // zero-out on exit
+}
+
+// Avoid String for sensitive data — immutable, can't be wiped
+// Don't log secrets, even in debug builds
+// Never include sensitive values in Crashlytics custom keys
+```
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Security mistakes',
+    variant: 'old',
+    points: [
+      'Hardcoded encryption keys in the APK',
+      'Tokens in plain SharedPreferences',
+      'allowBackup=true without excluding secrets',
+      'Logging tokens in debug builds',
+      'Custom "simple XOR" encryption',
+      'Using String for passwords (can\'t wipe memory)'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Solid crypto hygiene',
+    variant: 'new',
+    points: [
+      'Keys generated per-install in Keystore',
+      'EncryptedSharedPreferences or encrypted DataStore',
+      'allowBackup=false OR excluded rules',
+      'No secrets in logs, Crashlytics, or analytics',
+      'Standard algorithms (AES-GCM, ECDSA) via Keystore',
+      'CharArray for passwords; wipe after use'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Secure storage rules">
+- **Android Keystore** is non-negotiable — hardware-backed keys never leave the device.
+- **EncryptedSharedPreferences** for small secrets; **encrypted DataStore** for structured data.
+- **SQLCipher + Room** when the entire DB must be encrypted at rest.
+- **Biometric-gated keys** for payment / high-value operations.
+- **StrongBox** (setIsStrongBoxBacked) on Pixel 3+ for max hardening.
+- **allowBackup=false** OR exclude secrets from backup rules.
+- **Memory hygiene** — CharArray for passwords, zero-fill on exit, never log secrets.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Wrap tokens', description: 'Replace a plain SharedPreferences token store with EncryptedSharedPreferences. Verify the file on disk contains ciphertext only.' },
+  { title: 'SQLCipher for Room', description: 'Migrate an existing Room database to use SupportFactory from SQLCipher. Store the passphrase via EncryptedSharedPreferences, not in code.' },
+  { title: 'Biometric key', description: 'Create a Keystore key with setUserAuthenticationRequired(true) and setAlgorithmParameterSpec(EC). Sign a payload using BiometricPrompt.' },
+  { title: 'Encrypted Proto DataStore', description: 'Implement an EncryptedBytesSerializer using Tink Aead. Wrap a Proto DataStore with it. Confirm the .pb file on disk is not readable.' },
+  { title: 'Audit your app', description: 'List every piece of data your app persists. Classify each as public/private/secret. Encrypt everything in the secret category.' }
+]} />
+
+## Next
+
+Continue to **[Files, MediaStore & Scoped Storage](./files-and-media)** to handle larger binary data with correct Android 10+ permissions.

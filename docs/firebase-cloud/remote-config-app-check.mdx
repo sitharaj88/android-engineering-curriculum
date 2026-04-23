@@ -1,0 +1,449 @@
+---
+id: remote-config-app-check
+title: Remote Config & App Check
+sidebar_label: Remote Config & App Check
+description: Feature flags and A/B testing with Firebase Remote Config. Anti-abuse and backend verification with Firebase App Check + Play Integrity.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Remote Config & App Check
+
+Two complementary services. **Remote Config** lets you change app behavior
+without shipping a new APK — feature flags, A/B tests, staged rollouts.
+**App Check** proves requests come from your real app on real devices,
+protecting backend APIs from abuse.
+
+## Remote Config
+
+### What it's for
+
+- **Feature flags** — enable a risky feature for 10% of users
+- **A/B tests** — show variant A vs B, measure conversion
+- **Dynamic content** — promo banners, onboarding copy
+- **Emergency kill switches** — disable a broken feature remotely
+- **Per-segment config** — premium users see different defaults
+
+### Setup
+
+```kotlin
+implementation("com.google.firebase:firebase-config-ktx")
+implementation("com.google.firebase:firebase-analytics-ktx")   // for A/B test targeting
+```
+
+```kotlin
+@Singleton
+class FeatureFlags @Inject constructor() {
+    private val remoteConfig: FirebaseRemoteConfig = Firebase.remoteConfig.apply {
+        setConfigSettingsAsync(remoteConfigSettings {
+            minimumFetchIntervalInSeconds = if (BuildConfig.DEBUG) 0 else 3600
+        })
+
+        // Local defaults baked into the app — fallback if fetch fails
+        setDefaultsAsync(R.xml.remote_config_defaults)
+    }
+
+    // Fetch + activate together. Safe to call often; SDK caches.
+    suspend fun refresh(): Boolean = remoteConfig.fetchAndActivate().await()
+
+    // Typed accessors
+    val newCheckoutEnabled: Boolean get() = remoteConfig.getBoolean("new_checkout_enabled")
+    val maxUploadMB: Long get() = remoteConfig.getLong("max_upload_mb")
+    val promoBanner: String? get() = remoteConfig.getString("promo_banner").takeIf { it.isNotBlank() }
+
+    val helloVariant: String get() = remoteConfig.getString("hello_variant")
+
+    // JSON values
+    val experimentConfig: ExperimentConfig? get() =
+        runCatching {
+            Json.decodeFromString<ExperimentConfig>(remoteConfig.getString("experiment_config"))
+        }.getOrNull()
+}
+```
+
+```xml
+<!-- res/xml/remote_config_defaults.xml -->
+<defaultsMap>
+    <entry>
+        <key>new_checkout_enabled</key>
+        <value>false</value>
+    </entry>
+    <entry>
+        <key>max_upload_mb</key>
+        <value>10</value>
+    </entry>
+    <entry>
+        <key>promo_banner</key>
+        <value></value>
+    </entry>
+    <entry>
+        <key>hello_variant</key>
+        <value>control</value>
+    </entry>
+</defaultsMap>
+```
+
+### Fetching strategy
+
+```kotlin
+class RemoteConfigInitializer @Inject constructor(
+    private val flags: FeatureFlags,
+    private val scope: CoroutineScope
+) {
+    fun install() {
+        scope.launch {
+            flags.refresh()    // fetch at launch; activate the new values
+        }
+
+        // Periodic refresh while app is active
+        scope.launch {
+            while (isActive) {
+                delay(30.minutes)
+                flags.refresh()
+            }
+        }
+    }
+}
+```
+
+For rollout-critical flags (emergency kill switches), also fetch on
+cold start before rendering the affected feature.
+
+### Realtime Remote Config
+
+Firebase pushes config changes via FCM — no polling needed:
+
+```kotlin
+val configUpdateListener = remoteConfig.addOnConfigUpdateListener(object : ConfigUpdateListener {
+    override fun onUpdate(configUpdate: ConfigUpdate) {
+        remoteConfig.activate().addOnCompleteListener {
+            // Re-read flag; re-emit from your StateFlow
+        }
+    }
+    override fun onError(error: FirebaseRemoteConfigException) { /* ... */ }
+})
+
+// Wrap as Flow
+val realtimeFlags: Flow<RemoteConfigSnapshot> = callbackFlow {
+    val registration = remoteConfig.addOnConfigUpdateListener(object : ConfigUpdateListener {
+        override fun onUpdate(u: ConfigUpdate) {
+            remoteConfig.activate().addOnCompleteListener {
+                trySend(RemoteConfigSnapshot.capture(remoteConfig))
+            }
+        }
+        override fun onError(e: FirebaseRemoteConfigException) { }
+    })
+    trySend(RemoteConfigSnapshot.capture(remoteConfig))
+    awaitClose { registration.remove() }
+}
+```
+
+Ideal for emergency toggles and config that must propagate within seconds.
+
+### A/B testing with Firebase Analytics
+
+```kotlin
+// Bucket users via user properties
+Firebase.analytics.setUserProperty("experiment_group", "variant_b")
+```
+
+Firebase Console → A/B Testing → create experiment with:
+- Variants (control, variant_a, variant_b)
+- Activation event (`first_open`, custom event)
+- Goal metrics (retention, engagement, revenue)
+
+Each user lands in a stable bucket (sticky). Results flow back to the
+console with confidence intervals.
+
+### Personalization (automated)
+
+Firebase Personalization uses ML to pick per-user values for numeric or
+string keys. You define the goal (e.g., maximize retention); Firebase
+continuously optimizes.
+
+### Conditional targeting
+
+In the console, you can set values based on conditions:
+
+- App version ≥ 2.3.0
+- User property `tier = premium`
+- Audience (Analytics-defined)
+- Country, language, device model
+- Random percentile (for gradual rollouts)
+
+Ship with `new_checkout_enabled = false`, then flip to `true` for 5% of
+users in a specific country — no APK update.
+
+### Using flags in the UI
+
+```kotlin
+@HiltViewModel
+class CheckoutViewModel @Inject constructor(
+    private val flags: FeatureFlags
+) : ViewModel() {
+    val uiState: StateFlow<CheckoutUiState> = /* ... */
+
+    fun onCheckout() = viewModelScope.launch {
+        if (flags.newCheckoutEnabled) newCheckoutFlow() else legacyCheckoutFlow()
+    }
+}
+
+@Composable
+fun PromoBanner(viewModel: PromoViewModel = hiltViewModel()) {
+    val banner by viewModel.banner.collectAsStateWithLifecycle()
+    banner?.let {
+        Surface(color = MaterialTheme.colorScheme.tertiaryContainer) {
+            Text(it, Modifier.padding(12.dp))
+        }
+    }
+}
+```
+
+### Flag hygiene
+
+<Callout kind="tip" title="Delete flags after rollout">
+Every flag is technical debt. Categorize:
+- **Release flags** (short-lived) — delete within 2 weeks of full rollout.
+- **Ops flags** (long-lived) — document why it needs to stay.
+- **Kill switches** (permanent) — keep, document, test periodically.
+
+Without hygiene, you end up with 500 flags no one remembers.
+</Callout>
+
+### Testing with Remote Config
+
+```kotlin
+// In tests, force a specific set of flags
+class FakeFeatureFlags : FeatureFlags() {
+    override val newCheckoutEnabled: Boolean = true
+    override val maxUploadMB: Long = 50
+}
+
+// @BindValue in Hilt tests
+@BindValue @JvmField val flags: FeatureFlags = FakeFeatureFlags()
+```
+
+---
+
+## Firebase App Check
+
+### What it's for
+
+App Check proves that API requests originate from **your legitimate app**
+running on a **legitimate device**. It mitigates:
+
+- Scraping (abuse of your Firestore from a script)
+- Credential stuffing (bots brute-forcing sign-in)
+- Quota abuse (exhausting your Firebase budget)
+- Fake installs / emulator abuse (ad fraud)
+
+### The protection layers
+
+| Provider            | Works on                                | Cost                       |
+|---------------------|-----------------------------------------|----------------------------|
+| Play Integrity      | Real Android devices via Play           | Free (quotas apply)        |
+| SafetyNet (legacy)  | Deprecated; migrate to Play Integrity   | —                          |
+| Debug provider      | Your dev builds only                    | Free                       |
+| Custom              | Your own verification                   | DIY                        |
+
+Most apps: **Play Integrity in prod, Debug provider in debug builds**.
+
+### Setup
+
+```kotlin
+implementation("com.google.firebase:firebase-appcheck")
+implementation("com.google.firebase:firebase-appcheck-playintegrity")
+implementation("com.google.firebase:firebase-appcheck-debug")
+```
+
+```kotlin
+class AppCheckInitializer @Inject constructor() {
+    fun install() {
+        val appCheck = Firebase.appCheck
+        if (BuildConfig.DEBUG) {
+            appCheck.installAppCheckProviderFactory(
+                DebugAppCheckProviderFactory.getInstance()
+            )
+        } else {
+            appCheck.installAppCheckProviderFactory(
+                PlayIntegrityAppCheckProviderFactory.getInstance()
+            )
+        }
+    }
+}
+```
+
+### Debug provider setup
+
+On first debug run, logcat prints a UUID-style token:
+
+```
+D/com.google.firebase.appcheck: Enter this debug secret into the allow list
+in the Firebase Console for your project: a1b2c3d4-...
+```
+
+Add that token to Firebase Console → App Check → Manage debug tokens.
+Now your debug builds can talk to production-protected services.
+
+### Enforcing App Check on Firebase services
+
+In Firebase Console → App Check:
+
+1. Go to the service (Firestore, Storage, Functions, Realtime DB).
+2. Click "Enforce" — requests without a valid App Check token are rejected.
+
+Typically, **start in metrics-only mode**. Watch for a few days, confirm
+legitimate traffic is passing, then flip to enforcement.
+
+### App Check on your own backend
+
+App Check tokens work beyond Firebase services. Your own backend can
+verify them:
+
+```kotlin
+// Client — get the current token
+suspend fun appCheckToken(): String =
+    Firebase.appCheck.getAppCheckToken(false).await().token
+
+// Interceptor — attach to every request
+class AppCheckInterceptor @Inject constructor() : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val token = runBlocking { appCheckToken() }
+        val authed = chain.request().newBuilder()
+            .header("X-Firebase-AppCheck", token)
+            .build()
+        return chain.proceed(authed)
+    }
+}
+```
+
+```javascript
+// Backend (Node) — verify
+const {getAppCheck} = require('firebase-admin/app-check');
+
+app.post('/api/private', async (req, res) => {
+  const token = req.header('X-Firebase-AppCheck');
+  if (!token) return res.status(401).send('Missing App Check token');
+
+  try {
+    const result = await getAppCheck().verifyToken(token);
+    // result.appId is the legitimate app
+    // Continue processing
+  } catch (e) {
+    return res.status(401).send('Invalid App Check token');
+  }
+});
+```
+
+### App Check token replay & limited use
+
+Tokens are short-lived (~1 hour). For extra-sensitive actions (payment,
+account deletion), use **limited-use tokens** — single-use tokens the
+server verifies and marks consumed:
+
+```kotlin
+suspend fun sensitiveAction() {
+    val token = Firebase.appCheck.getLimitedUseAppCheckToken().await().token
+    api.deleteAccount(token)    // server rejects if token already used
+}
+```
+
+Prevents an attacker with a leaked token from replaying it repeatedly.
+
+### App Check + Play Integrity API (direct)
+
+If you need more than App Check offers (device integrity verdict, app
+integrity, licensing), use Play Integrity directly. See
+[Module 16 — Security & Compliance](/docs/security-compliance/overview).
+
+---
+
+## Combining the two — a production setup
+
+```kotlin
+@Singleton
+class FirebaseBootstrap @Inject constructor(
+    private val appCheckInit: AppCheckInitializer,
+    private val remoteConfig: FeatureFlags,
+    private val configInit: RemoteConfigInitializer,
+    private val channelsInit: NotificationChannelsInitializer
+) {
+    fun install() {
+        appCheckInit.install()              // FIRST — subsequent Firebase calls use the token
+        channelsInit.create()
+        configInit.install()                // fetch flags in the background
+    }
+}
+
+@HiltAndroidApp
+class MyApp : Application() {
+    @Inject lateinit var firebaseBootstrap: FirebaseBootstrap
+
+    override fun onCreate() {
+        super.onCreate()
+        firebaseBootstrap.install()
+    }
+}
+```
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Config / App Check mistakes',
+    variant: 'old',
+    points: [
+      'No local defaults — app breaks if fetch fails',
+      'Synchronous fetch on main thread blocking startup',
+      'Flags scattered across codebase (hard to audit)',
+      'App Check enforced without a metrics-only period',
+      'Debug token checked into version control',
+      'Flag values used to enforce security'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Solid setup',
+    variant: 'new',
+    points: [
+      'Defaults XML + type-safe FeatureFlags class',
+      'Async refresh with local defaults as fallback',
+      'One @Singleton FeatureFlags — single source of truth',
+      'Monitor before enforcing for 3-7 days',
+      'Debug tokens in .gitignore or added per-dev in Firebase Console',
+      'Flags for UX/rollout; security is enforced by rules + backend'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Remote Config & App Check rules">
+- **Remote Config** = feature flags + A/B tests + dynamic content; not for security.
+- **Local XML defaults** every key has a default — app works offline.
+- **Realtime Remote Config** propagates changes in seconds via FCM.
+- **Clean up flags** after rollout; a flag graveyard is tech debt.
+- **App Check** verifies requests come from your real app on real devices.
+- **Debug provider** for dev builds; **Play Integrity** for production.
+- **Metrics-only first**, then enforce — avoid locking out legitimate traffic.
+- **Limited-use tokens** for single-use sensitive actions.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Feature flag class', description: 'Build a @Singleton FeatureFlags with typed accessors. Back it with XML defaults. Wire into a ViewModel.' },
+  { title: 'A/B test', description: 'Set up an A/B test in the Firebase console that assigns users to \"control\" or \"variant_a\". Gate a small UI change with the variant value.' },
+  { title: 'Realtime config', description: 'Add addOnConfigUpdateListener. Flip a flag in the console; watch the app update live without restart.' },
+  { title: 'App Check integration', description: 'Add App Check with Play Integrity in release and Debug provider in debug. Enable metrics-only enforcement on Firestore.' },
+  { title: 'Backend verification', description: 'Protect your own /api endpoint with X-Firebase-AppCheck header verification using the Admin SDK.' }
+]} />
+
+## Next
+
+Return to **[Module 07 Overview](./overview)** or continue to **[Module 08 — Advanced Components](/docs/advanced-components/overview)**.

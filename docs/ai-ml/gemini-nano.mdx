@@ -1,0 +1,621 @@
+---
+id: gemini-nano
+title: Gemini Nano & AICore
+sidebar_label: Gemini Nano
+description: On-device Gemini Nano via Android AICore — API, streaming, prompting patterns, structured output, function calling, and production integration.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Gemini Nano & AICore
+
+Gemini Nano is Google's on-device LLM, shipping in **AICore** on
+Android 14 QPR2+ devices (Pixel 8 Pro, Pixel 9, Samsung S24, Pixel Fold 2
+and more). Apps get access via the `GenerativeModel` SDK — no model
+hosting, no per-inference cost, no data leaving the device.
+
+## Supported devices (as of 2025)
+
+- Pixel 8 Pro (original launch)
+- Pixel 9, 9 Pro, 9 Pro XL, 9 Pro Fold
+- Samsung Galaxy S24, S24+, S24 Ultra
+- Samsung Galaxy Z Fold6, Z Flip6
+- Growing list — check `GenerativeModel.isSupported()` at runtime
+
+On unsupported devices, fall back to server-side LLM (Gemini Pro via the
+Firebase AI Logic SDK, or your own backend).
+
+---
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+genai = "0.0.0-alpha01"
+firebase-ai = "16.0.0"
+
+genai-client = { module = "com.google.ai.edge.aicore:aicore", version.ref = "genai" }
+firebase-ai = { module = "com.google.firebase:firebase-ai", version.ref = "firebase-ai" }
+```
+
+```kotlin
+@Provides @Singleton
+fun provideGenerativeModel(@ApplicationContext context: Context): GenerativeModel {
+    val config = generationConfig {
+        context = context
+        temperature = 0.2f
+        topK = 16
+        maxOutputTokens = 256
+    }
+    return GenerativeModel(generationConfig = config)
+}
+```
+
+### Check availability
+
+```kotlin
+class GenAiAvailabilityChecker @Inject constructor(
+    private val model: GenerativeModel
+) {
+    suspend fun canUseOnDevice(): Boolean = try {
+        model.prepareInferenceEngine()   // downloads / prepares the model
+        true
+    } catch (e: Exception) {
+        false
+    }
+}
+```
+
+`prepareInferenceEngine()` returns quickly if AICore is available and the
+feature is enabled. On non-supported devices or when AICore is
+disabled, it throws.
+
+---
+
+## Basic inference
+
+```kotlin
+suspend fun summarize(text: String): String {
+    val response = model.generateContent("Summarize in one sentence:\n$text")
+    return response.text.orEmpty()
+}
+
+// Usage
+val summary = summarize(articleText)
+```
+
+### Streaming
+
+For long outputs, stream chunks:
+
+```kotlin
+fun summarizeStreaming(text: String): Flow<String> = flow {
+    model.generateContentStream("Summarize:\n$text").collect { chunk ->
+        emit(chunk.text.orEmpty())
+    }
+}
+
+@Composable
+fun StreamingSummary(viewModel: SummaryViewModel = hiltViewModel()) {
+    val partial by viewModel.partial.collectAsStateWithLifecycle()
+    Text(partial, modifier = Modifier.animateContentSize())
+}
+
+class SummaryViewModel @Inject constructor(
+    private val summarizer: Summarizer
+) : ViewModel() {
+    private val _partial = MutableStateFlow("")
+    val partial: StateFlow<String> = _partial.asStateFlow()
+
+    fun summarize(text: String) = viewModelScope.launch {
+        _partial.value = ""
+        summarizer.summarizeStreaming(text)
+            .collect { chunk -> _partial.update { it + chunk } }
+    }
+}
+```
+
+Gives a streaming-feel ("typing in") UX even though total wall-time is
+the same.
+
+---
+
+## Prompt engineering — the core skill
+
+Gemini Nano is ~3-6B parameters (much smaller than Gemini Pro). Your
+prompts need to be **tighter** to get good results.
+
+### Be specific
+
+```kotlin
+// ❌ Vague
+"Rewrite this"
+
+// ✅ Specific
+"""Rewrite the following text to be more formal. Preserve the meaning.
+Keep it under 100 words.
+
+TEXT: $text
+
+REWRITE:"""
+```
+
+### Structure the output
+
+```kotlin
+val prompt = """Extract product details from this receipt text.
+Return as JSON with exactly these fields: name, priceCents, quantity.
+If a field is missing, use null.
+
+RECEIPT:
+$text
+
+JSON:"""
+
+val json = model.generateContent(prompt).text.orEmpty().substringAfter("JSON:").trim()
+val product = runCatching { Json.decodeFromString<Product>(json) }.getOrNull()
+```
+
+Always:
+- Ask for a specific format (JSON, one of N labels, bullet list)
+- Specify "return only the X" to prevent preamble
+- Parse defensively (the model sometimes wraps JSON in ```json blocks)
+
+### Few-shot examples
+
+```kotlin
+val prompt = """Classify the sentiment as POSITIVE, NEGATIVE, or NEUTRAL.
+
+Example 1:
+Text: I love this phone!
+Sentiment: POSITIVE
+
+Example 2:
+Text: The battery is terrible.
+Sentiment: NEGATIVE
+
+Example 3:
+Text: The screen is 6.2 inches.
+Sentiment: NEUTRAL
+
+Text: $input
+Sentiment:"""
+```
+
+3-5 examples dramatically improve accuracy for classification tasks.
+
+### Anchor tokens
+
+Force the model to start with a known prefix:
+
+```kotlin
+val prompt = """You are proofreading text for grammar and spelling only.
+Return ONLY the corrected text. No explanation.
+
+Original: $text
+
+Corrected:"""
+
+val result = model.generateContent(prompt).text.orEmpty()
+    .substringAfter("Corrected:")
+    .substringBefore("\n\n")
+    .trim()
+```
+
+The model's output starts after "Corrected:" — your parsing is
+deterministic.
+
+---
+
+## Function calling
+
+Newer AICore builds support **tool use** — the model can request
+function invocations:
+
+```kotlin
+val tools = listOf(
+    Tool(
+        functionDeclarations = listOf(
+            FunctionDeclaration(
+                name = "get_weather",
+                description = "Get current weather for a city",
+                parameters = mapOf(
+                    "city" to Schema.str("City name")
+                )
+            )
+        )
+    )
+)
+
+val config = generationConfig {
+    context = context
+    tools = tools
+}
+
+val model = GenerativeModel(generationConfig = config)
+
+val response = model.generateContent("What's the weather in Tokyo?")
+
+// Check if the model wants to call a function
+val functionCall = response.functionCalls.firstOrNull()
+if (functionCall?.name == "get_weather") {
+    val city = functionCall.args["city"] as String
+    val weather = weatherApi.current(city)
+
+    // Feed the function result back
+    val final = model.generateContent(
+        Content.FunctionResponse("get_weather", mapOf("temperature" to weather.temp))
+    )
+    return final.text
+}
+```
+
+Great for:
+- Weather / location queries
+- Triggering in-app actions from natural language
+- Multi-step agentic flows
+
+---
+
+## Grounding with local data
+
+Gemini Nano has no knowledge of your user's data. Pass relevant context
+in the prompt:
+
+```kotlin
+class NotesSearch @Inject constructor(
+    private val notesDao: NoteDao,
+    private val model: GenerativeModel
+) {
+    suspend fun askAboutNotes(question: String): String {
+        val recent = notesDao.recent(limit = 20)
+        val context = recent.joinToString("\n---\n") { "${it.title}\n${it.body}" }
+
+        val prompt = """Answer the user's question based only on these notes.
+If the answer isn't in the notes, say "I don't see that in your notes."
+
+NOTES:
+$context
+
+QUESTION: $question
+
+ANSWER:"""
+
+        return model.generateContent(prompt).text.orEmpty()
+    }
+}
+```
+
+This is **RAG (Retrieval-Augmented Generation)** — retrieve relevant
+docs, insert into the prompt as context. The model answers from the
+context, not its trained knowledge.
+
+### Semantic search for RAG
+
+For 1000+ notes, you need embeddings. TF Lite text embedding models let
+you compute cosine similarity on-device:
+
+```kotlin
+class NoteRagEngine @Inject constructor(
+    private val embedder: TextEmbedder,   // TF Lite model
+    private val noteEmbeddings: NoteEmbeddingDao
+) {
+    suspend fun relevant(question: String, topK: Int = 5): List<NoteEntity> {
+        val queryEmbedding = embedder.embed(question)
+        return noteEmbeddings.all()
+            .map { it.note to cosineSimilarity(queryEmbedding, it.embedding) }
+            .sortedByDescending { it.second }
+            .take(topK)
+            .map { it.first }
+    }
+}
+```
+
+See [ML Kit & TensorFlow Lite](./ml-kit-tensorflow) for the embedding
+model setup.
+
+---
+
+## Safety and guardrails
+
+### Response safety settings
+
+```kotlin
+val config = generationConfig {
+    safetySettings = listOf(
+        SafetySetting(HarmCategory.HARASSMENT, HarmBlockThreshold.MEDIUM_AND_ABOVE),
+        SafetySetting(HarmCategory.HATE_SPEECH, HarmBlockThreshold.MEDIUM_AND_ABOVE),
+        SafetySetting(HarmCategory.SEXUALLY_EXPLICIT, HarmBlockThreshold.MEDIUM_AND_ABOVE),
+        SafetySetting(HarmCategory.DANGEROUS_CONTENT, HarmBlockThreshold.HIGH_AND_ABOVE)
+    )
+}
+```
+
+Responses flagged as unsafe return `null` text with a blocked reason.
+Handle both cases.
+
+### Prompt injection defense
+
+```kotlin
+fun sanitizePrompt(userInput: String): String {
+    // Block common injection patterns
+    val blocked = listOf(
+        "ignore previous instructions",
+        "disregard the above",
+        "you are now",
+        "new instructions:"
+    )
+    if (blocked.any { userInput.contains(it, ignoreCase = true) }) {
+        return "[User input blocked for policy violation]"
+    }
+    return userInput
+}
+```
+
+Never concatenate user input with system prompts without some
+sanitization. Prompt injection is a real vector.
+
+### Output validation
+
+```kotlin
+suspend fun categorize(text: String): Category {
+    val raw = model.generateContent(
+        """Classify: FOOD, TECH, SPORTS, OTHER.
+           Return only the category.
+           Text: $text"""
+    ).text?.trim()?.uppercase() ?: return Category.OTHER
+
+    return Category.values().find { it.name == raw } ?: Category.OTHER
+}
+```
+
+Constrain outputs to a known set. If the LLM returns "I'm not sure",
+default safely.
+
+---
+
+## Performance
+
+### Warm up on app start
+
+```kotlin
+class GenAiWarmup @Inject constructor(
+    private val model: GenerativeModel,
+    private val scope: CoroutineScope
+) {
+    fun install() {
+        scope.launch {
+            runCatching { model.prepareInferenceEngine() }
+        }
+    }
+}
+```
+
+First inference latency: ~2-3s. Subsequent: &lt;500ms. Warm up during app
+launch so the first user-facing request is fast.
+
+### Batch when possible
+
+```kotlin
+// ❌ Ten inferences, ten token overheads
+val results = items.map { item -> model.generateContent("Classify: $item").text }
+
+// ✅ One inference
+val prompt = """Classify each item as FOOD / TECH / SPORTS / OTHER.
+Return one category per line, same order.
+
+Items:
+${items.mapIndexed { i, it -> "$i. $it" }.joinToString("\n")}
+
+Classifications:"""
+
+val results = model.generateContent(prompt).text.orEmpty().lines()
+```
+
+### Respect battery and thermal
+
+```kotlin
+suspend fun safeInference(prompt: String): String? {
+    val battery = context.getSystemService(BatteryManager::class.java)
+    val level = battery.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+
+    if (level < 20 && !batteryManager.isCharging) {
+        // Defer or use server fallback
+        return null
+    }
+
+    val power = context.getSystemService(PowerManager::class.java)
+    if (power.currentThermalStatus > PowerManager.THERMAL_STATUS_MODERATE) {
+        // Thermal throttling — defer
+        return null
+    }
+
+    return model.generateContent(prompt).text
+}
+```
+
+Sustained LLM inference can drain 20% battery per hour and thermal-
+throttle after 5 minutes. Gate on battery + thermal state.
+
+---
+
+## Full app example — compose proofreader
+
+```kotlin
+class ProofreaderViewModel @Inject constructor(
+    private val model: GenerativeModel
+) : ViewModel() {
+    private val _state = MutableStateFlow(ProofreadState())
+    val state: StateFlow<ProofreadState> = _state.asStateFlow()
+
+    fun proofread(text: String) = viewModelScope.launch {
+        _state.update { it.copy(isLoading = true, corrected = "", error = null) }
+        try {
+            val sanitized = sanitizePrompt(text)
+            val prompt = """Correct grammar and spelling. Preserve meaning and style.
+Return only the corrected text.
+
+TEXT: $sanitized
+
+CORRECTED:"""
+            val corrected = model.generateContent(prompt).text
+                ?.substringAfter("CORRECTED:")
+                ?.trim()
+                ?: text
+
+            // Guardrail: output shouldn't be dramatically different
+            if (corrected.length > text.length * 2) {
+                _state.update { it.copy(isLoading = false, corrected = text, error = "Model returned unexpected output") }
+                return@launch
+            }
+
+            _state.update { it.copy(isLoading = false, corrected = corrected) }
+        } catch (e: Exception) {
+            _state.update { it.copy(isLoading = false, error = e.message) }
+        }
+    }
+}
+
+@Composable
+fun ProofreadScreen(viewModel: ProofreaderViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    var draft by rememberSaveable { mutableStateOf("") }
+
+    Column(Modifier.padding(16.dp)) {
+        OutlinedTextField(
+            value = draft,
+            onValueChange = { draft = it },
+            label = { Text("Draft") },
+            minLines = 5,
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        Button(
+            onClick = { viewModel.proofread(draft) },
+            enabled = !state.isLoading && draft.isNotBlank()
+        ) {
+            if (state.isLoading) CircularProgressIndicator(strokeWidth = 2.dp)
+            else Text("Proofread")
+        }
+
+        state.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+
+        if (state.corrected.isNotBlank()) {
+            Spacer(Modifier.height(16.dp))
+            Text("Corrected", style = MaterialTheme.typography.labelLarge)
+            Text(state.corrected, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+data class ProofreadState(
+    val isLoading: Boolean = false,
+    val corrected: String = "",
+    val error: String? = null
+)
+```
+
+---
+
+## Deploying Gemini Nano at scale
+
+### Adoption strategy
+
+1. **Device gate** — enable feature only on AICore-supported devices
+2. **Server fallback** for older devices (Gemini Pro via Firebase AI Logic)
+3. **Feature flag** for gradual rollout (Remote Config)
+4. **A/B test** — on-device vs server — measure quality and latency
+
+```kotlin
+class GenerativeAIStrategy @Inject constructor(
+    private val onDevice: GenerativeModel,
+    private val serverModel: FirebaseVertexAI,
+    private val featureFlags: FeatureFlags
+) {
+    suspend fun summarize(text: String): String {
+        if (!featureFlags.aiSummarizationEnabled) return ""
+
+        val useOnDevice = featureFlags.preferOnDeviceAi && isOnDeviceAvailable()
+        return if (useOnDevice) {
+            runCatching { onDevice.generateContent("Summarize: $text").text.orEmpty() }
+                .getOrElse { serverModel.generateContent("Summarize: $text").text.orEmpty() }
+        } else {
+            serverModel.generateContent("Summarize: $text").text.orEmpty()
+        }
+    }
+
+    private suspend fun isOnDeviceAvailable(): Boolean =
+        runCatching { onDevice.prepareInferenceEngine(); true }.getOrElse { false }
+}
+```
+
+### Quality monitoring
+
+- Log **prompt hashes** + **user ratings** (thumbs up/down on output)
+- Sample traces — review in aggregate; never log raw PII
+- Track inference success / error / safety-blocked rates
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Gemini Nano mistakes',
+    variant: 'old',
+    points: [
+      'No device availability check (crashes on unsupported)',
+      'Vague prompts ("make this better")',
+      'No output validation (LLM hallucinations ship)',
+      'Unbounded generation (100k tokens)',
+      'Raw user text into system prompts (injection)',
+      'Running inference on low battery'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production-grade AI',
+    variant: 'new',
+    points: [
+      'prepareInferenceEngine() at startup; fallback for failure',
+      'Specific, few-shot, structured prompts',
+      'Validate output (enum, length, schema)',
+      'maxOutputTokens set; safety thresholds configured',
+      'Sanitize user input before adding to prompts',
+      'Battery + thermal gate before inference'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Gemini Nano rules">
+- **Check availability** at runtime; fall back to server-side LLM for unsupported devices.
+- **Prompt precision** beats model size — be specific, use few-shot, structure outputs.
+- **Stream for long outputs** to feel responsive.
+- **Validate everything**: enum-constrained outputs, length checks, safety settings.
+- **Sanitize user input** before concatenating with system prompts.
+- **Warm up on app start** — first inference is 2-3s.
+- **Battery + thermal gate** — defer if low / throttled.
+- **Privacy win**: data never leaves device; declare in Data Safety.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Availability check', description: 'Wire up prepareInferenceEngine() + a server fallback. Log which path is used per user.' },
+  { title: 'Streaming summary', description: 'Build a screen that summarizes the current article. Use generateContentStream to stream words into a Text composable.' },
+  { title: 'RAG over notes', description: 'Implement semantic search over 100 notes using TF Lite embeddings. Pass top-5 relevant notes as context for user questions.' },
+  { title: 'Structured output', description: 'Extract receipt details (name, price, quantity) as JSON. Parse defensively; retry with tighter prompt on parse failure.' },
+  { title: 'Safety guardrails', description: 'Implement prompt injection detection + output validation. Test with adversarial inputs ("ignore previous instructions").' }
+]} />
+
+## Next
+
+Continue to **[ML Kit & TensorFlow Lite](./ml-kit-tensorflow)** for
+pre-built features and custom models.

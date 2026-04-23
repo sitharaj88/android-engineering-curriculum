@@ -1,0 +1,635 @@
+---
+id: instrumentation-testing
+title: Instrumentation Testing
+sidebar_label: Instrumentation Testing
+description: On-device / emulator tests — Compose UI Testing, Espresso, UIAutomator, Hilt test rules, screenshot testing with Paparazzi / Roborazzi, Firebase Test Lab.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Instrumentation Testing
+
+Instrumentation tests run on a real device or emulator. They're slower
+than unit tests but test the **real Android runtime** — lifecycle,
+rendering, real Room, real WorkManager. This chapter covers Compose UI
+testing, Espresso (for XML), UIAutomator (cross-process), Hilt
+integration, and snapshot testing.
+
+## The instrumented stack
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  AndroidJUnit4                                              │
+│    runs test classes with @RunWith(AndroidJUnit4::class)    │
+│                                                             │
+│  ComposeTestRule                                            │
+│    createComposeRule / createAndroidComposeRule             │
+│                                                             │
+│  Espresso                                                   │
+│    classic XML View assertions and actions                  │
+│                                                             │
+│  UIAutomator                                                │
+│    cross-app, system UI (notifications, Settings)           │
+│                                                             │
+│  Robolectric (JVM alternative — covered separately)         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+androidx-test-runner    = "1.6.2"
+androidx-test-rules     = "1.6.1"
+androidx-test-ext-junit = "1.2.1"
+espresso                = "3.6.1"
+ui-automator            = "2.3.0"
+compose-bom             = "2024.12.01"
+hilt                    = "2.52"
+paparazzi               = "1.3.5"
+roborazzi               = "1.30.1"
+
+[libraries]
+androidx-test-runner     = { module = "androidx.test:runner",          version.ref = "androidx-test-runner" }
+androidx-test-rules      = { module = "androidx.test:rules",           version.ref = "androidx-test-rules" }
+androidx-test-ext-junit  = { module = "androidx.test.ext:junit",       version.ref = "androidx-test-ext-junit" }
+espresso-core            = { module = "androidx.test.espresso:espresso-core",      version.ref = "espresso" }
+espresso-contrib         = { module = "androidx.test.espresso:espresso-contrib",   version.ref = "espresso" }
+espresso-intents         = { module = "androidx.test.espresso:espresso-intents",   version.ref = "espresso" }
+ui-automator             = { module = "androidx.test.uiautomator:uiautomator",     version.ref = "ui-automator" }
+compose-ui-test          = { module = "androidx.compose.ui:ui-test-junit4" }
+compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest" }
+hilt-android-testing     = { module = "com.google.dagger:hilt-android-testing",    version.ref = "hilt" }
+```
+
+```kotlin
+android {
+    defaultConfig {
+        testInstrumentationRunner = "com.myapp.HiltTestRunner"
+    }
+}
+
+dependencies {
+    androidTestImplementation(platform(libs.compose.bom))
+    androidTestImplementation(libs.compose.ui.test)
+    debugImplementation(libs.compose.ui.test.manifest)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.espresso.core)
+    androidTestImplementation(libs.hilt.android.testing)
+    kspAndroidTest(libs.hilt.compiler)
+}
+```
+
+### Hilt test runner
+
+```kotlin
+class HiltTestRunner : AndroidJUnitRunner() {
+    override fun newApplication(
+        cl: ClassLoader?, className: String?, context: Context?
+    ): Application = super.newApplication(cl, HiltTestApplication::class.java.name, context)
+}
+```
+
+---
+
+## Compose UI testing
+
+### Basic Compose test
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class CounterTest {
+    @get:Rule val compose = createComposeRule()
+
+    @Test
+    fun increments() {
+        compose.setContent { Counter() }
+
+        compose.onNodeWithText("Count: 0").assertIsDisplayed()
+        compose.onNodeWithText("Increment").performClick()
+        compose.onNodeWithText("Count: 1").assertIsDisplayed()
+    }
+}
+```
+
+### Finders (semantic matchers)
+
+```kotlin
+compose.onNodeWithText("Submit")
+compose.onNodeWithContentDescription("Close")
+compose.onNodeWithTag("submit_btn")                   // testTag modifier
+compose.onAllNodesWithText("Item")                     // multiple
+compose.onNode(hasText("Submit") and hasClickAction())
+compose.onNode(hasAnyAncestor(hasTestTag("list")))
+```
+
+### Assertions
+
+```kotlin
+.assertIsDisplayed()
+.assertIsNotDisplayed()
+.assertExists()                                        // in tree but maybe off-screen
+.assertDoesNotExist()
+.assertIsEnabled()
+.assertIsFocused()
+.assertIsSelected()
+.assertIsOn() / .assertIsOff()
+.assertTextEquals("Hello")
+.assertTextContains("ell")
+.assertContentDescriptionEquals("Close")
+
+compose.onAllNodesWithTag("item").assertCountEquals(5)
+```
+
+### Actions
+
+```kotlin
+.performClick()
+.performLongClick()
+.performTextInput("hello")
+.performTextClearance()
+.performScrollTo()
+.performScrollToIndex(20)
+.performScrollToKey("item-123")
+.performImeAction()                        // Done / Next on keyboard
+.performTouchInput { swipeLeft() }
+.performKeyPress(KeyEvent(NativeKeyEvent(ACTION_DOWN, KEYCODE_TAB)))
+```
+
+### Hilt + Compose test
+
+```kotlin
+@HiltAndroidTest
+class ProfileScreenTest {
+
+    @get:Rule(order = 0) val hiltRule = HiltAndroidRule(this)
+    @get:Rule(order = 1) val compose = createAndroidComposeRule<HiltTestActivity>()
+
+    @BindValue @JvmField val userRepo: UserRepository = FakeUserRepository()
+
+    @Before
+    fun setUp() { hiltRule.inject() }
+
+    @Test
+    fun shows_user_name() {
+        (userRepo as FakeUserRepository).seed(User("u1", "Aarav"))
+
+        compose.setContent { AppTheme { ProfileScreen(userId = "u1") } }
+
+        compose.onNodeWithText("Aarav").assertIsDisplayed()
+    }
+}
+```
+
+`HiltTestActivity` is a bare Activity that exists only for testing —
+your app's MainActivity has its own launch logic we don't want in
+component tests.
+
+```kotlin
+// androidTest/kotlin/.../HiltTestActivity.kt
+@AndroidEntryPoint
+class HiltTestActivity : ComponentActivity()
+```
+
+```xml
+<!-- src/debug/AndroidManifest.xml -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+            android:name="com.myapp.HiltTestActivity"
+            android:exported="false"/>
+    </application>
+</manifest>
+```
+
+### Navigation tests
+
+```kotlin
+@Test
+fun navigates_to_detail_on_click() {
+    compose.setContent {
+        val navController = rememberNavController()
+        AppNavHost(navController)
+    }
+
+    compose.onNodeWithText("Product A").performClick()
+
+    compose.waitUntil(5_000) {
+        compose.onAllNodesWithTag("product_detail").fetchSemanticsNodes().isNotEmpty()
+    }
+    compose.onNodeWithTag("product_detail").assertIsDisplayed()
+}
+```
+
+### Waiting for state
+
+```kotlin
+// Wait for a specific condition
+compose.waitUntil(timeoutMillis = 5_000) {
+    compose.onAllNodesWithText("Loaded").fetchSemanticsNodes().isNotEmpty()
+}
+
+// Wait for Compose to be idle
+compose.waitForIdle()
+
+// Control the main clock for animation testing
+compose.mainClock.autoAdvance = false
+compose.mainClock.advanceTimeBy(500)
+compose.mainClock.advanceTimeByFrame()
+```
+
+### Semantics tree dump — debugging
+
+```kotlin
+compose.onRoot().printToLog("TREE")
+```
+
+Logcat output:
+
+```text
+Node #1 at (0,0)-(1080,2340)px
+  Node #2: Tag='header'
+    Text = [Profile]
+  Node #3: Tag='email_field'
+    EditableText = [a@x.com]
+    Focused = true
+```
+
+Great for "why isn't my node found?" — shows the exact tree Compose has.
+
+---
+
+## Espresso — XML View tests
+
+For legacy screens (or during migration), Espresso is the standard:
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class LoginActivityTest {
+
+    @get:Rule val activityRule = ActivityScenarioRule(LoginActivity::class.java)
+
+    @Test
+    fun shows_error_on_empty_email() {
+        onView(withId(R.id.loginBtn)).perform(click())
+        onView(withId(R.id.emailLayout))
+            .check(matches(hasErrorText("Email required")))
+    }
+
+    @Test
+    fun disables_submit_while_loading() {
+        onView(withId(R.id.email)).perform(typeText("a@x.com"), closeSoftKeyboard())
+        onView(withId(R.id.password)).perform(typeText("secret123"), closeSoftKeyboard())
+        onView(withId(R.id.loginBtn)).perform(click())
+
+        onView(withId(R.id.loginBtn)).check(matches(not(isEnabled())))
+    }
+}
+```
+
+### Intents
+
+```kotlin
+@get:Rule val intentsRule = IntentsRule()
+
+@Test
+fun opens_browser_on_help_link() {
+    onView(withId(R.id.helpLink)).perform(click())
+    intended(allOf(
+        hasAction(Intent.ACTION_VIEW),
+        hasData("https://help.example.com")
+    ))
+}
+```
+
+### RecyclerView
+
+```kotlin
+onView(withId(R.id.recyclerView))
+    .perform(RecyclerViewActions.actionOnItemAtPosition<ViewHolder>(5, click()))
+
+onView(withId(R.id.recyclerView))
+    .perform(RecyclerViewActions.scrollToPosition<ViewHolder>(50))
+```
+
+### Espresso and Compose together
+
+Both can coexist — Espresso actions target `AndroidView`-hosted views;
+Compose actions target composables. A hybrid screen works fine:
+
+```kotlin
+onView(withId(R.id.toolbar)).check(matches(isDisplayed()))      // XML toolbar
+compose.onNodeWithText("Continue").performClick()                // Compose body
+```
+
+---
+
+## UIAutomator — cross-process / system UI
+
+UIAutomator tests the whole device — system notifications, Settings,
+other apps. Use it sparingly for end-to-end:
+
+```kotlin
+@Test
+fun message_notification_appears() {
+    val device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+
+    // Trigger whatever sends a notification
+    triggerPush()
+
+    device.openNotification()
+    device.wait(Until.hasObject(By.textContains("New message")), 5_000)
+
+    val notif = device.findObject(By.textContains("New message"))
+    assertNotNull(notif)
+    notif.click()
+
+    device.wait(Until.hasObject(By.pkg("com.myapp")), 5_000)
+}
+```
+
+---
+
+## Room instrumentation tests
+
+In-memory Room + instrumentation lets you test real SQL without touching
+a device disk:
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class MessageDaoTest {
+
+    private lateinit var db: AppDatabase
+    private lateinit var dao: MessageDao
+
+    @Before
+    fun setUp() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        dao = db.messageDao()
+    }
+
+    @After fun tearDown() { db.close() }
+
+    @Test
+    fun insert_and_observe() = runBlocking {
+        dao.upsert(sampleMessage)
+
+        val observed = dao.observeById("m1").first()
+        assertEquals("m1", observed?.id)
+    }
+
+    @Test
+    fun migration_1_to_2() {
+        val helper = MigrationTestHelper(
+            InstrumentationRegistry.getInstrumentation(),
+            AppDatabase::class.java.canonicalName
+        )
+        helper.createDatabase("test.db", 1).use {
+            it.execSQL("INSERT INTO messages VALUES (...)")
+        }
+        helper.runMigrationsAndValidate("test.db", 2, true, AppDatabase.MIGRATION_1_2)
+    }
+}
+```
+
+---
+
+## Screenshot testing — Paparazzi
+
+Paparazzi renders composables to PNG using `layoutlib` — deterministic,
+no emulator required, runs on a dev laptop:
+
+```kotlin
+// build.gradle.kts
+plugins {
+    id("app.cash.paparazzi")
+}
+
+class PrimaryButtonSnapshotTest {
+    @get:Rule val paparazzi = Paparazzi(
+        deviceConfig = DeviceConfig.PIXEL_6,
+        theme = "android:Theme.Material.Light.NoActionBar"
+    )
+
+    @Test fun light() {
+        paparazzi.snapshot {
+            AppTheme { Button(onClick = {}) { Text("Confirm") } }
+        }
+    }
+
+    @Test fun dark() {
+        paparazzi.snapshot {
+            AppTheme(darkTheme = true) { Button(onClick = {}) { Text("Confirm") } }
+        }
+    }
+
+    @Test fun large_font() {
+        paparazzi.snapshot(deviceConfig = DeviceConfig.PIXEL_6.copy(fontScale = 2f)) {
+            AppTheme { Button(onClick = {}) { Text("Confirm") } }
+        }
+    }
+}
+```
+
+```bash
+./gradlew recordPaparazziDebug     # record baseline PNGs
+./gradlew verifyPaparazziDebug     # fail on diff
+```
+
+Commit the baselines to git. PR diffs show image changes — a visual code
+review for design system changes.
+
+### Roborazzi — alternative that supports interactions
+
+Roborazzi builds on Robolectric, so you can drive Compose test actions
+before snapshotting a state:
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
+class ExpandableCardSnapshotTest {
+    @get:Rule val compose = createComposeRule()
+
+    @Test
+    fun expanded_state() {
+        compose.setContent { ExpandableCard(title = "Title", body = "Body") }
+
+        compose.onRoot().captureRoboImage("collapsed.png")
+
+        compose.onNodeWithText("Title").performClick()
+        compose.waitForIdle()
+
+        compose.onRoot().captureRoboImage("expanded.png")
+    }
+}
+```
+
+---
+
+## Accessibility testing
+
+```kotlin
+@HiltAndroidTest
+class ProfileA11yTest {
+    @get:Rule(order = 0) val hiltRule = HiltAndroidRule(this)
+    @get:Rule(order = 1) val compose = createAndroidComposeRule<HiltTestActivity>()
+
+    @Test
+    fun all_buttons_have_labels() {
+        compose.setContent { ProfileScreen() }
+
+        compose.onAllNodesWithRole(Role.Button)
+            .assertAll(hasContentDescription() or hasText())
+    }
+
+    @Test
+    fun a11y_audit_passes() {
+        compose.setContent { ProfileScreen() }
+        compose.onRoot().performAccessibilityAudit()   // Google A11y Test Framework
+    }
+}
+```
+
+See [Module 19 — Enterprise UX](/docs/enterprise-ux/overview) for the
+full accessibility playbook.
+
+---
+
+## Firebase Test Lab — cross-device CI
+
+```bash
+# CLI — trigger a run across a device matrix
+gcloud firebase test android run \
+    --type instrumentation \
+    --app app/build/outputs/apk/debug/app-debug.apk \
+    --test app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk \
+    --device model=pixel6,version=33,locale=en,orientation=portrait \
+    --device model=oriole,version=31 \
+    --device model=blueline,version=28 \
+    --timeout 10m
+```
+
+Firebase Test Lab runs your instrumented tests on physical devices in
+Google's lab. Catches device-specific regressions (OEM quirks, API level
+incompatibilities) you'd never see on your emulator.
+
+Integrate into CI (GitHub Actions, GitLab CI) to run on every release
+branch.
+
+---
+
+## Emulator vs physical device
+
+| | Emulator                             | Physical device                         |
+|-|---------------------------------------|------------------------------------------|
+| Speed | Fast with x86_64 + KVM          | Slower, real hardware timing            |
+| Determinism | High                        | OEM variations                          |
+| Sensors | Simulated                      | Real                                    |
+| Camera | Virtual scenes                   | Real                                    |
+| Cost | Free                               | Physical lab or Firebase Test Lab       |
+| Use | PR validation, most tests           | Release candidate validation            |
+
+Use emulators in CI for speed. Run a nightly job on Firebase Test Lab with
+3-5 physical device types for coverage.
+
+---
+
+## Test AVD manager
+
+AVDs for CI should use system images with the exact API levels you
+support:
+
+```bash
+# Install minimal set
+sdkmanager "system-images;android-28;google_apis;x86_64"
+sdkmanager "system-images;android-33;google_apis;x86_64"
+sdkmanager "system-images;android-34;google_apis;x86_64"
+
+# Create an AVD
+echo "no" | avdmanager create avd -n pixel_6_api_34 \
+    -k "system-images;android-34;google_apis;x86_64" \
+    -d pixel_6
+
+# Boot with no window
+$ANDROID_HOME/emulator/emulator -avd pixel_6_api_34 -no-window -no-audio -no-boot-anim &
+```
+
+Or use the `reactivecircus/android-emulator-runner` GitHub Action — one
+line in CI:
+
+```yaml
+- uses: reactivecircus/android-emulator-runner@v2
+  with:
+    api-level: 34
+    target: google_apis
+    arch: x86_64
+    script: ./gradlew connectedDebugAndroidTest
+```
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Test problems',
+    variant: 'old',
+    points: [
+      'Using instrumentation for logic you could unit-test',
+      'Hardcoded Thread.sleep in instrumented tests',
+      'Tests depending on network',
+      'Screenshot tests with timestamps / random IDs',
+      'testTag on every node (pollutes prod code)',
+      'Ignoring flaky tests rather than fixing them'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Reliable instrumentation',
+    variant: 'new',
+    points: [
+      'Unit-test first; instrument for UI integration',
+      'compose.waitUntil / compose.mainClock APIs',
+      'Mock network at OkHttp layer; never hit real servers',
+      'Freeze the clock + seed RNG for deterministic snapshots',
+      'Prefer semantic finders (onNodeWithText) over testTag',
+      'Quarantine + fix flakies within a sprint'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Instrumentation testing rules">
+- **AndroidJUnit4 + ComposeTestRule** is the default for UI tests.
+- **Hilt + `@BindValue`** replaces real deps with fakes inside tests.
+- **Espresso** for XML, **UIAutomator** for cross-process, **UIAutomator** for system-UI integration.
+- **Room in-memory DB** + instrumentation for fast DAO tests.
+- **Paparazzi / Roborazzi** for deterministic snapshot testing without an emulator.
+- **Firebase Test Lab** for cross-device validation; emulators in CI for speed.
+- **Accessibility audits** with `performAccessibilityAudit()` per screen.
+- Minimize instrumentation — most bugs surface in unit tests if you write them right.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Hilt + Compose test', description: 'Write a @HiltAndroidTest for a ProfileScreen using createAndroidComposeRule<HiltTestActivity> and @BindValue for a fake repo.' },
+  { title: 'Navigation flow', description: 'Test a 3-screen flow (home → list → detail) using Compose Test + NavController. Assert back navigation restores list state.' },
+  { title: 'Paparazzi baseline', description: 'Add Paparazzi for a design-system component. Record Light + Dark + 2x-font + RTL baselines. Break the component intentionally and verify the diff.' },
+  { title: 'A11y audit', description: 'Call performAccessibilityAudit() on 3 screens. Fix any violations (missing labels, low contrast, small touch targets).' },
+  { title: 'Firebase Test Lab CI', description: 'Add a CI job that uploads APK + test APK to Firebase Test Lab and runs on 3 device types. Fail the build on any test failure.' }
+]} />
+
+## Next
+
+Continue to **[TDD & Code Coverage](./tdd-coverage)** for the methodology, or **[Benchmark & Property-Based](./benchmark-property-based)** for performance and advanced testing.

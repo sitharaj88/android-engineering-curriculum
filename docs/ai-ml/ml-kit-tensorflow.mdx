@@ -1,0 +1,509 @@
+---
+id: ml-kit-tensorflow
+title: ML Kit & TensorFlow Lite
+sidebar_label: ML Kit & TF Lite
+description: Google ML Kit pre-built features (text, barcode, face, pose, translation, smart reply) and TensorFlow Lite / LiteRT for custom models.
+---
+
+import { Callout, StepList, ComparisonCard, FeatureGrid } from '@site/src/components/Doc';
+
+# ML Kit & TensorFlow Lite
+
+Not every AI task needs an LLM. **ML Kit** ships pre-built features —
+text recognition, barcodes, faces, translation — that work on every
+Android device. **TensorFlow Lite** (rebranded LiteRT) is the escape
+hatch when you need a custom model. Both run 100% on-device.
+
+## ML Kit overview
+
+<FeatureGrid columns={3} features={[
+  { icon: '📝', title: 'Text Recognition', description: 'OCR from camera or image. Supports 100+ scripts. Works offline.' },
+  { icon: '🔍', title: 'Barcode Scanning', description: 'QR, UPC, EAN, PDF417, Data Matrix. 12+ formats.' },
+  { icon: '😀', title: 'Face Detection', description: 'Faces + landmarks + expressions. Real-time.' },
+  { icon: '🏃', title: 'Pose Detection', description: 'Human body pose, 33 landmarks, 3D.' },
+  { icon: '🌐', title: 'Translation', description: '60+ languages, offline after first download.' },
+  { icon: '💬', title: 'Smart Reply', description: 'Suggested responses for chat messages.' },
+  { icon: '🖼️', title: 'Image Labeling', description: 'Classify image content (custom model support).' },
+  { icon: '✂️', title: 'Selfie Segmentation', description: 'Separate person from background. Real-time.' },
+  { icon: '📄', title: 'Document Scanner', description: 'Auto-crop + perspective correct + enhance.' }
+]} />
+
+All ML Kit features are **bundled** (run fully offline after SDK install)
+or **unbundled** (downloaded from Play Services on demand).
+
+### Bundled vs unbundled
+
+| Bundled                                    | Unbundled                                    |
+|--------------------------------------------|---------------------------------------------|
+| Works offline immediately                  | Requires Play Services                      |
+| Larger APK (~5-20 MB per feature)          | Tiny APK; models downloaded lazily          |
+| Deterministic availability                 | May fail to download                        |
+| Good for core features                     | Good for optional features                  |
+
+---
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+ml-kit-text       = { module = "com.google.mlkit:text-recognition", version = "16.0.0" }
+ml-kit-text-cjk   = { module = "com.google.mlkit:text-recognition-chinese", version = "16.0.0" }
+ml-kit-barcode    = { module = "com.google.mlkit:barcode-scanning", version = "17.3.0" }
+ml-kit-face       = { module = "com.google.mlkit:face-detection", version = "16.1.7" }
+ml-kit-translate  = { module = "com.google.mlkit:translate", version = "17.0.3" }
+ml-kit-smart-reply = { module = "com.google.mlkit:smart-reply", version = "17.0.4" }
+ml-kit-docscanner = { module = "com.google.android.gms:play-services-mlkit-document-scanner", version = "16.0.0-beta1" }
+ml-kit-selfie-seg = { module = "com.google.mlkit:segmentation-selfie", version = "16.0.0-beta6" }
+```
+
+---
+
+## Text Recognition — OCR from images
+
+```kotlin
+class TextOcrService @Inject constructor() {
+    private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+
+    suspend fun recognize(bitmap: Bitmap): TextResult = suspendCancellableCoroutine { cont ->
+        val image = InputImage.fromBitmap(bitmap, 0)
+        recognizer.process(image)
+            .addOnSuccessListener { result ->
+                val blocks = result.textBlocks.map { block ->
+                    TextBlock(
+                        text = block.text,
+                        boundingBox = block.boundingBox,
+                        cornerPoints = block.cornerPoints?.toList() ?: emptyList()
+                    )
+                }
+                cont.resume(TextResult(result.text, blocks)) {}
+            }
+            .addOnFailureListener { cont.resumeWithException(it) }
+    }
+}
+
+data class TextResult(val fullText: String, val blocks: List<TextBlock>)
+data class TextBlock(val text: String, val boundingBox: Rect?, val cornerPoints: List<Point>)
+```
+
+### In a CameraX pipeline
+
+```kotlin
+@OptIn(ExperimentalGetImage::class)
+val analyzer = ImageAnalysis.Analyzer { imageProxy ->
+    val mediaImage = imageProxy.image ?: run { imageProxy.close(); return@Analyzer }
+    val input = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+
+    recognizer.process(input)
+        .addOnSuccessListener { result ->
+            // Display detected text bounds on overlay
+            onTextDetected(result)
+        }
+        .addOnCompleteListener { imageProxy.close() }    // critical
+}
+```
+
+Real-time receipt scanning: ~10 FPS on a mid-tier device. See
+[CameraX & Sensors](/docs/advanced-components/camerax-sensors) for the
+full pipeline.
+
+---
+
+## Barcode Scanning
+
+```kotlin
+val options = BarcodeScannerOptions.Builder()
+    .setBarcodeFormats(
+        Barcode.FORMAT_QR_CODE,
+        Barcode.FORMAT_EAN_13,
+        Barcode.FORMAT_UPC_A,
+        Barcode.FORMAT_CODE_128
+    )
+    .build()
+
+val scanner = BarcodeScanning.getClient(options)
+
+@OptIn(ExperimentalGetImage::class)
+val analyzer = ImageAnalysis.Analyzer { imageProxy ->
+    val mediaImage = imageProxy.image ?: run { imageProxy.close(); return@Analyzer }
+    val input = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+
+    scanner.process(input)
+        .addOnSuccessListener { barcodes ->
+            barcodes.firstOrNull()?.let { barcode ->
+                when (barcode.valueType) {
+                    Barcode.TYPE_URL -> onUrl(barcode.url?.url)
+                    Barcode.TYPE_WIFI -> onWifi(barcode.wifi?.ssid, barcode.wifi?.password)
+                    Barcode.TYPE_CONTACT_INFO -> onContact(barcode.contactInfo)
+                    else -> onGenericBarcode(barcode.rawValue)
+                }
+            }
+        }
+        .addOnCompleteListener { imageProxy.close() }
+}
+```
+
+Barcode scanner restricts to specified formats — faster if you only need
+QR codes (common).
+
+---
+
+## Face Detection
+
+```kotlin
+val options = FaceDetectorOptions.Builder()
+    .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)  // or FAST
+    .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+    .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+    .setMinFaceSize(0.15f)
+    .enableTracking()
+    .build()
+
+val detector = FaceDetection.getClient(options)
+
+suspend fun detectFaces(bitmap: Bitmap): List<Face> = suspendCancellableCoroutine { cont ->
+    detector.process(InputImage.fromBitmap(bitmap, 0))
+        .addOnSuccessListener { faces ->
+            cont.resume(faces.map { face ->
+                Face(
+                    bounds = face.boundingBox,
+                    smilingProbability = face.smilingProbability ?: 0f,
+                    leftEyeOpenProbability = face.leftEyeOpenProbability ?: 0f,
+                    rightEyeOpenProbability = face.rightEyeOpenProbability ?: 0f,
+                    rotationY = face.headEulerAngleY,
+                    rotationZ = face.headEulerAngleZ,
+                    landmarks = face.allLandmarks.map { it.position }
+                )
+            }) {}
+        }
+        .addOnFailureListener { cont.resumeWithException(it) }
+}
+```
+
+Use for:
+- Auto-capture when everyone is smiling
+- Unlock via face (not production-secure; use BiometricPrompt for that)
+- AR filters (overlay glasses, hats)
+- Attention tracking (eye-open probability for fatigue detection)
+
+---
+
+## Translation
+
+```kotlin
+class TranslationService {
+    suspend fun translate(text: String, sourceLang: String, targetLang: String): String {
+        val options = TranslatorOptions.Builder()
+            .setSourceLanguage(sourceLang)
+            .setTargetLanguage(targetLang)
+            .build()
+
+        val translator = Translation.getClient(options)
+
+        // Ensure model is downloaded
+        val conditions = DownloadConditions.Builder().requireWifi().build()
+        translator.downloadModelIfNeeded(conditions).await()
+
+        return translator.translate(text).await()
+    }
+}
+
+// Usage
+val translated = translationService.translate(
+    text = "Hello, world!",
+    sourceLang = TranslateLanguage.ENGLISH,
+    targetLang = TranslateLanguage.SPANISH
+)
+// → "¡Hola mundo!"
+```
+
+Each language pair model is ~20-30 MB. First call triggers download
+(respect `requireWifi()`). Subsequent calls are instant and offline.
+
+### Language identification
+
+```kotlin
+val identifier = LanguageIdentification.getClient()
+val lang = identifier.identifyLanguage(text).await()
+// lang = "en", "hi", "und" (undetermined), etc.
+```
+
+Pair with Translation for auto-translate features.
+
+---
+
+## Smart Reply
+
+```kotlin
+val smartReply = SmartReply.getClient()
+
+suspend fun suggestReplies(conversation: List<ChatMessage>): List<String> {
+    val mlMessages = conversation.map { msg ->
+        if (msg.isFromUser) {
+            TextMessage.createForLocalUser(msg.body, msg.timestampMs)
+        } else {
+            TextMessage.createForRemoteUser(msg.body, msg.timestampMs, msg.senderId)
+        }
+    }
+    val result = smartReply.suggestReplies(mlMessages).await()
+    return result.suggestions.map { it.text }
+}
+```
+
+Returns up to 3 short reply suggestions. Works for English only (as of
+2025). Display below the chat input for quick-reply UX.
+
+---
+
+## Pose Detection (MediaPipe Tasks)
+
+Beyond ML Kit, **MediaPipe Tasks** offers more advanced features:
+
+```kotlin
+// libs.versions.toml
+mediapipe-tasks = { module = "com.google.mediapipe:tasks-vision", version = "0.10.15" }
+```
+
+```kotlin
+val baseOptions = BaseOptions.builder()
+    .setModelAssetPath("pose_landmarker_lite.task")
+    .build()
+val options = PoseLandmarker.PoseLandmarkerOptions.builder()
+    .setBaseOptions(baseOptions)
+    .setRunningMode(RunningMode.LIVE_STREAM)
+    .setResultListener(::onResult)
+    .setErrorListener { /* ... */ }
+    .build()
+
+val landmarker = PoseLandmarker.createFromOptions(context, options)
+
+// In ImageAnalysis
+@OptIn(ExperimentalGetImage::class)
+val analyzer = ImageAnalysis.Analyzer { imageProxy ->
+    val bitmap = imageProxy.toBitmap()
+    val mpImage = BitmapImageBuilder(bitmap).build()
+    landmarker.detectAsync(mpImage, imageProxy.imageInfo.timestamp)
+    imageProxy.close()
+}
+
+private fun onResult(result: PoseLandmarkerResult, input: MPImage) {
+    val landmarks = result.landmarks().firstOrNull() ?: return
+    // 33 landmarks: nose, shoulders, elbows, wrists, hips, knees, ankles, ...
+    val leftWrist = landmarks[15]
+    val rightWrist = landmarks[16]
+    // Detect gestures / check form / count reps
+}
+```
+
+Used for:
+- Fitness apps (squat counting, form analysis)
+- Gesture control
+- AR body overlays
+
+---
+
+## TensorFlow Lite / LiteRT — custom models
+
+When ML Kit doesn't fit, drop to TF Lite:
+
+```kotlin
+// libs.versions.toml
+tflite-task       = { module = "org.tensorflow:tensorflow-lite-task-vision", version = "0.4.4" }
+tflite-support    = { module = "org.tensorflow:tensorflow-lite-support", version = "0.4.4" }
+tflite-gpu        = { module = "org.tensorflow:tensorflow-lite-gpu-delegate-plugin", version = "0.4.4" }
+```
+
+### Example — product classifier
+
+You trained a model on your product catalog. Ship the `.tflite` file:
+
+```kotlin
+class ProductClassifier @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    private val classifier: ImageClassifier by lazy {
+        val options = ImageClassifier.ImageClassifierOptions.builder()
+            .setMaxResults(3)
+            .setScoreThreshold(0.5f)
+            .setBaseOptions(BaseOptions.builder().useGpu().build())
+            .build()
+
+        ImageClassifier.createFromFileAndOptions(context, "product_classifier.tflite", options)
+    }
+
+    fun classify(bitmap: Bitmap): List<Classification> {
+        val tensorImage = TensorImage.fromBitmap(bitmap)
+        val results = classifier.classify(tensorImage)
+        return results.firstOrNull()?.categories?.map {
+            Classification(label = it.label, score = it.score)
+        } ?: emptyList()
+    }
+}
+
+data class Classification(val label: String, val score: Float)
+```
+
+### Delegates — hardware acceleration
+
+| Delegate                 | Speed up   | When to use                                |
+|--------------------------|-----------|--------------------------------------------|
+| CPU (default)            | 1x         | Always works                               |
+| GPU                      | 3-5x       | Most devices with a GPU                    |
+| NNAPI                    | 2-10x      | NPU-equipped devices (Pixel 6+)            |
+| Hexagon DSP              | 3-8x       | Qualcomm-powered devices                   |
+
+Use `useGpu()` first; fall back to CPU if initialization fails.
+
+### Model distribution via Firebase ML
+
+Instead of bundling the `.tflite` in the APK:
+
+```kotlin
+val conditions = CustomModelDownloadConditions.Builder()
+    .requireWifi()
+    .build()
+
+FirebaseModelDownloader.getInstance()
+    .getModel("product_classifier_v2", DownloadType.LATEST_MODEL, conditions)
+    .addOnSuccessListener { model ->
+        val modelFile = model.file
+        val interpreter = Interpreter(modelFile!!)
+        // Use the interpreter
+    }
+```
+
+Firebase ML hosts the model. You can push new versions without app
+updates. Great for iterating on model quality.
+
+### Text embeddings for RAG
+
+```kotlin
+val embedder = TextEmbedder.createFromFile(context, "universal_sentence_encoder.tflite")
+
+fun embed(text: String): FloatArray {
+    val embedding = embedder.embed(text)
+    return embedding.embeddings().first().floatArray()
+}
+
+fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
+    var dot = 0f; var magA = 0f; var magB = 0f
+    for (i in a.indices) {
+        dot += a[i] * b[i]
+        magA += a[i] * a[i]
+        magB += b[i] * b[i]
+    }
+    return dot / (sqrt(magA) * sqrt(magB))
+}
+```
+
+Enables semantic search — find similar notes, group similar messages.
+Required for RAG with Gemini Nano (see [Gemini Nano](./gemini-nano)).
+
+---
+
+## Model optimization
+
+### Quantization
+
+Full-precision FP32 → INT8 quantization shrinks models 4x with minimal
+accuracy loss:
+
+```python
+# Training-side (Python)
+converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.representative_dataset = representative_dataset_gen
+converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+converter.inference_input_type = tf.int8
+converter.inference_output_type = tf.int8
+tflite_model = converter.convert()
+```
+
+Always quantize before shipping. A quantized model runs faster, uses
+less RAM, and ships as a smaller file.
+
+### Pruning
+
+Remove weights that contribute little. Combined with quantization, a
+30MB model becomes ~5MB.
+
+---
+
+## Benchmarking inference
+
+```kotlin
+@get:Rule val rule = BenchmarkRule()
+
+@Test fun classifier_inference_time() {
+    val classifier = ProductClassifier(context)
+    val bitmap = BitmapFactory.decodeResource(context.resources, R.drawable.sample_product)
+
+    rule.measureRepeated {
+        classifier.classify(bitmap)
+    }
+}
+```
+
+Measure on the range of target devices — low-end matters more than
+flagship. Run in release builds for accurate numbers.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'ML Kit / TF Lite mistakes',
+    variant: 'old',
+    points: [
+      'Running inference on the main thread',
+      'Not closing ImageProxy after ML Kit call',
+      'Bundling huge TF models into APK (base APK bloat)',
+      'CPU-only delegates when GPU is available',
+      'Shipping float32 models without quantization',
+      'Not caching Translation model downloads'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production ML',
+    variant: 'new',
+    points: [
+      'All inference on Dispatchers.Default or a dedicated executor',
+      'imageProxy.close() in addOnCompleteListener',
+      'Firebase ML for custom models > 5MB',
+      'GPU delegate primary; CPU fallback',
+      'INT8 quantization before shipping',
+      'Download Translation models on first use, keep them'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="ML Kit & TF Lite rules">
+- **ML Kit** for pre-built features — text, barcode, face, translation, smart reply.
+- **MediaPipe Tasks** for pose, gesture, and other advanced vision.
+- **TensorFlow Lite / LiteRT** for custom models — quantize, use GPU delegate, distribute via Firebase ML.
+- **Bundled vs unbundled** — bundle critical features, unbundle optional.
+- **Always close `ImageProxy`** in ImageAnalysis to prevent backpressure.
+- **Combine with Gemini Nano** for RAG — embeddings for retrieval, LLM for generation.
+- **Model optimization**: quantize + prune + pick the right delegate.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'OCR from camera', description: 'Integrate ML Kit Text Recognition into a CameraX ImageAnalysis. Overlay detected text bounds on the preview.' },
+  { title: 'Barcode → action', description: 'Scan a QR code, parse URL / Wi-Fi / contact types, and trigger appropriate intents (open URL, save contact, etc.).' },
+  { title: 'Smart replies', description: 'Add Smart Reply to your chat app. Display 3 suggestions below the message input.' },
+  { title: 'Custom TF Lite', description: 'Train or download a simple image classifier. Integrate with GPU delegate. Benchmark inference time.' },
+  { title: 'RAG with embeddings', description: 'Use Universal Sentence Encoder to embed 100 notes. Semantic search for a query. Pass top-5 to Gemini Nano for Q&A.' }
+]} />
+
+## Next
+
+Return to **[Module 21 Overview](./overview)** or continue to advanced
+platform topics like **[Graphics & Rendering](/docs/graphics-media/graphics-rendering)**.
