@@ -1,0 +1,578 @@
+---
+id: forms-text-input
+title: Forms & Text Input
+sidebar_label: Forms & Text Input
+description: TextField deep dive — visual transformations, keyboard controllers, IME actions, focus management, validation, BasicTextField2, auto-fill, and form state.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Forms & Text Input
+
+Text input is where most apps leak UX quality. Getting keyboard behavior,
+validation, focus traversal, IME actions, and auto-fill right is the
+difference between "works" and "feels polished." This chapter covers every
+input API.
+
+## `TextField` — the Material 3 workhorse
+
+```kotlin
+@Composable
+fun LoginForm() {
+    var email by rememberSaveable { mutableStateOf("") }
+    var password by rememberSaveable { mutableStateOf("") }
+    var passwordVisible by remember { mutableStateOf(false) }
+
+    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        OutlinedTextField(
+            value = email,
+            onValueChange = { email = it },
+            label = { Text("Email") },
+            leadingIcon = { Icon(Icons.Default.Email, contentDescription = null) },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Email,
+                imeAction = ImeAction.Next,
+                autoCorrectEnabled = false
+            ),
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        OutlinedTextField(
+            value = password,
+            onValueChange = { password = it },
+            label = { Text("Password") },
+            leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null) },
+            trailingIcon = {
+                IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                    Icon(
+                        imageVector = if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                        contentDescription = if (passwordVisible) "Hide password" else "Show password"
+                    )
+                }
+            },
+            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Password,
+                imeAction = ImeAction.Done
+            ),
+            keyboardActions = KeyboardActions(onDone = { submit() }),
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Button(onClick = { submit() }, enabled = email.isNotBlank() && password.isNotBlank()) {
+            Text("Sign in")
+        }
+    }
+}
+```
+
+### TextField vs OutlinedTextField
+
+- `TextField` — filled variant, emphasized visual
+- `OutlinedTextField` — outlined variant (most forms)
+
+Both accept the same parameters. Pick based on your design system.
+
+---
+
+## Keyboard options
+
+| `KeyboardType`     | When to use                                    |
+|--------------------|------------------------------------------------|
+| `Text`             | Default                                        |
+| `Email`            | Email addresses                                |
+| `Password`         | Passwords (also set `visualTransformation`)   |
+| `Number`           | Integer-only numeric pad                      |
+| `NumberPassword`   | Numeric with dots masking                     |
+| `Decimal`          | Numeric with decimal point                    |
+| `Phone`            | Phone numbers                                  |
+| `Uri`              | URL entry                                      |
+| `Ascii`            | ASCII-only                                    |
+| `Unspecified`      | Default                                        |
+
+| `ImeAction` | Produces                              |
+|-------------|---------------------------------------|
+| `Done`      | Done / checkmark — closes keyboard    |
+| `Next`      | Next field button                     |
+| `Previous`  | Previous field                        |
+| `Search`    | Search icon                           |
+| `Send`      | Send icon                             |
+| `Go`        | Go (typically for URLs)               |
+| `None`      | Enter adds a newline                  |
+
+---
+
+## Visual transformations
+
+Format the display without changing the underlying value:
+
+### Password
+
+```kotlin
+visualTransformation = PasswordVisualTransformation(mask = '●')
+```
+
+### Credit card — `1234 5678 9012 3456`
+
+```kotlin
+class CreditCardTransformation : VisualTransformation {
+    override fun filter(text: AnnotatedString): TransformedText {
+        val trimmed = text.text.take(16)
+        val formatted = trimmed.chunked(4).joinToString(" ")
+        val offsetMapping = object : OffsetMapping {
+            override fun originalToTransformed(offset: Int) =
+                offset + (offset / 4).coerceAtMost(3)
+            override fun transformedToOriginal(offset: Int) =
+                offset - (offset / 5).coerceAtMost(3)
+        }
+        return TransformedText(AnnotatedString(formatted), offsetMapping)
+    }
+}
+```
+
+### Phone number masking — `(555) 123-4567`
+
+```kotlin
+class PhoneTransformation : VisualTransformation {
+    override fun filter(text: AnnotatedString): TransformedText {
+        val digits = text.text.filter { it.isDigit() }.take(10)
+        val formatted = buildString {
+            digits.forEachIndexed { i, c ->
+                when (i) {
+                    0 -> append("(").append(c)
+                    3 -> append(") ").append(c)
+                    6 -> append("-").append(c)
+                    else -> append(c)
+                }
+            }
+        }
+        return TransformedText(
+            AnnotatedString(formatted),
+            PhoneOffsetMapping(digits.length)
+        )
+    }
+}
+```
+
+---
+
+## Focus management
+
+```kotlin
+@Composable
+fun MultiFieldForm() {
+    val emailFocus = remember { FocusRequester() }
+    val passwordFocus = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    Column {
+        OutlinedTextField(
+            value = email, onValueChange = { email = it },
+            label = { Text("Email") },
+            modifier = Modifier.focusRequester(emailFocus),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+            keyboardActions = KeyboardActions(onNext = { passwordFocus.requestFocus() })
+        )
+
+        OutlinedTextField(
+            value = password, onValueChange = { password = it },
+            label = { Text("Password") },
+            modifier = Modifier.focusRequester(passwordFocus),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(
+                onDone = {
+                    keyboardController?.hide()
+                    submit()
+                }
+            )
+        )
+    }
+
+    LaunchedEffect(Unit) { emailFocus.requestFocus() }  // auto-focus on load
+}
+```
+
+### Focus order
+
+```kotlin
+Modifier.focusProperties {
+    next = passwordFocus    // Tab / Next moves here
+    previous = emailFocus
+    right = helpFocus
+}
+```
+
+### Clear focus on submit
+
+```kotlin
+val focusManager = LocalFocusManager.current
+
+Button(onClick = {
+    focusManager.clearFocus()
+    submit()
+}) { Text("Submit") }
+```
+
+---
+
+## Keyboard controllers
+
+```kotlin
+val keyboard = LocalSoftwareKeyboardController.current
+
+keyboard?.show()     // show the soft keyboard
+keyboard?.hide()     // hide it
+```
+
+**Common pattern** — dismiss keyboard on tap outside:
+
+```kotlin
+Box(
+    Modifier
+        .fillMaxSize()
+        .pointerInput(Unit) {
+            detectTapGestures(onTap = { focusManager.clearFocus() })
+        }
+) {
+    Column { /* form fields */ }
+}
+```
+
+---
+
+## IME insets — keyboard overlap
+
+```xml
+<!-- AndroidManifest.xml — required for modern insets -->
+<activity
+    android:name=".MainActivity"
+    android:windowSoftInputMode="adjustResize">
+```
+
+```kotlin
+Scaffold(
+    modifier = Modifier.imePadding()            // pad for keyboard
+) { innerPadding ->
+    Column(
+        Modifier
+            .padding(innerPadding)
+            .verticalScroll(rememberScrollState())
+            .imeNestedScroll()
+    ) { /* form */ }
+}
+```
+
+Always use `Modifier.imePadding()` or the `WindowInsets.ime` API. The old
+`adjustResize` mode alone isn't enough with edge-to-edge apps.
+
+---
+
+## Auto-fill integration
+
+Compose 1.7+ supports Android Autofill semantics:
+
+```kotlin
+OutlinedTextField(
+    value = email,
+    onValueChange = { email = it },
+    modifier = Modifier.semantics {
+        contentType = ContentType.EmailAddress
+    }
+)
+
+OutlinedTextField(
+    value = password,
+    onValueChange = { password = it },
+    modifier = Modifier.semantics {
+        contentType = ContentType.Password
+    }
+)
+```
+
+Other content types: `Username`, `NewUsername`, `NewPassword`, `CreditCardNumber`,
+`PostalAddress`, `PhoneNumber`, `PersonFullName`, etc.
+
+This lets Google Autofill, 1Password, and Dashlane fill fields correctly.
+
+---
+
+## `BasicTextField` — the low-level primitive
+
+Material `TextField` wraps `BasicTextField`. For fully custom designs, go
+direct:
+
+```kotlin
+BasicTextField(
+    value = text,
+    onValueChange = { text = it },
+    modifier = Modifier.fillMaxWidth(),
+    textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
+    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+    decorationBox = { innerField ->
+        Column {
+            Text("Custom label", style = MaterialTheme.typography.labelSmall)
+            Box(modifier = Modifier.padding(vertical = 8.dp)) {
+                if (text.isEmpty()) Text("Placeholder", color = Color.Gray)
+                innerField()
+            }
+            HorizontalDivider()
+        }
+    }
+)
+```
+
+### `BasicTextField` (formerly `BasicTextField2`)
+
+The new state-based API uses `TextFieldState`:
+
+```kotlin
+@Composable
+fun SearchBar() {
+    val state = rememberTextFieldState(initialText = "")
+
+    BasicTextField(
+        state = state,
+        modifier = Modifier.fillMaxWidth(),
+        textStyle = MaterialTheme.typography.bodyLarge
+    )
+
+    // Observe via snapshotFlow
+    LaunchedEffect(state) {
+        snapshotFlow { state.text.toString() }
+            .debounce(300)
+            .collect { query -> viewModel.search(query) }
+    }
+}
+```
+
+`TextFieldState` is **the recommended approach for new code** — it separates
+text state from composable lifecycle, supports undo/redo, and is more
+performant.
+
+---
+
+## Validation UX
+
+### Inline vs submit-time
+
+- **Inline errors** — validate on every keystroke after first blur. Show
+  error below the field.
+- **Submit-time errors** — for fields where inline feels noisy (e.g.
+  checking an email is registered).
+
+```kotlin
+@Composable
+fun EmailField(
+    email: String,
+    onEmailChange: (String) -> Unit,
+    wasBlurred: Boolean,
+    onBlur: () -> Unit
+) {
+    val error = remember(email, wasBlurred) {
+        when {
+            !wasBlurred -> null                                           // no error before blur
+            email.isBlank() -> "Email is required"
+            !email.matches(Regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$")) -> "Invalid email"
+            else -> null
+        }
+    }
+
+    OutlinedTextField(
+        value = email,
+        onValueChange = onEmailChange,
+        label = { Text("Email") },
+        isError = error != null,
+        supportingText = { error?.let { Text(it) } },
+        modifier = Modifier
+            .fillMaxWidth()
+            .onFocusChanged { if (!it.isFocused && !wasBlurred) onBlur() }
+    )
+}
+```
+
+### Form-level state
+
+Move form state into a state holder to reduce composable complexity:
+
+```kotlin
+@Stable
+class LoginFormState(
+    initialEmail: String = "",
+    initialPassword: String = ""
+) {
+    var email by mutableStateOf(initialEmail)
+    var emailError: String? by mutableStateOf(null)
+    var password by mutableStateOf(initialPassword)
+    var passwordError: String? by mutableStateOf(null)
+
+    val isValid: Boolean
+        get() = email.isNotBlank() && emailError == null &&
+                password.isNotBlank() && passwordError == null
+
+    fun validateEmail() {
+        emailError = when {
+            email.isBlank() -> "Email is required"
+            !email.matches(EMAIL_REGEX) -> "Invalid email"
+            else -> null
+        }
+    }
+
+    fun validatePassword() {
+        passwordError = when {
+            password.length < 8 -> "At least 8 characters"
+            else -> null
+        }
+    }
+}
+
+@Composable
+fun rememberLoginFormState() = rememberSaveable(saver = LoginFormStateSaver) {
+    LoginFormState()
+}
+```
+
+---
+
+## Multi-line input
+
+```kotlin
+OutlinedTextField(
+    value = body,
+    onValueChange = { body = it },
+    label = { Text("Message") },
+    minLines = 3,
+    maxLines = 8,
+    modifier = Modifier.fillMaxWidth()
+)
+```
+
+For rich text (bold, links), use `AnnotatedString` + `BasicTextField`. For
+markdown or HTML editing, consider a WebView wrapped in `AndroidView`.
+
+---
+
+## TextField with character counter
+
+```kotlin
+OutlinedTextField(
+    value = bio,
+    onValueChange = { if (it.length <= 160) bio = it },
+    label = { Text("Bio") },
+    supportingText = {
+        Text(
+            text = "${bio.length} / 160",
+            modifier = Modifier.fillMaxWidth(),
+            textAlign = TextAlign.End
+        )
+    },
+    isError = bio.length > 140,     // warning color above 140
+    modifier = Modifier.fillMaxWidth()
+)
+```
+
+---
+
+## Search bar pattern
+
+```kotlin
+@Composable
+fun SearchBar(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onSearch: (String) -> Unit
+) {
+    OutlinedTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        placeholder = { Text("Search") },
+        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+        trailingIcon = {
+            if (query.isNotEmpty()) {
+                IconButton(onClick = { onQueryChange("") }) {
+                    Icon(Icons.Default.Clear, contentDescription = "Clear")
+                }
+            }
+        },
+        singleLine = true,
+        shape = CircleShape,
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+        keyboardActions = KeyboardActions(onSearch = { onSearch(query) }),
+        modifier = Modifier.fillMaxWidth()
+    )
+}
+
+// In parent, debounce for live-search
+val debouncedQuery by remember {
+    snapshotFlow { query }
+        .debounce(300)
+        .distinctUntilChanged()
+}.collectAsStateWithLifecycle(initialValue = "")
+
+LaunchedEffect(debouncedQuery) {
+    viewModel.search(debouncedQuery)
+}
+```
+
+---
+
+## Common pitfalls
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Input traps',
+    variant: 'old',
+    points: [
+      'Storing TextField state in ViewModel (unnecessary VM roundtrip on every char)',
+      'Not using rememberSaveable (loses input on rotation)',
+      'Validating on every keystroke before blur',
+      'Not setting keyboardType / imeAction',
+      'Hardcoded padding that clips with IME',
+      'Password field without contentType = Password for autofill'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Correct patterns',
+    variant: 'new',
+    points: [
+      'Local remember/rememberSaveable + debounce to VM',
+      'rememberSaveable for every form field',
+      'Validate on blur OR on submit; inline only when helpful',
+      'Every TextField specifies keyboardOptions',
+      'Modifier.imePadding() + adjustResize',
+      'Semantic contentType for autofill'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Forms & input rules">
+- **`rememberSaveable`** for every form field — survives rotation and process death.
+- **`KeyboardOptions` + `KeyboardActions`** — set IME action + keyboardType on every field.
+- **`FocusRequester`** for programmatic focus; **`LocalSoftwareKeyboardController`** for show/hide.
+- **`VisualTransformation`** for masks (credit cards, phones) without mutating the value.
+- **`Modifier.imePadding()`** + `adjustResize` — keyboard never overlaps inputs.
+- **Autofill** via `semantics { contentType = ContentType.* }`.
+- **`BasicTextField` + `TextFieldState`** is the new recommended primitive for custom input.
+- **Validate on blur or submit**, not every keystroke — reserve inline for helpful cases.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Login form with focus traversal', description: 'Build an email + password form. ImeAction.Next focuses password; ImeAction.Done submits. Auto-focus email on open.' },
+  { title: 'Credit card mask', description: 'Implement a CreditCardTransformation that formats 16 digits as "1234 5678 9012 3456" without mutating the underlying value.' },
+  { title: 'Validation state holder', description: 'Extract a @Stable LoginFormState class with email/password fields, inline errors on blur, and isValid computation.' },
+  { title: 'Debounced search', description: 'Build a search bar that calls viewModel.search with a 300 ms debounce and only on distinctly changed queries.' },
+  { title: 'BasicTextField with TextFieldState', description: 'Convert an OutlinedTextField to BasicTextField + rememberTextFieldState. Observe text changes via snapshotFlow.' }
+]} />
+
+## Next
+
+Continue to **[Testing Compose](./testing)** for ComposeTestRule, semantics matchers, and Paparazzi screenshot tests.

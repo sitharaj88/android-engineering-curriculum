@@ -1,0 +1,485 @@
+---
+id: interop
+title: Compose Interop
+sidebar_label: Interop
+description: Embed Views in Compose and Compose in Views. AndroidView, AndroidViewBinding, ComposeView, Fragment/Activity hosting, migrating RecyclerView, and incremental migration strategies.
+---
+
+import { Callout, ComparisonCard, StepList, Diagram, BridgeDiagram } from '@site/src/components/Doc';
+
+# Compose Interop
+
+Real codebases are rarely greenfield. You have legacy Fragments, XML
+layouts, custom `View`s that took a year to get right, and SDKs that only
+ship View-based APIs. Compose interop is how you migrate without rewriting
+the world in a weekend.
+
+<Diagram title="Compose ↔ View interop" caption="Compose can host Views (AndroidView); Views can host Compose (ComposeView). Both directions are first-class.">
+  <BridgeDiagram />
+</Diagram>
+
+## Hosting a View inside Compose — `AndroidView`
+
+```kotlin
+@Composable
+fun MapViewContainer(latitude: Double, longitude: Double) {
+    AndroidView(
+        factory = { context ->
+            MapView(context).apply {
+                onCreate(null)
+                getMapAsync { map ->
+                    map.moveCamera(CameraUpdateFactory.newLatLngZoom(LatLng(latitude, longitude), 15f))
+                }
+            }
+        },
+        update = { view ->
+            // Called on every recomposition where inputs changed
+            view.getMapAsync { map ->
+                map.moveCamera(CameraUpdateFactory.newLatLngZoom(LatLng(latitude, longitude), 15f))
+            }
+        },
+        onRelease = { view ->
+            view.onDestroy()   // clean up resources
+        },
+        modifier = Modifier.fillMaxSize()
+    )
+}
+```
+
+### The three blocks
+
+- **`factory`** — create the View once. Runs on first composition and when
+  the composable enters the tree.
+- **`update`** — sync inputs to the View. Runs on every recomposition
+  where one of the parameters changed.
+- **`onRelease`** — clean up when the composable leaves composition.
+
+### AndroidView with XML binding
+
+For View-based screens with complex XML, use `AndroidViewBinding`:
+
+```xml
+<!-- res/layout/legacy_profile_card.xml -->
+<merge xmlns:android="http://schemas.android.com/apk/res/android">
+    <ImageView android:id="@+id/avatar" android:layout_width="48dp" android:layout_height="48dp"/>
+    <TextView android:id="@+id/name" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+</merge>
+```
+
+```kotlin
+@Composable
+fun LegacyProfileCard(user: User) {
+    AndroidViewBinding(
+        factory = LegacyProfileCardBinding::inflate,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        avatar.load(user.avatarUrl)
+        name.text = user.name
+    }
+}
+```
+
+`AndroidViewBinding` takes a generated ViewBinding factory and gives you
+typed access to the inflated views. No `findViewById`, no casts.
+
+---
+
+## Common AndroidView scenarios
+
+### Video player (ExoPlayer / Media3)
+
+```kotlin
+@Composable
+fun VideoPlayer(mediaUri: Uri, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    val player = remember(mediaUri) {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(mediaUri))
+            prepare()
+        }
+    }
+
+    // Pause video when app goes background
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> player.pause()
+                Lifecycle.Event.ON_RESUME -> player.play()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            player.release()
+        }
+    }
+
+    AndroidView(
+        factory = { ctx -> PlayerView(ctx).apply { this.player = player } },
+        modifier = modifier
+    )
+}
+```
+
+### WebView
+
+```kotlin
+@Composable
+fun WebViewer(url: String, modifier: Modifier = Modifier) {
+    var webView by remember { mutableStateOf<WebView?>(null) }
+
+    AndroidView(
+        factory = { context ->
+            WebView(context).apply {
+                settings.javaScriptEnabled = true
+                webViewClient = WebViewClient()
+                webView = this
+            }
+        },
+        update = { it.loadUrl(url) },
+        onRelease = { it.destroy() },
+        modifier = modifier
+    )
+
+    BackHandler(enabled = webView?.canGoBack() == true) {
+        webView?.goBack()
+    }
+}
+```
+
+### Google Maps (Compose-native alternative)
+
+For Maps, prefer the Compose-native `maps-compose` library — it's less
+error-prone than wrapping `MapView`:
+
+```kotlin
+// dependency: com.google.maps.android:maps-compose:5.1.1
+GoogleMap(
+    cameraPositionState = rememberCameraPositionState {
+        position = CameraPosition.fromLatLngZoom(LatLng(37.7, -122.4), 12f)
+    }
+) {
+    Marker(state = MarkerState(LatLng(37.7, -122.4)), title = "Home")
+}
+```
+
+Many View-based SDKs have shipped Compose wrappers — check before reaching
+for `AndroidView`.
+
+---
+
+## Hosting Compose inside a View — `ComposeView`
+
+```kotlin
+class LegacyFragment : Fragment() {
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        return ComposeView(requireContext()).apply {
+            // IMPORTANT: dispose the Composition when the view is detached
+            setViewCompositionStrategy(
+                ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed
+            )
+            setContent {
+                AppTheme {
+                    LegacyFragmentContent(viewModel = viewModels<LegacyViewModel>().value)
+                }
+            }
+        }
+    }
+}
+```
+
+### `ViewCompositionStrategy` — when to dispose
+
+| Strategy                                             | Disposes when                                  |
+|------------------------------------------------------|------------------------------------------------|
+| `DisposeOnDetachedFromWindow`                        | View leaves the window (default, rarely wrong but suboptimal for Fragments) |
+| `DisposeOnViewTreeLifecycleDestroyed`                | Owning lifecycle's onDestroy (Fragment / Activity) |
+| `DisposeOnLifecycleDestroyed(lifecycle)`             | Specified lifecycle's onDestroy                |
+| `DisposeOnDetachedFromWindowOrReleasedFromPool`      | Inside RecyclerView (see below)                |
+
+**For Fragments**, always use `DisposeOnViewTreeLifecycleDestroyed` — the
+default leaks when the Fragment is in the back stack.
+
+### ComposeView in XML
+
+```xml
+<!-- res/layout/activity_main.xml -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android">
+    <TextView android:id="@+id/header" android:layout_width="match_parent" android:layout_height="wrap_content"/>
+    <androidx.compose.ui.platform.ComposeView
+        android:id="@+id/compose_content"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"/>
+</LinearLayout>
+```
+
+```kotlin
+binding.composeContent.setContent {
+    AppTheme { MyScreen() }
+}
+```
+
+---
+
+## Compose inside RecyclerView
+
+Every Compose-in-RecyclerView setup needs the right strategy — otherwise
+you leak Compositions on every scroll.
+
+```kotlin
+class ComposeViewHolder(val composeView: ComposeView) : RecyclerView.ViewHolder(composeView) {
+    init {
+        composeView.setViewCompositionStrategy(
+            ViewCompositionStrategy.DisposeOnDetachedFromWindowOrReleasedFromPool
+        )
+    }
+
+    fun bind(item: Item) {
+        composeView.setContent {
+            AppTheme { ItemRow(item) }
+        }
+    }
+}
+```
+
+<Callout kind="tip" title="Prefer LazyColumn for new work">
+Compose-in-RecyclerView is a migration path, not a destination. Once the
+screen is entirely Composable-driven, replace RecyclerView with
+LazyColumn — simpler, faster, and no composition strategy worries.
+</Callout>
+
+---
+
+## Sharing state across the boundary
+
+### ViewModel is the bridge
+
+```kotlin
+class SharedViewModel : ViewModel() {
+    private val _state = MutableStateFlow(MyState())
+    val state: StateFlow<MyState> = _state.asStateFlow()
+
+    fun onAction(action: Action) { /* ... */ }
+}
+
+// Used in a View-based Fragment
+class LegacyFragment : Fragment() {
+    private val viewModel: SharedViewModel by viewModels()
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.state.collect { state ->
+                    binding.header.text = state.title
+                }
+            }
+        }
+    }
+}
+
+// And a Compose screen
+@Composable
+fun ModernScreen(viewModel: SharedViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    Text(state.title)
+}
+```
+
+Same ViewModel, both UIs observe — no direct coupling.
+
+---
+
+## Gradual migration strategies
+
+### Strategy A — Screen by screen
+
+Pick one low-traffic screen. Rewrite it in Compose. Host via a `ComposeView`
+inside the existing `FragmentContainerView`. Ship. Repeat.
+
+```kotlin
+// AndroidManifest — no changes; MainActivity still uses Fragments
+class SettingsFragment : Fragment() {
+    override fun onCreateView(/* ... */) = ComposeView(requireContext()).apply {
+        setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+        setContent { AppTheme { SettingsScreen() } }
+    }
+}
+```
+
+### Strategy B — Hybrid screens
+
+One screen, two worlds. Compose for the new sections, XML for the legacy.
+
+```kotlin
+// Fragment with XML layout
+class ProfileFragment : Fragment() {
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, saved: Bundle?): View {
+        val binding = FragmentProfileBinding.inflate(inflater, container, false)
+
+        // Legacy header in XML
+        binding.header.text = "Profile"
+
+        // New content area in Compose
+        binding.composeContent.apply {
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            setContent {
+                AppTheme { ProfileContent() }
+            }
+        }
+
+        return binding.root
+    }
+}
+```
+
+### Strategy C — Compose host, View leafs
+
+Once the app is ~70% Compose, flip: Activities host ONE Composable, and
+use `AndroidView` for the remaining View-based widgets (camera preview,
+ads SDK, legacy charts).
+
+---
+
+## Navigation interop
+
+If you have Fragment-based navigation and want to migrate one screen:
+
+```kotlin
+// res/navigation/nav_graph.xml stays the same
+<fragment
+    android:id="@+id/settingsFragment"
+    android:name="com.myapp.SettingsFragment"/>
+
+// SettingsFragment hosts Compose
+class SettingsFragment : Fragment() {
+    override fun onCreateView(/* ... */) = ComposeView(requireContext()).apply {
+        setContent { AppTheme { SettingsScreen(onBack = { findNavController().popBackStack() }) } }
+    }
+}
+```
+
+Once more screens are Composable, migrate the `NavHost` itself to
+Navigation Compose. See [Navigation Masterclass](./navigation).
+
+---
+
+## Accessibility across the boundary
+
+`AndroidView` inherits View-based accessibility (content descriptions on
+`ImageView`, `labelFor`, etc.). `ComposeView` hosts Compose semantics. Both
+end up in the same accessibility tree — TalkBack doesn't care where a node
+came from.
+
+```kotlin
+// AndroidView accessibility
+AndroidView(
+    factory = { ctx ->
+        ImageView(ctx).apply {
+            contentDescription = "User avatar"
+        }
+    }
+)
+
+// ComposeView inside XML — semantics still work
+<androidx.compose.ui.platform.ComposeView
+    android:contentDescription="@string/video_player"
+    android:importantForAccessibility="no"/>    <!-- or yes; depends on Compose semantics inside -->
+```
+
+---
+
+## Lifecycle interop
+
+Compose inside a View automatically finds the owning `LifecycleOwner`,
+`ViewModelStoreOwner`, and `SavedStateRegistryOwner` from the View tree —
+**if you set up the owners correctly**.
+
+```kotlin
+// In an Activity that hosts Compose directly
+setContent { ... }   // works out of the box
+
+// In a Fragment, make sure the Fragment IS the LifecycleOwner of its view
+override fun onCreateView(/* ... */) = ComposeView(requireContext()).apply {
+    // DisposeOnViewTreeLifecycleDestroyed handles this correctly
+    setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+    setContent { /* hiltViewModel(), collectAsStateWithLifecycle() work correctly */ }
+}
+
+// In a custom ViewGroup, set the owners manually if nothing sets them:
+ViewTreeLifecycleOwner.set(this, lifecycleOwner)
+ViewTreeViewModelStoreOwner.set(this, viewModelStoreOwner)
+setViewTreeSavedStateRegistryOwner(savedStateRegistryOwner)
+```
+
+If you see `"ViewModel not found"` or `"No LifecycleOwner"` inside Compose,
+the View tree owners aren't set.
+
+---
+
+## Common pitfalls
+
+<ComparisonCard
+  left={{
+    label: 'Interop anti-patterns',
+    title: 'What breaks',
+    variant: 'old',
+    points: [
+      'Using default ViewCompositionStrategy in Fragments (leaks)',
+      'Forgetting onRelease for resource-owning Views (ExoPlayer, WebView)',
+      'Mutating the hosted View from outside update {}',
+      'Creating new lambdas in update {} on every recomposition (invalidates cache)',
+      'Nesting ComposeView inside RecyclerView without OnDetachedFromWindowOrReleasedFromPool',
+      'Passing mutable state directly instead of stable parameters'
+    ]
+  }}
+  right={{
+    label: 'Correct patterns',
+    title: 'Solid interop',
+    variant: 'new',
+    points: [
+      'DisposeOnViewTreeLifecycleDestroyed in Fragments',
+      'onRelease releases players, web views, and listeners',
+      'All mutations flow through update {} with stable inputs',
+      'Hoist lambdas to `remember` or pass directly',
+      'DisposeOnDetachedFromWindowOrReleasedFromPool for RecyclerView items',
+      'Use @Stable / @Immutable types for inputs to AndroidView'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Interop rules">
+- **`AndroidView`** — three blocks: `factory` (once), `update` (on change), `onRelease` (on dispose).
+- **`AndroidViewBinding`** for complex XML with ViewBinding types.
+- **`ComposeView`** in XML with the correct `ViewCompositionStrategy` for the host lifecycle.
+- **RecyclerView items** need `DisposeOnDetachedFromWindowOrReleasedFromPool`.
+- **Share state via ViewModel** — both worlds observe `StateFlow`.
+- Migrate screen-by-screen with a hybrid `Fragment` + `ComposeView` pattern.
+- Many SDKs ship Compose-native wrappers (Maps, WebView, player libraries) — prefer them.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Host a MapView', description: 'Build an AndroidView wrapping MapView. Call onCreate/onResume/onDestroy in the correct lifecycle hooks.' },
+  { title: 'Fragment with ComposeView', description: 'Create a Fragment whose onCreateView returns a ComposeView with DisposeOnViewTreeLifecycleDestroyed.' },
+  { title: 'Hybrid screen', description: 'In an XML layout, put a TextView header and a ComposeView body. Share a ViewModel between the two parts.' },
+  { title: 'RecyclerView + Compose rows', description: 'Build a RecyclerView adapter whose ViewHolder hosts a ComposeView with the correct pool-aware strategy.' },
+  { title: 'ExoPlayer wrapper', description: 'Wrap ExoPlayer\'s PlayerView in AndroidView with release on dispose and pause on background.' }
+]} />
+
+## Next
+
+Continue to **[Modifiers Deep Dive](./modifiers-deep-dive)** for composition order, custom modifiers, and the Modifier.Node API.

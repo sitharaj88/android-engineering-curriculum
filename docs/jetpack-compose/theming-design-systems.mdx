@@ -1,0 +1,488 @@
+---
+id: theming-design-systems
+title: Theming & Design Systems
+sidebar_label: Theming
+description: Material 3 theming end-to-end — ColorScheme, Typography, Shapes, dynamic color, custom design systems, dark mode, and multi-brand theming.
+---
+
+import { Callout, ComparisonCard, StepList, FeatureGrid } from '@site/src/components/Doc';
+
+# Theming & Design Systems
+
+Compose themes are **first-class composable state** — not XML-style
+overrides. This chapter covers Material 3's complete theming system,
+dynamic color on Android 12+, custom design systems that replace Material,
+and multi-brand theming for white-label apps.
+
+## The three theming pillars
+
+Material 3 themes are composed of three pillars plus an extension slot:
+
+```kotlin
+@Composable
+fun AppTheme(content: @Composable () -> Unit) {
+    MaterialTheme(
+        colorScheme = AppColors,       // Color system
+        typography = AppTypography,     // Text styles
+        shapes = AppShapes,             // Corner radii
+        content = content
+    )
+}
+```
+
+Components reference these via `MaterialTheme.colorScheme`, `.typography`,
+and `.shapes`. **Never hardcode hex colors** — they break dark mode, dynamic
+color, and accessibility audits.
+
+---
+
+## ColorScheme — Material 3 tokens
+
+Material 3 defines **29 color roles** organized as pairs: every surface has
+a matching `on*` color for text/icons on it.
+
+```kotlin
+val LightColors = lightColorScheme(
+    primary            = Color(0xFF006E2C),
+    onPrimary          = Color(0xFFFFFFFF),
+    primaryContainer   = Color(0xFF8FF7A4),
+    onPrimaryContainer = Color(0xFF002108),
+
+    secondary          = Color(0xFF526350),
+    onSecondary        = Color(0xFFFFFFFF),
+    secondaryContainer = Color(0xFFD4E8CF),
+    onSecondaryContainer = Color(0xFF101F10),
+
+    tertiary           = Color(0xFF39656C),
+    onTertiary         = Color(0xFFFFFFFF),
+
+    error              = Color(0xFFBA1A1A),
+    onError            = Color(0xFFFFFFFF),
+    errorContainer     = Color(0xFFFFDAD6),
+    onErrorContainer   = Color(0xFF410002),
+
+    background         = Color(0xFFFBFDF7),
+    onBackground       = Color(0xFF1A1C19),
+    surface            = Color(0xFFFBFDF7),
+    onSurface          = Color(0xFF1A1C19),
+    surfaceVariant     = Color(0xFFDEE5D9),
+    onSurfaceVariant   = Color(0xFF424940),
+    outline            = Color(0xFF72796F)
+)
+
+val DarkColors = darkColorScheme(
+    primary            = Color(0xFF73DA8B),
+    onPrimary          = Color(0xFF003912),
+    primaryContainer   = Color(0xFF00531F),
+    onPrimaryContainer = Color(0xFF8FF7A4),
+    /* ... full dark palette ... */
+)
+```
+
+### The five role buckets
+
+| Bucket        | Roles                                          | When to use                                  |
+|---------------|------------------------------------------------|----------------------------------------------|
+| **Primary**   | primary, onPrimary, primaryContainer, onPrimaryContainer | Brand color, FABs, primary actions |
+| **Secondary** | secondary, onSecondary, secondaryContainer, onSecondaryContainer | Chips, filter controls |
+| **Tertiary**  | tertiary, onTertiary, tertiaryContainer, onTertiaryContainer | Accent, complementary UI |
+| **Error**     | error, onError, errorContainer, onErrorContainer | Validation, destructive actions |
+| **Neutral**   | background, surface, surfaceVariant, outline   | Chrome, cards, dividers |
+
+### Surface elevation (M3)
+
+```kotlin
+// Material 3 uses color-based elevation (tinted surfaces) instead of shadows
+val surface1 = MaterialTheme.colorScheme.surfaceColorAtElevation(1.dp)
+val surface3 = MaterialTheme.colorScheme.surfaceColorAtElevation(3.dp)
+```
+
+---
+
+## Typography — the type scale
+
+```kotlin
+val AppTypography = Typography(
+    displayLarge  = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 57.sp, lineHeight = 64.sp, letterSpacing = (-0.25).sp),
+    displayMedium = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 45.sp, lineHeight = 52.sp),
+    displaySmall  = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 36.sp, lineHeight = 44.sp),
+
+    headlineLarge  = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 32.sp, lineHeight = 40.sp),
+    headlineMedium = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 28.sp, lineHeight = 36.sp),
+    headlineSmall  = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 24.sp, lineHeight = 32.sp),
+
+    titleLarge  = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Medium, fontSize = 22.sp, lineHeight = 28.sp),
+    titleMedium = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Medium, fontSize = 16.sp, lineHeight = 24.sp, letterSpacing = 0.15.sp),
+    titleSmall  = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Medium, fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.1.sp),
+
+    bodyLarge  = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 16.sp, lineHeight = 24.sp, letterSpacing = 0.5.sp),
+    bodyMedium = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.25.sp),
+    bodySmall  = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 12.sp, lineHeight = 16.sp, letterSpacing = 0.4.sp),
+
+    labelLarge  = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Medium, fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.1.sp),
+    labelMedium = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Medium, fontSize = 12.sp, lineHeight = 16.sp, letterSpacing = 0.5.sp),
+    labelSmall  = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Medium, fontSize = 11.sp, lineHeight = 16.sp, letterSpacing = 0.5.sp)
+)
+```
+
+### Downloadable fonts (recommended)
+
+```kotlin
+val provider = GoogleFont.Provider(
+    providerAuthority = "com.google.android.gms.fonts",
+    providerPackage   = "com.google.android.gms",
+    certificates      = R.array.com_google_android_gms_fonts_certs
+)
+
+val Inter = FontFamily(
+    Font(googleFont = GoogleFont("Inter"), fontProvider = provider, weight = FontWeight.Normal),
+    Font(googleFont = GoogleFont("Inter"), fontProvider = provider, weight = FontWeight.Medium),
+    Font(googleFont = GoogleFont("Inter"), fontProvider = provider, weight = FontWeight.Bold)
+)
+```
+
+Saves APK size (fonts are fetched once per device and cached), and Google
+Play Services handles updates.
+
+### Variable fonts
+
+```kotlin
+val InterVariable = FontFamily(
+    Font(
+        resId = R.font.inter_variable,
+        variationSettings = FontVariation.Settings(
+            FontVariation.weight(weight.weight),
+            FontVariation.width(100f)   // condensed to expanded
+        )
+    )
+)
+```
+
+Variable fonts ship one file that covers the whole weight axis — dramatically
+smaller than shipping Regular/Medium/Bold separately.
+
+---
+
+## Shapes — corner system
+
+```kotlin
+val AppShapes = Shapes(
+    extraSmall = RoundedCornerShape(4.dp),
+    small      = RoundedCornerShape(8.dp),
+    medium     = RoundedCornerShape(12.dp),
+    large      = RoundedCornerShape(16.dp),
+    extraLarge = RoundedCornerShape(28.dp)
+)
+```
+
+Components map to specific shapes: Card uses `medium`, FAB uses `large`,
+ExtendedFab uses `large`, ModalBottomSheet uses `extraLarge` at the top.
+
+### Non-uniform shapes (M3 "expressive")
+
+```kotlin
+val AsymmetricShape = RoundedCornerShape(
+    topStart = 24.dp,
+    topEnd = 4.dp,
+    bottomEnd = 24.dp,
+    bottomStart = 4.dp
+)
+
+val SquirclePolygon = RoundedPolygon.star(
+    numVerticesPerRadius = 8,
+    rounding = CornerRounding(radius = 0.4f)
+).toPath().asComposePath()
+```
+
+Material 3 Expressive (2025) added animated shape morphing — `MaterialShapes`
+ships 30+ preset non-uniform shapes.
+
+---
+
+## Dynamic color (Android 12+)
+
+Android 12 introduced **Material You** — system-generated palettes derived
+from the user's wallpaper. Opt in once; users love it.
+
+```kotlin
+@Composable
+fun AppTheme(
+    darkTheme: Boolean = isSystemInDarkTheme(),
+    dynamicColor: Boolean = true,
+    content: @Composable () -> Unit
+) {
+    val colorScheme = when {
+        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+            val context = LocalContext.current
+            if (darkTheme) dynamicDarkColorScheme(context)
+            else dynamicLightColorScheme(context)
+        }
+        darkTheme -> DarkColors
+        else -> LightColors
+    }
+
+    MaterialTheme(
+        colorScheme = colorScheme,
+        typography = AppTypography,
+        shapes = AppShapes,
+        content = content
+    )
+}
+```
+
+<Callout kind="tip" title="When to disable dynamic color">
+Disable dynamic color when brand identity is non-negotiable (bank apps,
+regulated UX). Offer a user setting: "Use system colors" — the 30% of
+Android users on 12+ overwhelmingly prefer it on.
+</Callout>
+
+---
+
+## CompositionLocal — theme extensions
+
+Material's ColorScheme has 29 roles, but you may need more (e.g., success,
+warning, on-brand accents). Use a **custom CompositionLocal**:
+
+```kotlin
+@Immutable
+data class AppSemanticColors(
+    val success: Color,
+    val onSuccess: Color,
+    val warning: Color,
+    val onWarning: Color,
+    val info: Color,
+    val onInfo: Color
+)
+
+val LightSemantic = AppSemanticColors(
+    success = Color(0xFF2E7D32), onSuccess = Color.White,
+    warning = Color(0xFFE65100), onWarning = Color.White,
+    info    = Color(0xFF1565C0), onInfo    = Color.White
+)
+
+val DarkSemantic = AppSemanticColors(
+    success = Color(0xFF66BB6A), onSuccess = Color.Black,
+    warning = Color(0xFFFFA726), onWarning = Color.Black,
+    info    = Color(0xFF42A5F5), onInfo    = Color.Black
+)
+
+val LocalAppSemantic = staticCompositionLocalOf<AppSemanticColors> {
+    error("No AppSemanticColors provided. Wrap with AppTheme.")
+}
+
+val MaterialTheme.semantic: AppSemanticColors
+    @Composable get() = LocalAppSemantic.current
+
+@Composable
+fun AppTheme(darkTheme: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
+    val semantic = if (darkTheme) DarkSemantic else LightSemantic
+    CompositionLocalProvider(LocalAppSemantic provides semantic) {
+        MaterialTheme(
+            colorScheme = if (darkTheme) DarkColors else LightColors,
+            typography = AppTypography,
+            shapes = AppShapes,
+            content = content
+        )
+    }
+}
+
+// Usage
+@Composable
+fun SuccessToast(message: String) {
+    Surface(color = MaterialTheme.semantic.success) {
+        Text(message, color = MaterialTheme.semantic.onSuccess)
+    }
+}
+```
+
+**`staticCompositionLocalOf`** vs **`compositionLocalOf`**:
+
+- `staticCompositionLocalOf` — reads are NOT tracked; changing the value
+  recomposes the entire subtree below the Provider. Use for rarely-changing
+  theme data.
+- `compositionLocalOf` — reads ARE tracked; only composables that read the
+  local recompose. Use for frequently-changing data (scroll position, etc.).
+
+---
+
+## Design tokens — the scalable path
+
+For apps with multiple brands or regular design refreshes, adopt the
+**token pyramid**:
+
+```text
+┌──────────────────────────────────────┐
+│  Component tokens                     │   Button.Primary.Background
+│     ↓ references                      │   TextField.Error.BorderColor
+├──────────────────────────────────────┤
+│  Semantic tokens                      │   color.surface
+│     ↓ references                      │   color.onSurface, spacing.inline.sm
+├──────────────────────────────────────┤
+│  Primitive tokens                     │   green.500 = #3DDC84
+│                                       │   space.04 = 8.dp
+└──────────────────────────────────────┘
+```
+
+Code only references **semantic** or **component** tokens. Primitive tokens
+are design-team concerns. See Module 19 (Enterprise UX) for the full token
+pipeline, Figma export, and code generation.
+
+---
+
+## Multi-brand theming
+
+```kotlin
+enum class Brand { Default, Premium, Enterprise }
+
+@Composable
+fun BrandedTheme(
+    brand: Brand,
+    darkTheme: Boolean = isSystemInDarkTheme(),
+    content: @Composable () -> Unit
+) {
+    val colors = when (brand) {
+        Brand.Default    -> if (darkTheme) DefaultDark    else DefaultLight
+        Brand.Premium    -> if (darkTheme) PremiumDark    else PremiumLight
+        Brand.Enterprise -> if (darkTheme) EnterpriseDark else EnterpriseLight
+    }
+    val typography = when (brand) {
+        Brand.Default, Brand.Premium -> AppTypography
+        Brand.Enterprise             -> EnterpriseTypography
+    }
+    MaterialTheme(colorScheme = colors, typography = typography, content = content)
+}
+```
+
+Combined with build flavors, you can ship the same binary as three
+differently-branded apps.
+
+---
+
+## Accessibility considerations
+
+### Contrast
+
+Use tooling to audit contrast on every custom palette:
+
+```kotlin
+fun Color.contrastRatio(other: Color): Float {
+    val l1 = luminance() + 0.05f
+    val l2 = other.luminance() + 0.05f
+    return maxOf(l1, l2) / minOf(l1, l2)
+}
+
+// WCAG AA: 4.5:1 for body text, 3:1 for large text (18sp+)
+assert(MaterialTheme.colorScheme.onPrimary.contrastRatio(MaterialTheme.colorScheme.primary) >= 4.5f)
+```
+
+### Font scaling
+
+Compose respects system font scale automatically when you use `.sp`. Test
+at **2.0×** (the max user-configurable scale) — it's where most layouts
+break.
+
+```kotlin
+@Preview(name = "Large font", fontScale = 2.0f, showBackground = true)
+@Composable
+private fun PreviewLargeFont() { AppTheme { /* ... */ } }
+```
+
+### Reduced motion
+
+```kotlin
+@Composable
+fun motionAdjustedDuration(baseDuration: Int): Int {
+    val context = LocalContext.current
+    val am = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
+    val scale = Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f)
+    return (baseDuration * scale).toInt()
+}
+```
+
+---
+
+## Previewing themes
+
+```kotlin
+@Preview(name = "Light", showBackground = true)
+@Preview(name = "Dark", showBackground = true, uiMode = Configuration.UI_MODE_NIGHT_YES)
+@Preview(name = "Large font", fontScale = 2.0f)
+@Preview(name = "RTL", locale = "ar")
+@Preview(name = "Tablet", device = "spec:width=1280dp,height=800dp")
+annotation class ThemePreviews
+
+@ThemePreviews
+@Composable
+private fun PrimaryButtonPreviews() {
+    AppTheme {
+        Column(Modifier.padding(16.dp)) {
+            Button(onClick = {}) { Text("Primary") }
+            OutlinedButton(onClick = {}) { Text("Outlined") }
+            TextButton(onClick = {}) { Text("Text") }
+        }
+    }
+}
+```
+
+Multi-preview annotations make every design-system component show 5
+variants in Android Studio's preview pane.
+
+---
+
+## Common theming anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'What to avoid',
+    variant: 'old',
+    points: [
+      'Color(0xFFFF0000) hardcoded in screens',
+      'if (isDarkTheme) Color.White else Color.Black',
+      'TextStyle(fontSize = 14.sp) inline',
+      'Custom Composables that pass colors as parameters',
+      'Material components with hardcoded shape arguments',
+      'Theme defined per-screen, not app-wide'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'What to do',
+    variant: 'new',
+    points: [
+      'MaterialTheme.colorScheme.primary',
+      'colorScheme.onSurface (automatically flips)',
+      'MaterialTheme.typography.bodyLarge',
+      'Components inherit from MaterialTheme via CompositionLocal',
+      'Shapes come from MaterialTheme.shapes',
+      'One AppTheme wrapper at the Activity level'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Theming principles">
+- Every color/text/shape comes from **`MaterialTheme.*`** — never hardcode.
+- **Dynamic color** on Android 12+ for consumer apps; disable for brand-critical.
+- **Custom CompositionLocal** for tokens Material doesn't have (success, warning, brand).
+- **Downloadable/variable fonts** save APK size and enable weight-axis flexibility.
+- **Multi-preview annotations** render 5 theme variants at once.
+- **Audit contrast** at 4.5:1 (text) / 3:1 (graphics); test at fontScale 2.0.
+- For scale, use the **token pyramid** — primitive → semantic → component.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Build a dark theme', description: 'Port your app\'s light palette to darkColorScheme with proper on* pairs. Test every screen in dark mode.' },
+  { title: 'Add semantic colors', description: 'Create an AppSemanticColors with success/warning/info. Expose via a custom CompositionLocal accessed via MaterialTheme.semantic.' },
+  { title: 'Dynamic color toggle', description: 'Add a setting "Use system colors (Android 12+)" with a DataStore preference. Wire it through AppTheme.' },
+  { title: 'Multi-preview a component', description: 'Pick one design-system component. Annotate its @Preview with @ThemePreviews. Verify Light, Dark, Large font, and RTL render correctly.' }
+]} />
+
+## Next
+
+Continue to **[Lists & Lazy Layouts](./lists-lazy-layouts)** for LazyColumn, grids, staggered grids, and scroll state.

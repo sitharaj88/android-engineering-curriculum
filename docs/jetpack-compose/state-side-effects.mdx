@@ -1,0 +1,526 @@
+---
+id: state-side-effects
+title: State & Side Effects Deep Dive
+sidebar_label: State & Side Effects
+description: Every state holder and side-effect API in Compose — remember families, snapshotFlow, produceState, derivedStateOf, LaunchedEffect, DisposableEffect, SideEffect, rememberCoroutineScope.
+---
+
+import { Callout, ComparisonCard, StepList, Diagram, ComposeRecompositionDiagram } from '@site/src/components/Doc';
+
+# State & Side Effects Deep Dive
+
+The overview introduced `mutableStateOf` and `LaunchedEffect`. This chapter
+covers **every state API and every side-effect API** in Compose — when to
+use each, how they interact with the composition lifecycle, and the traps
+that catch even senior engineers.
+
+<Callout kind="tip" title="Mental model">
+Compose has two worlds: the **composable world** (functions that describe
+UI and re-execute on state change) and the **non-composable world**
+(coroutines, callbacks, system APIs). State holders let you store values
+across recompositions; side effects let you safely cross the boundary
+between the two worlds.
+</Callout>
+
+## The state APIs
+
+### `mutableStateOf` — observable value
+
+```kotlin
+val count: MutableState<Int> = mutableStateOf(0)   // raw
+var count by mutableStateOf(0)                     // delegate syntax
+```
+
+`mutableStateOf<T>()` creates a `State<T>` that Compose tracks. Reading
+`.value` inside a composable subscribes that composable to changes; writing
+`.value` invalidates every subscriber.
+
+### Specialized variants — avoid boxing
+
+```kotlin
+var progress by remember { mutableFloatStateOf(0f) }
+var count by remember { mutableIntStateOf(0) }
+var flag by remember { mutableStateOf(false) }    // boolean has no specialized variant yet
+var timestamp by remember { mutableLongStateOf(0L) }
+```
+
+`mutableIntStateOf` stores an unboxed `Int`, avoiding allocation per change.
+For a progress slider updating 60 times per second, this matters.
+
+### `remember` — survive recomposition
+
+```kotlin
+@Composable
+fun Counter() {
+    // remember { } evaluates the block ONCE per composition site,
+    // returns the same instance on every recomposition.
+    var count by remember { mutableIntStateOf(0) }
+
+    Button(onClick = { count++ }) { Text("Count: $count") }
+}
+```
+
+Without `remember`, every recomposition would create a fresh `MutableState`
+with value 0, and the counter would reset on every render.
+
+### `remember` with keys — rebuild on dependency change
+
+```kotlin
+@Composable
+fun UserProfile(userId: String) {
+    // When userId changes, the block re-evaluates and state is reset
+    val loader = remember(userId) { UserLoader(userId) }
+    val state by remember(userId) { mutableStateOf(UiState.Loading) }
+}
+```
+
+### `rememberSaveable` — survive process death
+
+```kotlin
+@Composable
+fun EditorScreen() {
+    // Survives recomposition AND configuration changes AND process death
+    var draft by rememberSaveable { mutableStateOf("") }
+    var cursorPos by rememberSaveable { mutableIntStateOf(0) }
+}
+```
+
+`rememberSaveable` uses the Android `Saver` API to serialize the value into
+the saved instance state Bundle. Works automatically for primitives, Strings,
+and `Parcelable`/`Serializable` types.
+
+### Custom `Saver` for complex types
+
+```kotlin
+data class DraftState(val body: String, val tags: List<String>)
+
+val DraftStateSaver: Saver<DraftState, List<Any>> = Saver(
+    save = { state -> listOf(state.body, state.tags) },
+    restore = { list -> DraftState(list[0] as String, list[1] as List<String>) }
+)
+
+@Composable
+fun DraftEditor() {
+    var draft by rememberSaveable(stateSaver = DraftStateSaver) {
+        mutableStateOf(DraftState("", emptyList()))
+    }
+}
+
+// Alternative: mapSaver / listSaver are simpler for most cases
+val DraftStateSaver2 = mapSaver<DraftState>(
+    save = { mapOf("body" to it.body, "tags" to it.tags) },
+    restore = { DraftState(it["body"] as String, it["tags"] as List<String>) }
+)
+```
+
+<Callout kind="warning" title="rememberSaveable has limits">
+The Bundle has a ~500KB limit across your entire app. Don't put large
+lists, bitmaps, or parsed JSON into `rememberSaveable`. For bigger state,
+use a ViewModel with `SavedStateHandle` (Module 04).
+</Callout>
+
+### `SavedStateHandle` — the ViewModel path
+
+```kotlin
+@HiltViewModel
+class EditorViewModel @Inject constructor(
+    private val savedState: SavedStateHandle
+) : ViewModel() {
+
+    // Bound to the ViewModel's saved state; survives process death
+    val draft: StateFlow<String> = savedState.getStateFlow("draft", "")
+
+    fun updateDraft(text: String) {
+        savedState["draft"] = text
+    }
+}
+```
+
+This is the right home for state that must survive process death **AND**
+outlive composition (i.e., persists across screens or configuration changes
+where the ViewModel sticks around).
+
+### State hierarchy decision table
+
+| Kind of state                       | Use                                    |
+|-------------------------------------|----------------------------------------|
+| Local UI toggle (expanded, visible) | `remember { mutableStateOf }`          |
+| Form field surviving rotation       | `rememberSaveable { }`                 |
+| Complex non-serializable state      | `rememberSaveable` + custom `Saver`    |
+| Screen state outliving composition  | `ViewModel` + `SavedStateHandle`       |
+| App-wide state                      | DataStore / repository + VM            |
+
+---
+
+## `derivedStateOf` — compute once, recompose rarely
+
+```kotlin
+@Composable
+fun ScrollToTopButton(listState: LazyListState) {
+    // `showButton` recomputes on EVERY scroll; its value flips rarely
+    val showButton by remember {
+        derivedStateOf { listState.firstVisibleItemIndex > 10 }
+    }
+
+    AnimatedVisibility(visible = showButton) { /* FAB */ }
+}
+```
+
+Without `derivedStateOf`, the `AnimatedVisibility` would read
+`firstVisibleItemIndex` and invalidate on every pixel of scroll. With it,
+it only invalidates when the boolean crosses the threshold (twice: entering
+and leaving).
+
+**Rule**: use `derivedStateOf` when the inputs change far more often than
+the result.
+
+---
+
+## `snapshotFlow` — bridge state to Flow
+
+Sometimes you need to react to state changes **outside** a composable
+(in a ViewModel, coroutine scope, or analytics SDK). `snapshotFlow`
+converts Compose `State` reads into a cold Flow.
+
+```kotlin
+@Composable
+fun AnalyticsListener(listState: LazyListState) {
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .distinctUntilChanged()
+            .debounce(500)
+            .collect { index -> analytics.logScroll(index) }
+    }
+}
+```
+
+`snapshotFlow { ... }` re-reads the lambda every time any `State` read
+inside it changes, then emits. It's how you bridge from Compose to any
+coroutine-based system.
+
+---
+
+## `produceState` — turn async into State
+
+```kotlin
+@Composable
+fun UserAvatar(userId: String) {
+    val imageBitmap: State<ImageBitmap?> = produceState<ImageBitmap?>(
+        initialValue = null,
+        key1 = userId
+    ) {
+        // Runs in a coroutine; value assignments push new State values
+        value = runCatching { imageLoader.load(userId) }.getOrNull()
+    }
+
+    imageBitmap.value?.let { Image(it, contentDescription = null) }
+}
+```
+
+`produceState` is shorthand for:
+
+```kotlin
+var state by remember { mutableStateOf<ImageBitmap?>(null) }
+LaunchedEffect(userId) { state = imageLoader.load(userId) }
+```
+
+Use `produceState` when the State is derived entirely from an async source.
+
+---
+
+## The side-effect family
+
+Side effects are how composables safely call out to the non-composable
+world (coroutines, system APIs, event streams). Each API answers a
+different question about **timing** and **lifecycle**.
+
+### `LaunchedEffect` — coroutines in composition
+
+```kotlin
+@Composable
+fun MessageToast(events: Flow<String>) {
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(events) {
+        events.collect { message ->
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+}
+```
+
+- Launches a coroutine tied to the composition.
+- Cancels + relaunches when any key changes.
+- Cancels when the composable leaves composition.
+
+**Key choice matters**:
+
+```kotlin
+// Wrong: restarts every recomposition (userId captured by reference)
+LaunchedEffect(Unit) { viewModel.load(userId) }
+
+// Right: restart when userId changes
+LaunchedEffect(userId) { viewModel.load(userId) }
+
+// Also right: start once, never restart — but use Unit sparingly
+LaunchedEffect(Unit) { analytics.logScreenView("profile") }
+```
+
+### `DisposableEffect` — setup + teardown
+
+```kotlin
+@Composable
+fun ScreenAnalytics(screenName: String) {
+    DisposableEffect(screenName) {
+        analytics.start(screenName)
+        onDispose { analytics.stop(screenName) }
+    }
+}
+
+@Composable
+fun LifecycleAwareBlock(onPause: () -> Unit) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE) onPause()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+}
+```
+
+Use when you need to register a listener, then remove it when keys change
+or the composable leaves composition. The `onDispose` block is **mandatory**
+— the compiler enforces it.
+
+### `SideEffect` — runs after every successful recomposition
+
+```kotlin
+@Composable
+fun TrackingWrapper(userId: String) {
+    SideEffect {
+        analytics.setUser(userId)  // called after every successful recomposition
+    }
+}
+```
+
+`SideEffect` runs after Compose commits the current composition. Use for
+fire-and-forget synchronization with non-Compose systems that don't need
+cancellation or cleanup.
+
+### `rememberCoroutineScope` — user-triggered coroutines
+
+```kotlin
+@Composable
+fun LikeButton(postId: String, onLike: suspend () -> Unit) {
+    val scope = rememberCoroutineScope()
+
+    Button(onClick = {
+        scope.launch { onLike() }   // launched from a non-composable callback
+    }) { Text("Like") }
+}
+```
+
+Use when a **user action** (click, swipe) needs to launch a coroutine. The
+scope is cancelled when the composable leaves composition.
+
+<Callout kind="warning" title="LaunchedEffect vs rememberCoroutineScope">
+- `LaunchedEffect` — coroutine starts **automatically** when the composable
+  enters composition or keys change. Use for data loading, event collection.
+- `rememberCoroutineScope` — coroutine starts when **you call** `scope.launch`
+  from a callback. Use for click handlers.
+
+Mixing them up is the #1 source of "my API call runs on every recomposition"
+bugs.
+</Callout>
+
+### `rememberUpdatedState` — capture latest value in long-running effects
+
+```kotlin
+@Composable
+fun Timeout(onTimeout: () -> Unit, durationMs: Long = 3_000) {
+    // `onTimeout` may change every recomposition (new lambda from caller)
+    // But we only launch ONCE and don't want to restart on every change.
+    val currentOnTimeout by rememberUpdatedState(onTimeout)
+
+    LaunchedEffect(Unit) {
+        delay(durationMs)
+        currentOnTimeout()   // reads the LATEST lambda, not the first one
+    }
+}
+```
+
+Without `rememberUpdatedState`, the `LaunchedEffect` captures the first
+`onTimeout` lambda and ignores updates — a classic "my button calls the old
+callback" bug.
+
+---
+
+## The complete decision tree
+
+<Diagram title="Which state / effect API?" caption="Match the timing and lifecycle of your work to the right API.">
+  <ComposeRecompositionDiagram />
+</Diagram>
+
+```text
+Do I need to STORE a value across recompositions?
+├─ Yes
+│   ├─ Survive process death? → rememberSaveable (or SavedStateHandle in ViewModel)
+│   ├─ Derived from other state? → derivedStateOf
+│   ├─ Derived from async source? → produceState
+│   └─ Otherwise → remember { mutableStateOf() }
+│
+Do I need to RUN CODE in response to composition/state?
+├─ Triggered by composition entering / keys changing
+│   ├─ Needs coroutine (suspend, cancel on dispose) → LaunchedEffect
+│   ├─ Needs setup + teardown → DisposableEffect
+│   └─ Simple fire-and-forget → SideEffect
+│
+├─ Triggered by user action (click, swipe, etc.)
+│   └─ rememberCoroutineScope + scope.launch
+│
+└─ Need to observe Compose state from outside Compose
+    └─ snapshotFlow
+```
+
+---
+
+## Common pitfalls
+
+### 1. Running side effects in the composable body
+
+```kotlin
+// ❌ WRONG — runs on every recomposition
+@Composable
+fun Screen(viewModel: MyViewModel) {
+    viewModel.load()   // fires hundreds of times
+    // ...
+}
+
+// ✅ RIGHT — runs once per key
+@Composable
+fun Screen(viewModel: MyViewModel) {
+    LaunchedEffect(viewModel) { viewModel.load() }
+    // ...
+}
+```
+
+### 2. Capturing stale state
+
+```kotlin
+// ❌ WRONG — captures the first value of `count`
+@Composable
+fun Screen() {
+    var count by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) {
+        delay(5000)
+        println(count)   // prints 0, not the updated count
+    }
+}
+
+// ✅ RIGHT — read the latest value via rememberUpdatedState
+@Composable
+fun Screen() {
+    var count by remember { mutableIntStateOf(0) }
+    val currentCount by rememberUpdatedState(count)
+    LaunchedEffect(Unit) {
+        delay(5000)
+        println(currentCount)
+    }
+}
+```
+
+### 3. Forgetting to handle cleanup
+
+```kotlin
+// ❌ WRONG — listener leaks on every key change
+@Composable
+fun BatteryMonitor(onBatteryLow: () -> Unit) {
+    val context = LocalContext.current
+    context.registerReceiver(/* ... */, IntentFilter(Intent.ACTION_BATTERY_LOW))
+}
+
+// ✅ RIGHT — paired setup + teardown
+@Composable
+fun BatteryMonitor(onBatteryLow: () -> Unit) {
+    val context = LocalContext.current
+    val onLow by rememberUpdatedState(onBatteryLow)
+
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(c: Context?, i: Intent?) = onLow()
+        }
+        context.registerReceiver(receiver, IntentFilter(Intent.ACTION_BATTERY_LOW))
+        onDispose { context.unregisterReceiver(receiver) }
+    }
+}
+```
+
+### 4. Wrong key for `remember`
+
+```kotlin
+// ❌ WRONG — state never resets when user changes
+@Composable
+fun Profile(userId: String) {
+    var drafts by remember { mutableStateOf(emptyList<String>()) }
+}
+
+// ✅ RIGHT — reset when user changes
+@Composable
+fun Profile(userId: String) {
+    var drafts by remember(userId) { mutableStateOf(emptyList<String>()) }
+}
+```
+
+---
+
+## Testing state
+
+```kotlin
+@Test
+fun `counter increments on click`() {
+    composeTestRule.setContent { Counter() }
+    composeTestRule.onNodeWithText("Count: 0").assertIsDisplayed()
+    composeTestRule.onNodeWithText("Count: 0").performClick()
+    composeTestRule.onNodeWithText("Count: 1").assertIsDisplayed()
+}
+
+@Test
+fun `LaunchedEffect fires once per key change`() {
+    var callCount = 0
+    composeTestRule.setContent {
+        LaunchedEffect("k1") { callCount++ }
+    }
+    composeTestRule.waitForIdle()
+    assertEquals(1, callCount)
+}
+```
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="State & side-effect rules">
+- **`remember`** for composition lifetime; **`rememberSaveable`** for process death; **`SavedStateHandle`** for ViewModel-scoped.
+- **Specialized `mutableIntStateOf`/`FloatStateOf`** avoid boxing in hot paths.
+- **`derivedStateOf`** when result changes far less than inputs; **`produceState`** when value is async-derived.
+- **`snapshotFlow`** bridges Compose state → coroutine world.
+- **`LaunchedEffect`** for composition-triggered coroutines; **`rememberCoroutineScope`** for user-triggered.
+- **`DisposableEffect`** is the only correct home for setup + teardown.
+- **`rememberUpdatedState`** when a long-running effect needs the latest callback.
+- Keys in `LaunchedEffect` / `remember` / `DisposableEffect` **must match the dependency** you want to react to.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Build a countdown timer', description: 'Use LaunchedEffect + delay. Verify it cancels when the composable leaves. Add a pause button using rememberCoroutineScope.' },
+  { title: 'Bridge scroll to analytics', description: 'Use snapshotFlow on LazyListState.firstVisibleItemIndex, debounce 500ms, log to analytics without triggering recompositions.' },
+  { title: 'Fix a stale-callback bug', description: 'Write a 5-second timer that triggers a callback. Change the callback while running. Add rememberUpdatedState so the latest one fires.' },
+  { title: 'Custom Saver', description: 'Create a rememberSaveable for a data class with a List<Enum>. Use mapSaver.' }
+]} />
+
+## Next
+
+Return to **[Module 03 Overview](./overview)** or read **[Theming & Design Systems](./theming-design-systems)**.

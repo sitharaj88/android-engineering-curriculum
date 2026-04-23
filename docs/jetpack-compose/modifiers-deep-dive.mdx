@@ -1,0 +1,631 @@
+---
+id: modifiers-deep-dive
+title: Modifiers Deep Dive
+sidebar_label: Modifiers
+description: Modifier order, custom modifiers, Modifier.Node API, layout modifiers, semantics modifiers, composed vs factory modifiers, and the new modifier performance story.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Modifiers Deep Dive
+
+Modifiers look simple — a chain of `.padding().clickable().background()` —
+but they're one of the deepest parts of Compose. This chapter covers how
+order affects layout, how to write custom modifiers with the modern
+`Modifier.Node` API, and the patterns that unlock custom gestures, drawing,
+and layout.
+
+## Order matters — always
+
+```kotlin
+// Order A: clip THEN background → background respects the clip
+Modifier
+    .size(100.dp)
+    .clip(RoundedCornerShape(16.dp))
+    .background(Color.Blue)
+
+// Order B: background THEN clip → background is applied before clipping,
+// so the clip has no visible effect on background color.
+Modifier
+    .size(100.dp)
+    .background(Color.Blue)
+    .clip(RoundedCornerShape(16.dp))
+```
+
+Modifiers wrap left-to-right, and each modifier can **constrain** what
+downstream modifiers see. The same applies to `padding`:
+
+```kotlin
+// Padding reduces the size passed to .background
+Modifier.size(100.dp).padding(16.dp).background(Color.Red)
+// Result: a 100dp box with a 68×68dp red square in the middle (due to 16dp padding on all sides)
+
+// Padding applied AFTER background
+Modifier.size(100.dp).background(Color.Red).padding(16.dp)
+// Result: a 100dp red box; padding applies to its children, not the background
+```
+
+### Rule of thumb
+
+```text
+Outside → Inside:
+  size / fillMax* → align / offset → clip / background / border →
+  clickable / pointer → padding → contents
+```
+
+Most chains follow this pattern. Learn the default and break it only when
+you need a specific visual effect.
+
+---
+
+## The modifier chain — how it composes
+
+```kotlin
+Modifier.padding(16.dp).background(Color.Red).clickable { }
+// is syntactic sugar for
+Modifier
+    .then(PaddingModifier(16.dp))
+    .then(BackgroundModifier(Color.Red))
+    .then(ClickableModifier(onClick))
+```
+
+Each `.then()` appends to a linked list. `Modifier` is immutable — chains
+are built, not mutated.
+
+### `Modifier` vs `Modifier.Companion`
+
+```kotlin
+val base: Modifier = Modifier                // the starting point
+val withPadding: Modifier = base.padding(8.dp)
+```
+
+You'll see `Modifier.` (the companion object, used to start chains) and
+`Modifier` as a type (the parameter type for most composables).
+
+---
+
+## Parameters — always accept a `Modifier`
+
+```kotlin
+// Canonical parameter pattern: Modifier is optional, default Modifier,
+// placed between data and callback parameters.
+@Composable
+fun Avatar(
+    url: String,
+    modifier: Modifier = Modifier,
+    contentDescription: String? = null
+) {
+    AsyncImage(
+        model = url,
+        contentDescription = contentDescription,
+        modifier = modifier.clip(CircleShape).size(48.dp)
+    )
+}
+
+// Caller
+Avatar(url, modifier = Modifier.padding(8.dp))
+```
+
+Without the parameter, the caller can't position, size, or decorate your
+composable without wrapping it. **Every reusable composable accepts a
+Modifier parameter.**
+
+---
+
+## Built-in modifier categories
+
+### Size & position
+
+```kotlin
+.size(100.dp)            // both width and height
+.size(width = 100.dp, height = 50.dp)
+.width(100.dp)
+.height(50.dp)
+.fillMaxSize()
+.fillMaxWidth()
+.fillMaxWidth(0.5f)      // half parent width
+.fillMaxHeight()
+.requiredSize(100.dp)    // enforce size even if parent says no
+.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+.aspectRatio(16f / 9f)
+.wrapContentSize()
+.offset(x = 10.dp, y = 20.dp)
+.offset { IntOffset(10, 20) }    // lambda variant — deferred, no recomposition on change
+```
+
+### Padding
+
+```kotlin
+.padding(16.dp)                                           // all sides
+.padding(horizontal = 16.dp, vertical = 8.dp)
+.padding(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 8.dp)
+.padding(PaddingValues(16.dp))
+```
+
+### Background & border
+
+```kotlin
+.background(Color.Red)
+.background(brush = Brush.linearGradient(listOf(Color.Blue, Color.Green)))
+.background(color = Color.Red, shape = RoundedCornerShape(8.dp))
+.border(1.dp, Color.Gray, RoundedCornerShape(8.dp))
+```
+
+### Clipping & shape
+
+```kotlin
+.clip(RoundedCornerShape(8.dp))
+.clip(CircleShape)
+.clipToBounds()
+.graphicsLayer { clip = true; shape = RoundedCornerShape(8.dp) }
+```
+
+### Click, pointer, selection
+
+```kotlin
+.clickable { /* ... */ }
+.clickable(
+    interactionSource = remember { MutableInteractionSource() },
+    indication = ripple(),
+    enabled = true,
+    onClickLabel = "Open profile",
+    role = Role.Button,
+    onClick = { /* ... */ }
+)
+.combinedClickable(onClick = { }, onLongClick = { })
+.selectable(selected = isSelected, onClick = { })
+.toggleable(value = isOn, onValueChange = { })
+.pointerInput(Unit) { detectTapGestures { /* ... */ } }
+.hoverable(interactionSource = ...)    // desktop / Chromebook
+```
+
+### Focus
+
+```kotlin
+.focusable()
+.focusRequester(myFocusRequester)
+.onFocusChanged { if (it.isFocused) /* ... */ }
+.focusProperties { next = nextFocus; right = rightFocus }
+```
+
+### Scroll
+
+```kotlin
+.verticalScroll(rememberScrollState())
+.horizontalScroll(rememberScrollState())
+.scrollable(state = scrollState, orientation = Orientation.Vertical)
+.nestedScroll(connection)
+```
+
+### Drawing
+
+```kotlin
+.drawBehind { drawCircle(Color.Red, radius = 50f) }
+.drawWithContent {
+    drawContent()          // draw children first
+    drawLine(Color.Red, start = Offset.Zero, end = Offset(size.width, size.height))
+}
+.drawWithCache {
+    val path = Path().apply { /* build once per size */ }
+    onDrawBehind { drawPath(path, Color.Red) }
+}
+.graphicsLayer {
+    rotationZ = 45f
+    scaleX = 2f
+    alpha = 0.5f
+    shadowElevation = 8.dp.toPx()
+    shape = RoundedCornerShape(8.dp)
+    clip = true
+}
+```
+
+### Semantics (accessibility)
+
+```kotlin
+.semantics { contentDescription = "Close button"; role = Role.Button }
+.semantics(mergeDescendants = true) { /* consolidate children into one a11y node */ }
+.clearAndSetSemantics { contentDescription = "Profile" }
+.testTag("submit_btn")
+```
+
+### IME & window insets
+
+```kotlin
+.imePadding()
+.navigationBarsPadding()
+.statusBarsPadding()
+.systemBarsPadding()
+.safeDrawingPadding()
+.windowInsetsPadding(WindowInsets.safeDrawing)
+```
+
+### Layout
+
+```kotlin
+.layout { measurable, constraints ->
+    val placeable = measurable.measure(constraints)
+    layout(placeable.width, placeable.height) { placeable.placeRelative(0, 0) }
+}
+.onSizeChanged { size -> /* ... */ }
+.onGloballyPositioned { coords -> /* ... */ }
+.onPlaced { coords -> /* ... */ }
+```
+
+---
+
+## Writing custom modifiers — three approaches
+
+### 1. Extension function (factory)
+
+Easiest. Chain built-in modifiers into a reusable extension.
+
+```kotlin
+fun Modifier.cardContainer(shape: Shape = RoundedCornerShape(12.dp)) =
+    this
+        .clip(shape)
+        .background(MaterialTheme.colorScheme.surfaceVariant)
+        .padding(16.dp)
+
+// Usage
+Column(modifier = Modifier.cardContainer()) {
+    Text("Title")
+    Text("Body")
+}
+```
+
+<Callout kind="warning" title="Why not `@Composable` extensions?">
+```kotlin
+@Composable
+fun Modifier.cardContainer() = this
+    .clip(MaterialTheme.shapes.medium)           // reads MaterialTheme — needs @Composable
+    .background(MaterialTheme.colorScheme.surfaceVariant)
+```
+
+This works but forces every caller to be in a composable context. Use
+`composed { ... }` for modifiers that need composition scope.
+</Callout>
+
+### 2. `Modifier.composed { }` — composition-scope extensions
+
+```kotlin
+fun Modifier.shimmer(): Modifier = composed {
+    val transition = rememberInfiniteTransition(label = "shimmer")
+    val alpha by transition.animateFloat(
+        initialValue = 0.3f, targetValue = 0.7f,
+        animationSpec = infiniteRepeatable(tween(1_000), RepeatMode.Reverse),
+        label = "shimmerAlpha"
+    )
+    background(Color.LightGray.copy(alpha = alpha))
+}
+
+// Usage — the `remember*` calls happen inside composition automatically
+Box(Modifier.fillMaxWidth().height(60.dp).shimmer())
+```
+
+<Callout kind="tip" title="composed is being phased out">
+`Modifier.composed { }` is deprecated in favor of `Modifier.Node` (below)
+for new code. It still works but has subtle lifecycle and performance
+issues. Prefer Modifier.Node for any serious custom modifier.
+</Callout>
+
+### 3. `Modifier.Node` — the modern primitive
+
+```kotlin
+// Define the Modifier factory (data-only; no state)
+data class PaddingElement(
+    val padding: Dp
+) : ModifierNodeElement<PaddingNode>() {
+
+    override fun create() = PaddingNode(padding)
+
+    override fun update(node: PaddingNode) {
+        node.padding = padding
+    }
+
+    override fun InspectorInfo.inspectableProperties() {
+        name = "customPadding"
+        value = padding
+    }
+}
+
+// Define the Node (all behavior lives here; has lifecycle)
+class PaddingNode(var padding: Dp) : Modifier.Node(), LayoutModifierNode {
+
+    override fun MeasureScope.measure(
+        measurable: Measurable,
+        constraints: Constraints
+    ): MeasureResult {
+        val paddingPx = padding.roundToPx()
+        val horizontal = paddingPx * 2
+        val vertical = paddingPx * 2
+        val placeable = measurable.measure(constraints.offset(-horizontal, -vertical))
+        return layout(placeable.width + horizontal, placeable.height + vertical) {
+            placeable.place(paddingPx, paddingPx)
+        }
+    }
+}
+
+// Public factory
+fun Modifier.customPadding(padding: Dp): Modifier = this.then(PaddingElement(padding))
+```
+
+### Why `Modifier.Node` matters
+
+- **Allocation-free** — `ModifierNodeElement` is a data class; Nodes are
+  pooled. No per-recomposition allocation.
+- **Lifecycle aware** — `onAttach`, `onDetach` let you manage resources.
+- **Composable-free** — doesn't force the user to be inside `@Composable`.
+- **Precisely invalidate** — only re-layout when `update()` changes.
+
+### Node traits — what your Node can do
+
+```kotlin
+class MyNode : Modifier.Node(),
+    LayoutModifierNode,           // participate in measure/layout
+    DrawModifierNode,             // draw via ContentDrawScope
+    SemanticsModifierNode,        // contribute to accessibility
+    PointerInputModifierNode,     // handle pointer input
+    FocusTargetModifierNode,      // be focusable
+    GlobalPositionAwareModifierNode,  // know your absolute position
+    ObserverModifierNode,         // observe snapshots
+    CompositionLocalConsumerModifierNode,  // read CompositionLocals
+    DelegatingNode               // compose multiple child nodes
+{
+    override fun onAttach() { /* resource setup */ }
+    override fun onDetach() { /* resource cleanup */ }
+}
+```
+
+---
+
+## Example — a custom interactive modifier
+
+A **press-to-scale** modifier that scales down on press:
+
+```kotlin
+data class PressScaleElement(val scale: Float = 0.95f) : ModifierNodeElement<PressScaleNode>() {
+    override fun create() = PressScaleNode(scale)
+    override fun update(node: PressScaleNode) { node.scale = scale }
+}
+
+class PressScaleNode(var scale: Float) : Modifier.Node(),
+    PointerInputModifierNode,
+    LayoutModifierNode
+{
+    private var pressed = false
+
+    override fun onPointerEvent(
+        pointerEvent: PointerEvent,
+        pass: PointerEventPass,
+        bounds: IntSize
+    ) {
+        val newPressed = pointerEvent.type == PointerEventType.Press
+        if (newPressed != pressed) {
+            pressed = newPressed
+            invalidateMeasurement()
+        }
+    }
+
+    override fun onCancelPointerInput() { pressed = false; invalidateMeasurement() }
+
+    override fun MeasureScope.measure(
+        measurable: Measurable,
+        constraints: Constraints
+    ): MeasureResult {
+        val s = if (pressed) scale else 1f
+        val placeable = measurable.measure(constraints)
+        return layout(placeable.width, placeable.height) {
+            placeable.placeWithLayer(0, 0) {
+                scaleX = s
+                scaleY = s
+            }
+        }
+    }
+}
+
+fun Modifier.pressScale(scale: Float = 0.95f): Modifier = this.then(PressScaleElement(scale))
+```
+
+---
+
+## `layout` modifier — in-line custom layout
+
+For one-off positioning without writing a full Layout composable:
+
+```kotlin
+fun Modifier.firstBaselineToTop(firstBaselineToTop: Dp) = layout { measurable, constraints ->
+    val placeable = measurable.measure(constraints)
+    val baseline = placeable[FirstBaseline]
+    check(baseline != AlignmentLine.Unspecified)
+
+    val placeableY = firstBaselineToTop.roundToPx() - baseline
+    val height = placeable.height + placeableY
+
+    layout(placeable.width, height) {
+        placeable.placeRelative(0, placeableY)
+    }
+}
+
+// Usage: align text's baseline to 32dp from top
+Text("Hello", modifier = Modifier.firstBaselineToTop(32.dp))
+```
+
+---
+
+## Drawing modifiers
+
+```kotlin
+// drawBehind — draw BEFORE children
+Modifier.drawBehind {
+    drawCircle(Color.Red, radius = 50f, center = center)
+}
+
+// drawWithContent — draw around children
+Modifier.drawWithContent {
+    drawContent()   // children first
+    // now draw overlays
+    drawRect(
+        color = Color.Black.copy(alpha = 0.5f),
+        topLeft = Offset.Zero,
+        size = Size(size.width, size.height)
+    )
+}
+
+// drawWithCache — cache expensive path / brush across recompositions
+Modifier.drawWithCache {
+    val gradient = Brush.linearGradient(listOf(Color.Blue, Color.Green))
+    onDrawBehind {
+        drawRect(gradient, size = size)
+    }
+}
+```
+
+---
+
+## Semantics modifiers
+
+```kotlin
+// Standard — add to existing semantics
+Modifier.semantics {
+    contentDescription = "User avatar"
+    role = Role.Image
+}
+
+// mergeDescendants — children's semantics merge into this node's
+// (so TalkBack announces them as ONE)
+Modifier.semantics(mergeDescendants = true) {
+    contentDescription = "Aarav, online, 3 new messages"
+}
+
+// clearAndSet — override everything
+Modifier.clearAndSetSemantics { contentDescription = "Close dialog" }
+
+// Live region — announce changes automatically
+Modifier.semantics { liveRegion = LiveRegionMode.Polite }
+```
+
+See Module 19 (Enterprise UX) for the full accessibility playbook.
+
+---
+
+## Modifier performance
+
+### 1. Reuse Modifier chains in hot paths
+
+```kotlin
+// ❌ Allocates every item
+LazyColumn {
+    items(messages) { msg ->
+        MessageRow(
+            msg,
+            modifier = Modifier
+                .padding(8.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+        )
+    }
+}
+
+// ✅ Allocates once
+LazyColumn {
+    item {
+        val rowModifier = remember {
+            Modifier.padding(8.dp).clip(RoundedCornerShape(8.dp))
+        }
+        // ... but wait — MaterialTheme changes on theme switch
+    }
+}
+```
+
+For theme-dependent chains, use a composable factory:
+
+```kotlin
+@Composable
+fun rememberRowModifier(): Modifier {
+    val surface = MaterialTheme.colorScheme.surfaceVariant
+    return remember(surface) {
+        Modifier.padding(8.dp).clip(RoundedCornerShape(8.dp)).background(surface)
+    }
+}
+```
+
+### 2. Prefer `offset { }` lambda over `offset(x, y)`
+
+```kotlin
+// Triggers recomposition when offsetX changes
+.offset(x = offsetX, y = 0.dp)
+
+// Defers reading — no recomposition, just layout
+.offset { IntOffset(offsetX.roundToPx(), 0) }
+```
+
+### 3. Use `graphicsLayer` for transforms
+
+`.rotate(90f)` and `.scale(2f)` trigger layout passes; `graphicsLayer {
+rotationZ = 90f; scaleX = 2f }` runs on the GPU.
+
+### 4. Minimize `composed { }`
+
+Each `composed { }` creates a new `remember` site per call. In a list of
+100 items, that's 100 extra compositions. Migrate hot-path modifiers to
+`Modifier.Node`.
+
+---
+
+## Common pitfalls
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Modifier traps',
+    variant: 'old',
+    points: [
+      'Order misunderstandings (background before clip)',
+      'Reusing modifier instances incorrectly (they are cached by Compose)',
+      'Wrapping composables just to add a padding',
+      'composed { } in hot list-item paths',
+      'Forgetting Modifier parameter in reusable composables',
+      'offset(x, y) in animation hot paths'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Correct usage',
+    variant: 'new',
+    points: [
+      'Learn the default outside-in order; only deviate with intent',
+      'Immutable chains; build them per-call-site',
+      'Add Modifier parameter to caller signatures',
+      'Modifier.Node for custom modifiers',
+      'modifier: Modifier = Modifier on every public composable',
+      'offset { } lambda for animation-driven offsets'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Modifier rules">
+- **Order matters**: outside-in applies. Practice the `size → clip/background → padding` pattern.
+- Every reusable composable accepts a **`modifier: Modifier = Modifier`** parameter.
+- **Extension functions** for simple compositions; **`Modifier.Node`** for custom modifiers.
+- **`remember`** Modifier chains in hot paths; use **`offset { }`** lambda for animated offsets.
+- **`graphicsLayer { }`** for GPU-accelerated transforms.
+- **Semantics modifiers** (`semantics`, `mergeDescendants`, `clearAndSetSemantics`) for accessibility.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Card container extension', description: 'Write a Modifier.cardContainer() extension that applies clip + surfaceVariant background + 16dp padding. Use it across 3 screens.' },
+  { title: 'Shimmer modifier', description: 'Build a Modifier.shimmer() using composed { rememberInfiniteTransition } that pulses alpha 0.3 → 0.7 with tween(1_000).' },
+  { title: 'Modifier.Node port', description: 'Convert the shimmer modifier from composed { } to Modifier.Node with DrawModifierNode. Measure composition count in Layout Inspector.' },
+  { title: 'Press-scale modifier', description: 'Implement the PressScaleNode above. Apply to a Button. Verify it scales down on press.' },
+  { title: 'First-baseline-to-top', description: 'Use Modifier.layout to implement firstBaselineToTop(24.dp). Compare the baseline alignment vs a hardcoded padding.' }
+]} />
+
+## Next
+
+Continue to **[Compose Internals](./internals)** to understand the slot table, composition, and recomposition scopes.

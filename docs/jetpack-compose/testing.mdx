@@ -1,0 +1,589 @@
+---
+id: testing
+title: Testing Compose
+sidebar_label: Testing
+description: Compose testing deep dive — ComposeTestRule, semantics matchers, custom matchers, state reads, Robolectric + Compose, Paparazzi / Roborazzi screenshot testing.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Testing Compose
+
+Compose testing runs on **semantics nodes** — an abstract tree of what
+your UI means, not what it looks like. This is how screen readers see
+your app too, so good tests double as accessibility validation.
+
+<Callout kind="tip" title="The big trade-off">
+- **Instrumentation tests** (on device/emulator) are slow but real — full
+  Compose runtime, real animations, real navigation.
+- **Robolectric tests** (on JVM) run 10× faster but some APIs behave
+  differently.
+- **Paparazzi / Roborazzi** generate screenshots deterministically without
+  an emulator — perfect for visual regression.
+
+Use all three for different purposes.
+</Callout>
+
+## Dependencies
+
+```kotlin
+// build.gradle.kts (for the module under test)
+dependencies {
+    // Core
+    debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+
+    // UI tests (instrumentation)
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+
+    // Unit tests (Robolectric + Compose)
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    testImplementation("org.robolectric:robolectric:4.13")
+
+    // Screenshot testing
+    testImplementation("app.cash.paparazzi:paparazzi:1.3.5")
+    // OR
+    testImplementation("com.github.takahirom.roborazzi:roborazzi:1.30.1")
+}
+```
+
+---
+
+## The three test rule variants
+
+### 1. `createComposeRule` — pure Compose
+
+```kotlin
+class CounterTest {
+    @get:Rule val composeRule = createComposeRule()
+
+    @Test fun increments_on_click() {
+        composeRule.setContent { Counter() }
+
+        composeRule.onNodeWithText("Count: 0").assertIsDisplayed()
+        composeRule.onNodeWithText("Increment").performClick()
+        composeRule.onNodeWithText("Count: 1").assertIsDisplayed()
+    }
+}
+```
+
+### 2. `createAndroidComposeRule<MyActivity>` — hosted in an Activity
+
+```kotlin
+class ProfileScreenTest {
+    @get:Rule val composeRule = createAndroidComposeRule<MainActivity>()
+
+    @Test fun showsUserName() {
+        composeRule.onNodeWithText("Aarav").assertIsDisplayed()
+    }
+}
+```
+
+Required when your Composable depends on `LocalContext.current` (most
+real screens do) or Activity-scoped Hilt components.
+
+### 3. `createEmptyComposeRule` — full control
+
+```kotlin
+class CustomHostTest {
+    @get:Rule val composeRule = createEmptyComposeRule()
+
+    @Test fun custom() {
+        ActivityScenario.launch(TestActivity::class.java).use {
+            composeRule.setContent { MyScreen() }
+            composeRule.onNodeWithText("Hello").assertIsDisplayed()
+        }
+    }
+}
+```
+
+---
+
+## Finders — locating composables
+
+```kotlin
+composeRule.onNodeWithText("Submit")                       // by visible text
+composeRule.onNodeWithContentDescription("Close button")   // by a11y description
+composeRule.onNodeWithTag("submit_btn")                    // by testTag
+
+composeRule.onAllNodesWithText("Aarav")                    // multiple
+composeRule.onNodeWithText("Sign in", ignoreCase = true)   // case-insensitive
+composeRule.onNodeWithText("Email", substring = true)      // partial match
+```
+
+### `testTag` — stable selector
+
+```kotlin
+Button(
+    onClick = { /* ... */ },
+    modifier = Modifier.testTag("submit_btn")
+) { Text("Submit") }
+
+// Test
+composeRule.onNodeWithTag("submit_btn").performClick()
+```
+
+<Callout kind="warning" title="testTag discipline">
+Don't sprinkle testTags on every node — they pollute the UI. Reserve them
+for when semantics aren't sufficient (e.g., two buttons with the same
+text). Prefer `onNodeWithText` or `onNodeWithContentDescription` when you
+can — they validate real a11y behavior too.
+</Callout>
+
+### Matchers — complex selectors
+
+```kotlin
+composeRule.onNode(
+    hasText("Submit") and isEnabled() and hasClickAction()
+)
+
+composeRule.onNode(
+    hasAnyAncestor(hasTestTag("form")) and hasText("Email")
+)
+```
+
+Built-in matchers: `hasText`, `hasContentDescription`, `hasTestTag`,
+`hasClickAction`, `isEnabled`, `isFocused`, `isSelected`, `isOn`,
+`isToggleable`, `hasScrollAction`, `hasSetTextAction`, `hasProgressBarRangeInfo`,
+`hasImeAction`, and many more.
+
+---
+
+## Assertions
+
+```kotlin
+// Presence
+.assertExists()                     // in the tree (may be off-screen)
+.assertDoesNotExist()
+.assertIsDisplayed()                // in the tree AND visible
+.assertIsNotDisplayed()
+
+// State
+.assertIsEnabled() / .assertIsNotEnabled()
+.assertIsFocused() / .assertIsNotFocused()
+.assertIsSelected()
+.assertIsOn() / .assertIsOff()      // toggles
+.assertIsSelectable()
+
+// Text
+.assertTextEquals("Hello")
+.assertTextContains("ello")
+
+// Semantics
+.assertContentDescriptionEquals("Close")
+.assertLabelEquals("Email")
+
+// Count
+composeRule.onAllNodesWithText("Item").assertCountEquals(5)
+```
+
+---
+
+## Actions
+
+```kotlin
+.performClick()
+.performLongClick()
+.performDoubleClick()
+
+.performTextInput("hello")                 // append
+.performTextClearance()
+.performTextReplacement("new text")
+
+.performScrollTo()                         // scroll parent until visible
+.performScrollToIndex(10)                  // in LazyColumn
+.performScrollToKey("item-123")
+.performScrollToNode(hasText("Target"))
+
+.performKeyPress(KeyEvent(NativeKeyEvent(ACTION_DOWN, KEYCODE_ENTER)))
+
+.performImeAction()                        // trigger keyboard Done/Next/...
+
+.performSemanticsAction(SemanticsActions.SetProgress) { it(0.5f) }
+```
+
+### Gesture actions
+
+```kotlin
+.performTouchInput {
+    down(Offset(100f, 100f))
+    moveBy(Offset(50f, 0f))
+    up()
+}
+
+.performTouchInput {
+    swipeLeft()
+    swipeUp(startY = visibleSize.height.toFloat(), endY = 0f)
+    pinch(
+        start0 = center,
+        end0 = Offset(100f, 100f),
+        start1 = center,
+        end1 = Offset(200f, 200f)
+    )
+}
+```
+
+---
+
+## Synchronization
+
+By default Compose tests **auto-wait** for idle (no pending recompositions or
+animations). Override when needed:
+
+```kotlin
+// Pause auto-advance — useful when testing timing or animations step-by-step
+composeRule.mainClock.autoAdvance = false
+composeRule.mainClock.advanceTimeBy(500)
+composeRule.mainClock.advanceTimeByFrame()   // next vsync
+
+// Wait for condition
+composeRule.waitUntil(timeoutMillis = 5_000) {
+    composeRule.onAllNodesWithText("Loaded").fetchSemanticsNodes().isNotEmpty()
+}
+
+// Wait for all animations to finish
+composeRule.waitForIdle()
+```
+
+---
+
+## Testing state — exposing it deterministically
+
+### Inject the source of truth
+
+```kotlin
+@Test fun loadsUser() {
+    val repo = FakeUserRepository(users = listOf(User("u1", "Aarav", "a@x.com")))
+    composeRule.setContent {
+        AppTheme {
+            ProfileScreen(viewModel = ProfileViewModel(repo, SavedStateHandle(mapOf("userId" to "u1"))))
+        }
+    }
+
+    composeRule.onNodeWithText("Aarav").assertIsDisplayed()
+}
+```
+
+### With Hilt
+
+```kotlin
+@HiltAndroidTest
+class ProfileScreenTest {
+    @get:Rule(order = 0) val hiltRule = HiltAndroidRule(this)
+    @get:Rule(order = 1) val composeRule = createAndroidComposeRule<HiltTestActivity>()
+
+    @BindValue @JvmField val repo: UserRepository = FakeUserRepository()
+
+    @Before fun setup() { hiltRule.inject() }
+
+    @Test fun shows_user() {
+        repo.stub(User("u1", "Aarav", "a@x.com"))
+        composeRule.setContent { ProfileScreen() }
+        composeRule.onNodeWithText("Aarav").assertIsDisplayed()
+    }
+}
+```
+
+`@BindValue` + `HiltAndroidTest` replaces the Hilt module's `UserRepository`
+with the test fake.
+
+---
+
+## Semantics tree dump — debugging
+
+```kotlin
+composeRule.onRoot().printToLog("TEST_TREE")
+```
+
+Output:
+
+```text
+Node #1 at (0..1080, 0..2220)px
+ |-Node #2 at (40..1040, 100..200)px, Tag: 'email_field'
+ | Focused = 'true'
+ | Text = '[aarav]'
+ | Actions = [SetText, ...]
+ |-Node #3 at (40..1040, 260..360)px
+   Text = '[Invalid email]'
+```
+
+Great for debugging "why isn't my node found?" — you see exactly what the
+tree looks like.
+
+---
+
+## Custom matchers
+
+```kotlin
+fun hasProgress(progress: Float): SemanticsMatcher = SemanticsMatcher(
+    description = "has progress $progress"
+) { node ->
+    val info = node.config.getOrNull(SemanticsProperties.ProgressBarRangeInfo)
+    info?.current == progress
+}
+
+composeRule.onNode(hasProgress(0.5f)).assertExists()
+```
+
+---
+
+## Robolectric + Compose — fast JVM tests
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+@Config(qualifiers = "w360dp-h640dp-normal-long-notround-any-300dpi-keyshidden-nonav")
+class FastComposeTest {
+    @get:Rule val composeRule = createComposeRule()
+
+    @Test fun renders_fast() {
+        composeRule.setContent { MyScreen() }
+        composeRule.onNodeWithText("Hello").assertIsDisplayed()
+    }
+}
+```
+
+Runs on your laptop in < 1s per test, no emulator required. Most
+Compose-only tests (no `ContentResolver`, no system services) work fine on
+Robolectric.
+
+Enable in `build.gradle.kts`:
+
+```kotlin
+android {
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            isReturnDefaultValues = true
+        }
+    }
+}
+```
+
+---
+
+## Paparazzi — deterministic snapshot testing
+
+```kotlin
+class ButtonSnapshotTest {
+    @get:Rule val paparazzi = Paparazzi(
+        deviceConfig = DeviceConfig.PIXEL_6,
+        theme = "android:Theme.Material.Light.NoActionBar"
+    )
+
+    @Test fun primary_button() {
+        paparazzi.snapshot {
+            AppTheme {
+                Button(onClick = {}) { Text("Confirm") }
+            }
+        }
+    }
+
+    @Test fun primary_button_dark() {
+        paparazzi.snapshot {
+            AppTheme(darkTheme = true) {
+                Button(onClick = {}) { Text("Confirm") }
+            }
+        }
+    }
+
+    @Test fun primary_button_large_font() {
+        paparazzi.snapshot(
+            deviceConfig = DeviceConfig.PIXEL_6.copy(fontScale = 2f)
+        ) {
+            AppTheme {
+                Button(onClick = {}) { Text("Confirm") }
+            }
+        }
+    }
+}
+```
+
+Paparazzi renders via **layoutlib** directly to PNG — no emulator, no ADB,
+deterministic on CI. Every PR that changes a composable produces a visual
+diff in the build output.
+
+### Recording vs verifying
+
+```bash
+./gradlew :core:design:recordPaparazziDebug     # update baseline PNGs
+./gradlew :core:design:verifyPaparazziDebug     # fail on any visual diff
+```
+
+Commit the `src/test/snapshots/images/` directory. CI runs `verify`; a
+failing diff means the screenshot changed — intentional or regression.
+
+---
+
+## Roborazzi — Paparazzi alternative
+
+Same idea, but runs on Robolectric (so Compose test rule works too):
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
+class ButtonRoborazziTest {
+    @get:Rule val composeRule = createComposeRule()
+
+    @Test fun primary_button() {
+        composeRule.setContent {
+            AppTheme { Button(onClick = {}) { Text("Confirm") } }
+        }
+        composeRule.onRoot().captureRoboImage()
+    }
+}
+```
+
+Advantage over Paparazzi: you can drive interactions (click a button,
+expand a card) before snapshotting — test **states**, not just static
+renders.
+
+---
+
+## Multi-preview snapshot pattern
+
+```kotlin
+@ThemePreviews       // @Preview(Light/Dark/Fontscale 2x/RTL)
+@Composable
+private fun PrimaryButtonPreviews() {
+    AppTheme { Button(onClick = {}) { Text("Confirm") } }
+}
+
+// Using the compose-preview-screenshot plugin (Android Studio Jellyfish+):
+// ./gradlew validateScreenshotTest
+```
+
+Android Studio's **Compose Preview Screenshot Testing** plugin auto-
+generates Paparazzi-style tests from every `@Preview` function. Set it up
+once; visual regression is free thereafter.
+
+---
+
+## Testing animations
+
+```kotlin
+composeRule.mainClock.autoAdvance = false
+
+composeRule.setContent { ExpandableCard(content = "Hello") }
+
+// Initial state — collapsed
+composeRule.onNodeWithText("Hello").assertIsDisplayed()
+val initialHeight = composeRule.onNodeWithTag("card").fetchSemanticsNode().size.height
+
+// Trigger expand
+composeRule.onNodeWithTag("card").performClick()
+
+// Frame by frame
+composeRule.mainClock.advanceTimeByFrame()
+composeRule.mainClock.advanceTimeBy(150)  // mid-animation
+
+// Final state
+composeRule.mainClock.advanceTimeBy(1_000)
+val finalHeight = composeRule.onNodeWithTag("card").fetchSemanticsNode().size.height
+assertTrue(finalHeight > initialHeight)
+```
+
+---
+
+## Accessibility testing
+
+```kotlin
+@Test fun all_buttons_have_accessible_names() {
+    composeRule.setContent { ProfileScreen() }
+
+    composeRule.onAllNodesWithTag("action")
+        .assertAll(hasContentDescription() or hasText())
+}
+
+@Test fun screen_passes_a11y_audit() {
+    composeRule.setContent { ProfileScreen() }
+    composeRule.onRoot().performAccessibilityAudit()   // Google A11y Test Framework
+}
+```
+
+See [Module 19 — Enterprise UX](/docs/enterprise-ux/overview) for the full
+accessibility testing playbook.
+
+---
+
+## Test pyramid for Compose
+
+```text
+         ▲
+        ╱ ╲
+       ╱EE2╲       Small number of Espresso/Compose E2E tests on device
+      ╱─────╲
+     ╱ Inte- ╲    Hilt + Compose tests; real Room with in-memory DB
+    ╱ gration ╲
+   ╱───────────╲
+  ╱  Snapshot   ╲  Paparazzi / Roborazzi — every design-system component
+ ╱───────────────╲
+╱   Composable    ╲ Robolectric + ComposeTestRule; fast, many
+│    unit tests    │
+└───────────────────┘
+```
+
+Aim for:
+- **100+ Robolectric + Compose** tests per feature
+- **20-30 snapshot** tests across design-system + critical screens
+- **5-10 instrumented** E2E tests for money paths (login, checkout)
+
+---
+
+## Common pitfalls
+
+<ComparisonCard
+  left={{
+    label: 'Test anti-patterns',
+    title: 'What breaks',
+    variant: 'old',
+    points: [
+      'testTag on every node (pollutes prod code)',
+      'Tests dependent on exact pixel values',
+      'Tests that Thread.sleep',
+      'Flaky tests left in the suite',
+      'Testing implementation details (composition count)',
+      'Snapshot tests with timestamps / random values'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Solid tests',
+    variant: 'new',
+    points: [
+      'Prefer semantic matchers (text, contentDescription)',
+      'Assert behavior (visible, enabled), not pixels',
+      'Use waitUntil and mainClock APIs',
+      'Quarantine + delete flaky tests',
+      'Test observable behavior (state changes, actions)',
+      'Freeze clock + seed RNG for deterministic snapshots'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Testing rules">
+- **Robolectric + Compose** for the bulk of unit tests — 10× faster.
+- **Paparazzi / Roborazzi** for visual regression on every PR.
+- **`createAndroidComposeRule<HiltTestActivity>`** + `@BindValue` for screens that need Hilt.
+- **Semantic finders** (`onNodeWithText`, `onNodeWithContentDescription`) over `testTag` where possible.
+- **`mainClock.autoAdvance = false`** for deterministic animation testing.
+- **`printToLog` + `printToString`** when a selector doesn't match.
+- Aim for **100+ unit, 20 snapshot, 5 E2E** per feature.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Write a Compose unit test', description: 'Test a Counter composable with createComposeRule. Assert initial state and post-click state.' },
+  { title: 'Hilt + Compose test', description: 'Use HiltAndroidRule + @BindValue to swap a FakeUserRepository in a ProfileScreen test.' },
+  { title: 'Paparazzi snapshots', description: 'Add Paparazzi tests for your PrimaryButton in Light, Dark, 2x font, and RTL configurations.' },
+  { title: 'Animation test', description: 'Pause the main clock and assert an ExpandableCard\'s measured height grows across frames after clicking.' },
+  { title: 'A11y audit', description: 'Add an onRoot().performAccessibilityAudit() check to one screen. Fix any violations.' }
+]} />
+
+## Next
+
+Continue to **[Compose Interop](./interop)** for AndroidView, ComposeView, and Fragment/Activity hosting.

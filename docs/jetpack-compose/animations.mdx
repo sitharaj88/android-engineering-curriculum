@@ -1,0 +1,575 @@
+---
+id: animations
+title: Animations Masterclass
+sidebar_label: Animations
+description: Every Compose animation API — animate*AsState, AnimatedVisibility, AnimatedContent, Transition, InfiniteTransition, Crossfade, gesture-driven, shared element, Lottie.
+---
+
+import { Callout, StepList, Diagram, AnimationThreadDiagram } from '@site/src/components/Doc';
+
+# Animations Masterclass
+
+Compose has the most ergonomic animation system of any UI toolkit. Every
+API takes a **target value** and a **spec** (duration, easing, spring) —
+and Compose handles interpolation, frame timing, and cancellation.
+
+<Callout kind="tip" title="The three tiers">
+- **Tier 1 — `animate*AsState`**: single-value animations. 90% of cases.
+- **Tier 2 — `AnimatedVisibility`, `AnimatedContent`, `Crossfade`**: composable-level transitions.
+- **Tier 3 — `Transition`, `updateTransition`, `InfiniteTransition`**: orchestrated multi-value animations.
+
+Start at tier 1; escalate only when you need more.
+</Callout>
+
+## Tier 1 — `animate*AsState`
+
+The simplest API: give it a target; it interpolates when the target changes.
+
+```kotlin
+@Composable
+fun ToggleBox() {
+    var expanded by remember { mutableStateOf(false) }
+
+    val size by animateDpAsState(
+        targetValue = if (expanded) 200.dp else 100.dp,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+        label = "boxSize"
+    )
+    val color by animateColorAsState(
+        targetValue = if (expanded) Color.Blue else Color.Red,
+        animationSpec = tween(durationMillis = 400),
+        label = "boxColor"
+    )
+
+    Box(
+        Modifier
+            .size(size)
+            .background(color)
+            .clickable { expanded = !expanded }
+    )
+}
+```
+
+Available value variants:
+
+| API                      | Type       |
+|--------------------------|------------|
+| `animateFloatAsState`    | `Float`    |
+| `animateDpAsState`       | `Dp`       |
+| `animateIntAsState`      | `Int`      |
+| `animateIntOffsetAsState`| `IntOffset`|
+| `animateOffsetAsState`   | `Offset`   |
+| `animateSizeAsState`     | `Size`     |
+| `animateRectAsState`     | `Rect`     |
+| `animateColorAsState`    | `Color`    |
+| `animateValueAsState`    | Generic    |
+
+### Generic with a custom `TwoWayConverter`
+
+```kotlin
+val pathValue by animateValueAsState(
+    targetValue = targetPath,
+    typeConverter = TwoWayConverter(
+        convertToVector = { AnimationVector2D(it.x, it.y) },
+        convertFromVector = { Point(it.v1, it.v2) }
+    ),
+    label = "pathAnim"
+)
+```
+
+---
+
+## Animation specs
+
+### Spring — physics-based
+
+```kotlin
+spring(
+    dampingRatio = Spring.DampingRatioMediumBouncy,   // bounciness
+    stiffness = Spring.StiffnessMedium                // speed
+)
+```
+
+Spring is the default for most `animate*AsState` because it feels natural.
+Damping presets:
+
+- `DampingRatioNoBouncy` (1.0) — settles without bounce
+- `DampingRatioLowBouncy` (0.75)
+- `DampingRatioMediumBouncy` (0.5)
+- `DampingRatioHighBouncy` (0.2) — lots of bounce
+
+### Tween — duration-based
+
+```kotlin
+tween(
+    durationMillis = 300,
+    delayMillis = 0,
+    easing = FastOutSlowInEasing          // Material standard
+)
+```
+
+Easing presets: `LinearEasing`, `FastOutSlowInEasing`, `FastOutLinearInEasing`,
+`LinearOutSlowInEasing`, `EaseIn`, `EaseOut`, `EaseInOut`, `EaseOutBack`, etc.
+
+### Keyframes — multi-stage
+
+```kotlin
+keyframes {
+    durationMillis = 1000
+    0.dp at 0
+    20.dp at 200 using FastOutSlowInEasing
+    40.dp at 400
+    10.dp at 700
+    50.dp at 1000
+}
+```
+
+### Repeatable / Infinite
+
+```kotlin
+val transition = rememberInfiniteTransition(label = "pulse")
+val scale by transition.animateFloat(
+    initialValue = 1f,
+    targetValue = 1.1f,
+    animationSpec = infiniteRepeatable(
+        animation = tween(1_000, easing = FastOutSlowInEasing),
+        repeatMode = RepeatMode.Reverse
+    ),
+    label = "pulseScale"
+)
+Box(Modifier.graphicsLayer { scaleX = scale; scaleY = scale })
+```
+
+---
+
+## `AnimatedVisibility` — enter/exit
+
+```kotlin
+AnimatedVisibility(
+    visible = isLoaded,
+    enter = slideInVertically { it } + fadeIn(animationSpec = tween(200)),
+    exit = slideOutVertically { -it } + fadeOut(animationSpec = tween(150))
+) {
+    SuccessBanner()
+}
+```
+
+Composable enter/exit specs compose via `+`:
+
+| Spec                         | Animates                         |
+|------------------------------|----------------------------------|
+| `fadeIn()` / `fadeOut()`     | Alpha                            |
+| `slideIn*()` / `slideOut*()` | Position from edge              |
+| `scaleIn()` / `scaleOut()`   | Scale                            |
+| `expandIn()` / `shrinkOut()` | Size clipped                     |
+| `expandHorizontally()`       | Width only                       |
+| `expandVertically()`         | Height only                      |
+
+### Multiple specs
+
+```kotlin
+AnimatedVisibility(
+    visible = visible,
+    enter = slideInVertically { it } + fadeIn() + expandVertically(),
+    exit = shrinkVertically() + fadeOut()
+) { /* ... */ }
+```
+
+### Per-child animations
+
+```kotlin
+AnimatedVisibility(visible = visible) {
+    Column {
+        Text("Title", Modifier.animateEnterExit(enter = fadeIn(tween(delayMillis = 100))))
+        Text("Subtitle", Modifier.animateEnterExit(enter = fadeIn(tween(delayMillis = 300))))
+    }
+}
+```
+
+---
+
+## `AnimatedContent` — swap between values
+
+```kotlin
+var counter by remember { mutableIntStateOf(0) }
+
+AnimatedContent(
+    targetState = counter,
+    transitionSpec = {
+        if (targetState > initialState) {
+            slideInVertically { it } + fadeIn() togetherWith
+            slideOutVertically { -it } + fadeOut()
+        } else {
+            slideInVertically { -it } + fadeIn() togetherWith
+            slideOutVertically { it } + fadeOut()
+        }.using(SizeTransform(clip = false))
+    },
+    label = "counter"
+) { count ->
+    Text("$count", style = MaterialTheme.typography.displayLarge)
+}
+```
+
+`togetherWith` specifies enter + exit. `SizeTransform` controls how the
+container resizes between states.
+
+### State-based screen swaps
+
+```kotlin
+AnimatedContent(
+    targetState = uiState,
+    transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(200)) },
+    label = "screen"
+) { state ->
+    when (state) {
+        is UiState.Loading -> LoadingView()
+        is UiState.Success -> ContentView(state.data)
+        is UiState.Error -> ErrorView(state.error)
+    }
+}
+```
+
+---
+
+## `Crossfade` — simple fade between values
+
+```kotlin
+Crossfade(targetState = isDarkMode, label = "theme") { dark ->
+    Icon(
+        imageVector = if (dark) Icons.Default.DarkMode else Icons.Default.LightMode,
+        contentDescription = null
+    )
+}
+```
+
+Crossfade is `AnimatedContent` with fade-in + fade-out defaults. Use when
+you just need a simple swap.
+
+---
+
+## `updateTransition` — orchestrated animations
+
+When multiple values must animate together with the same timing:
+
+```kotlin
+enum class BoxState { Collapsed, Expanded }
+
+@Composable
+fun OrchestrationDemo() {
+    var state by remember { mutableStateOf(BoxState.Collapsed) }
+    val transition = updateTransition(targetState = state, label = "box")
+
+    val size by transition.animateDp(label = "size") {
+        if (it == BoxState.Expanded) 200.dp else 100.dp
+    }
+    val color by transition.animateColor(label = "color") {
+        if (it == BoxState.Expanded) Color.Blue else Color.Red
+    }
+    val cornerRadius by transition.animateDp(label = "corners") {
+        if (it == BoxState.Expanded) 32.dp else 8.dp
+    }
+
+    Box(
+        Modifier
+            .size(size)
+            .clip(RoundedCornerShape(cornerRadius))
+            .background(color)
+            .clickable {
+                state = if (state == BoxState.Collapsed) BoxState.Expanded else BoxState.Collapsed
+            }
+    )
+}
+```
+
+### Child transitions — stagger
+
+```kotlin
+val sizeSpec: @Composable Transition.Segment<BoxState>.() -> FiniteAnimationSpec<Dp> = {
+    when {
+        BoxState.Collapsed isTransitioningTo BoxState.Expanded -> tween(500)
+        else -> tween(200)
+    }
+}
+
+val size by transition.animateDp(transitionSpec = sizeSpec, label = "size") {
+    if (it == BoxState.Expanded) 200.dp else 100.dp
+}
+```
+
+---
+
+## `Animatable` — fully programmatic
+
+When you need manual control (cancel, snap to value, drive from coroutine):
+
+```kotlin
+@Composable
+fun DragHandle() {
+    val offset = remember { Animatable(0f) }
+    val scope = rememberCoroutineScope()
+
+    Box(
+        Modifier
+            .offset { IntOffset(offset.value.roundToInt(), 0) }
+            .pointerInput(Unit) {
+                detectDragGestures(
+                    onDragEnd = {
+                        scope.launch {
+                            offset.animateTo(0f, spring(stiffness = Spring.StiffnessLow))
+                        }
+                    },
+                    onDrag = { _, drag ->
+                        scope.launch { offset.snapTo(offset.value + drag.x) }
+                    }
+                )
+            }
+    )
+}
+```
+
+### Decay animation — flings
+
+```kotlin
+val decay = rememberSplineBasedDecay<Float>()
+
+// After a drag, let momentum carry the value
+scope.launch {
+    offset.animateDecay(initialVelocity = velocity, animationSpec = decay)
+}
+```
+
+---
+
+## Gesture-driven animations
+
+```kotlin
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun SwipeableCard(onDismiss: () -> Unit) {
+    val dismissState = rememberSwipeToDismissBoxState(
+        confirmValueChange = { state ->
+            if (state == SwipeToDismissBoxValue.EndToStart) { onDismiss(); true }
+            else false
+        }
+    )
+
+    SwipeToDismissBox(
+        state = dismissState,
+        backgroundContent = {
+            val color by animateColorAsState(
+                if (dismissState.dismissDirection == SwipeToDismissBoxValue.EndToStart) Color.Red
+                else Color.Transparent,
+                label = "bg"
+            )
+            Box(Modifier.fillMaxSize().background(color))
+        }
+    ) { MessageCard() }
+}
+```
+
+---
+
+## Layout animations — `animateContentSize`
+
+```kotlin
+@Composable
+fun ExpandableCard(content: String) {
+    var expanded by remember { mutableStateOf(false) }
+    Card(
+        Modifier
+            .animateContentSize(animationSpec = spring())
+            .clickable { expanded = !expanded }
+    ) {
+        Text(
+            text = content,
+            maxLines = if (expanded) Int.MAX_VALUE else 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(16.dp)
+        )
+    }
+}
+```
+
+The card smoothly resizes when `maxLines` changes.
+
+### `Modifier.animateItem()` in LazyColumn
+
+Covered in [Lists & Lazy Layouts](./lists-lazy-layouts) — animates
+insertion, deletion, and reordering.
+
+---
+
+## Shared element transitions
+
+```kotlin
+@OptIn(ExperimentalSharedTransitionApi::class)
+@Composable
+fun App() {
+    SharedTransitionLayout {
+        val navController = rememberNavController()
+        NavHost(/* ... */) {
+            composable<ListRoute> {
+                ListScreen(
+                    sharedTransitionScope = this@SharedTransitionLayout,
+                    animatedVisibilityScope = this@composable
+                )
+            }
+            composable<DetailRoute> {
+                DetailScreen(
+                    sharedTransitionScope = this@SharedTransitionLayout,
+                    animatedVisibilityScope = this@composable
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ListItem(
+    item: Item,
+    sharedTransitionScope: SharedTransitionScope,
+    animatedVisibilityScope: AnimatedVisibilityScope
+) {
+    with(sharedTransitionScope) {
+        AsyncImage(
+            model = item.imageUrl,
+            contentDescription = null,
+            modifier = Modifier
+                .sharedElement(
+                    state = rememberSharedContentState("image-${item.id}"),
+                    animatedVisibilityScope = animatedVisibilityScope,
+                    boundsTransform = { _, _ -> tween(500) }
+                )
+                .size(80.dp)
+        )
+    }
+}
+```
+
+Match `key` across destinations and Compose auto-animates bounds.
+
+---
+
+## Lottie & Rive
+
+```kotlin
+// Lottie
+implementation("com.airbnb.android:lottie-compose:6.5.2")
+
+@Composable
+fun LoadingLottie() {
+    val composition by rememberLottieComposition(LottieCompositionSpec.Asset("loading.json"))
+    LottieAnimation(
+        composition = composition,
+        iterations = LottieConstants.IterateForever,
+        modifier = Modifier.size(120.dp)
+    )
+}
+```
+
+```kotlin
+// Rive
+implementation("app.rive:rive-android:9.10.4")
+
+@Composable
+fun RiveAnimation() {
+    AndroidView(
+        factory = { context ->
+            RiveAnimationView(context).apply {
+                setRiveResource(R.raw.character, autoplay = true)
+            }
+        }
+    )
+}
+```
+
+Rive supports state-machine-driven animations — better for interactive
+UI (buttons, toggles, character rigs) than Lottie.
+
+---
+
+## Motion tokens (Material 3)
+
+```kotlin
+object MotionTokens {
+    // Durations
+    val DurationShort1  = 50
+    val DurationShort2  = 100
+    val DurationMedium1 = 200
+    val DurationMedium2 = 250
+    val DurationLong1   = 400
+    val DurationLong2   = 500
+
+    // Easing (M3 "emphasized" family)
+    val EasingStandard = CubicBezierEasing(0.2f, 0.0f, 0.0f, 1.0f)
+    val EasingEmphasized = CubicBezierEasing(0.2f, 0.0f, 0.0f, 1.0f)
+    val EasingEmphasizedDecelerate = CubicBezierEasing(0.05f, 0.7f, 0.1f, 1.0f)
+    val EasingEmphasizedAccelerate = CubicBezierEasing(0.3f, 0.0f, 0.8f, 0.15f)
+}
+
+animateDpAsState(
+    targetValue = if (expanded) 200.dp else 100.dp,
+    animationSpec = tween(MotionTokens.DurationMedium1, easing = MotionTokens.EasingStandard),
+    label = "size"
+)
+```
+
+---
+
+## Reduced motion
+
+```kotlin
+@Composable
+fun motionAdjustedTween(durationMs: Int): TweenSpec<Float> {
+    val context = LocalContext.current
+    val animatorScale = Settings.Global.getFloat(
+        context.contentResolver,
+        Settings.Global.ANIMATOR_DURATION_SCALE,
+        1f
+    )
+    return tween(
+        durationMillis = (durationMs * animatorScale).toInt().coerceAtLeast(1)
+    )
+}
+```
+
+When the user sets Animator duration to 0 via developer options (or "Remove
+animations" in accessibility), respect it by scaling durations.
+
+---
+
+## Performance notes
+
+- `graphicsLayer { }` runs on the GPU — cheap for alpha/scale/translation
+- `animateContentSize` measures and re-lays out — expensive for tall lists
+- `snap()` spec for instant value changes (no animation, but still drives `animate*AsState`)
+- Prefer `animate*AsState` over manual `Animatable` unless you need cancel/programmatic control
+- Use labels in every animation call — they show up in Android Studio's Animation Preview
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Animation rules">
+- Start at **`animate*AsState`** — 90% of animations.
+- **`AnimatedVisibility`** for enter/exit; **`AnimatedContent`** for value swaps; **`Crossfade`** for simple fades.
+- **`updateTransition`** when multiple values must share timing.
+- **`Animatable`** for programmatic / gesture-driven control.
+- **`SharedTransitionLayout`** for list → detail hero animations.
+- **Motion tokens** (duration + easing) for consistency across the app.
+- **Respect reduced motion** — scale durations by the system animator scale.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Expand/collapse card', description: 'Use animateContentSize to smoothly expand a card\'s description on tap. Try different specs (tween vs spring).' },
+  { title: 'Counter with AnimatedContent', description: 'Replace a Text("$count") with AnimatedContent that slides in numbers from top/bottom based on direction.' },
+  { title: 'Pulsing dot', description: 'Use rememberInfiniteTransition + animateFloat to build a pulsing presence indicator with RepeatMode.Reverse.' },
+  { title: 'Draggable chip', description: 'Build a chip that tracks finger with Animatable.snapTo on drag, then Animatable.animateTo(0f) on release.' },
+  { title: 'Shared element', description: 'Animate a product image from a list row to a detail screen using SharedTransitionLayout.' }
+]} />
+
+## Next
+
+Continue to **[Forms & Text Input](./forms-text-input)** for TextField, IME, focus, and validation UX.

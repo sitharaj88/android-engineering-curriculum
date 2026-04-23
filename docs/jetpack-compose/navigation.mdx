@@ -1,0 +1,595 @@
+---
+id: navigation
+title: Navigation Masterclass
+sidebar_label: Navigation
+description: Type-safe Navigation Compose — routes with Kotlin Serialization, nested graphs, deep links, shared element transitions, bottom-bar state, multi-module nav, backstack patterns.
+---
+
+import { Callout, ComparisonCard, StepList, Diagram, NavigationStackDiagram } from '@site/src/components/Doc';
+
+# Navigation Masterclass
+
+Navigation is the connective tissue of every multi-screen app. This chapter
+covers Navigation Compose 2.8+ with **type-safe routes** (Kotlin
+Serialization), nested graphs, deep links, shared element transitions,
+bottom-nav persistence, and multi-module navigation.
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+[versions]
+navigation-compose = "2.8.4"
+kotlinx-serialization = "1.7.3"
+
+[libraries]
+navigation-compose = { module = "androidx.navigation:navigation-compose", version.ref = "navigation-compose" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
+
+[plugins]
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+```
+
+```kotlin
+// build.gradle.kts
+plugins {
+    alias(libs.plugins.kotlin.serialization)
+}
+dependencies {
+    implementation(libs.navigation.compose)
+    implementation(libs.kotlinx.serialization.json)
+}
+```
+
+---
+
+## Type-safe routes (the modern way)
+
+Pre-2.8 navigation used string routes (`"profile/{userId}"`) with manual
+argument parsing. 2.8+ introduces **Kotlin Serialization**-backed routes:
+the compiler catches typos, missing args, and wrong types.
+
+```kotlin
+@Serializable data object HomeRoute
+@Serializable data object SearchRoute
+@Serializable data class ProfileRoute(val userId: String)
+@Serializable data class ProductRoute(val productId: String, val sourceCategory: String? = null)
+@Serializable data object SettingsRoute
+
+@Composable
+fun AppNavHost(navController: NavHostController = rememberNavController()) {
+    NavHost(
+        navController = navController,
+        startDestination = HomeRoute
+    ) {
+        composable<HomeRoute> {
+            HomeScreen(
+                onProfileClick = { userId -> navController.navigate(ProfileRoute(userId)) },
+                onProductClick = { id -> navController.navigate(ProductRoute(id, sourceCategory = "featured")) }
+            )
+        }
+
+        composable<ProfileRoute> { backStackEntry ->
+            val args: ProfileRoute = backStackEntry.toRoute()
+            ProfileScreen(userId = args.userId, onBack = navController::popBackStack)
+        }
+
+        composable<ProductRoute> { backStackEntry ->
+            val args: ProductRoute = backStackEntry.toRoute()
+            ProductScreen(
+                productId = args.productId,
+                source = args.sourceCategory,
+                onBack = navController::popBackStack
+            )
+        }
+
+        composable<SettingsRoute> { SettingsScreen(navController::popBackStack) }
+    }
+}
+```
+
+<Callout kind="tip" title="Why type-safe routes matter">
+Mistype an argument name (`userId` vs `UserId`) → compile error, not a
+runtime crash. Refactor a route → find-usages shows every caller. Change
+`String` to `UserId` (value class) → every destination signature updates
+automatically.
+</Callout>
+
+---
+
+## Arguments — supported types
+
+Type-safe routes support (via `@Serializable`):
+
+- All primitive types (`Int`, `Long`, `Float`, `Boolean`, `String`, ...)
+- Enums and inline/value classes
+- `@Serializable` data classes (nested)
+- Nullable types (optional with default)
+- Collections (`List`, `Map`) with `@Serializable` elements
+
+```kotlin
+@Serializable
+data class CheckoutRoute(
+    val cartId: String,
+    val discount: Discount? = null,             // nullable, optional
+    val addresses: List<String> = emptyList()   // list arg
+)
+
+@Serializable
+data class Discount(val code: String, val percent: Int)
+```
+
+### Custom types
+
+```kotlin
+@Serializable(with = LocalDateSerializer::class)
+data class EventRoute(val date: LocalDate)
+
+object LocalDateSerializer : KSerializer<LocalDate> {
+    override val descriptor = PrimitiveSerialDescriptor("LocalDate", PrimitiveKind.STRING)
+    override fun serialize(encoder: Encoder, value: LocalDate) = encoder.encodeString(value.toString())
+    override fun deserialize(decoder: Decoder) = LocalDate.parse(decoder.decodeString())
+}
+```
+
+---
+
+## Nested graphs
+
+Group related screens under a shared route; enables shared ViewModels,
+scoped permissions, and clean back navigation.
+
+```kotlin
+@Serializable data object AuthGraph
+@Serializable data object AuthLoginRoute
+@Serializable data object AuthSignupRoute
+@Serializable data object AuthForgotPasswordRoute
+
+@Serializable data object MainGraph
+@Serializable data object HomeRoute
+@Serializable data object ProfileGraph
+@Serializable data object ProfileRoot
+@Serializable data object ProfileEdit
+
+@Composable
+fun AppNavHost() {
+    val navController = rememberNavController()
+    NavHost(navController = navController, startDestination = AuthGraph) {
+
+        navigation<AuthGraph>(startDestination = AuthLoginRoute) {
+            composable<AuthLoginRoute> { LoginScreen(/* ... */) }
+            composable<AuthSignupRoute> { SignupScreen(/* ... */) }
+            composable<AuthForgotPasswordRoute> { ForgotScreen(/* ... */) }
+        }
+
+        navigation<MainGraph>(startDestination = HomeRoute) {
+            composable<HomeRoute> { HomeScreen(/* ... */) }
+
+            navigation<ProfileGraph>(startDestination = ProfileRoot) {
+                composable<ProfileRoot> { ProfileRootScreen(/* ... */) }
+                composable<ProfileEdit> { ProfileEditScreen(/* ... */) }
+            }
+        }
+    }
+}
+```
+
+### Shared ViewModel across nested destinations
+
+```kotlin
+@Composable
+fun ProfileRootScreen(navController: NavController) {
+    // Scoped to the ProfileGraph — shared with ProfileEditScreen
+    val viewModel: ProfileSharedViewModel = hiltViewModel(
+        viewModelStoreOwner = navController.getBackStackEntry<ProfileGraph>()
+    )
+    // Both ProfileRoot and ProfileEdit can access the same VM instance
+}
+```
+
+---
+
+## Deep links & App Links
+
+```kotlin
+composable<ProfileRoute>(
+    deepLinks = listOf(
+        navDeepLink<ProfileRoute>(basePath = "https://myapp.com/user"),
+        navDeepLink<ProfileRoute>(basePath = "myapp://user")
+    )
+) { /* ... */ }
+```
+
+```xml
+<!-- AndroidManifest.xml -->
+<activity android:name=".MainActivity">
+    <intent-filter android:autoVerify="true">
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="https" android:host="myapp.com" android:pathPrefix="/user"/>
+    </intent-filter>
+</activity>
+```
+
+Host a Digital Asset Links file at `https://myapp.com/.well-known/assetlinks.json`
+so Android verifies your ownership and opens the app directly (no chooser):
+
+```json
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "com.myapp",
+    "sha256_cert_fingerprints": ["14:6D:E9:83:...:FF"]
+  }
+}]
+```
+
+### Testing deep links
+
+```bash
+adb shell am start -W -a android.intent.action.VIEW -d "https://myapp.com/user/u123"
+```
+
+---
+
+## Backstack patterns
+
+### `popUpTo` — clear intermediate screens
+
+```kotlin
+// After login, remove the entire Auth graph from the backstack
+navController.navigate(MainGraph) {
+    popUpTo<AuthGraph> { inclusive = true }
+}
+```
+
+### `launchSingleTop` — avoid duplicates
+
+```kotlin
+navController.navigate(HomeRoute) {
+    launchSingleTop = true   // don't re-enter if already on top
+}
+```
+
+### `saveState` / `restoreState` — bottom-nav pattern
+
+```kotlin
+navController.navigate(destination) {
+    popUpTo(navController.graph.findStartDestination().id) {
+        saveState = true
+    }
+    launchSingleTop = true
+    restoreState = true   // restore prior state of this destination
+}
+```
+
+This is the canonical pattern for **bottom navigation** — switching tabs
+preserves scroll position, search query, and VM state of each tab.
+
+---
+
+## Bottom navigation
+
+```kotlin
+@Serializable sealed class TopLevelRoute {
+    @Serializable data object Home : TopLevelRoute()
+    @Serializable data object Search : TopLevelRoute()
+    @Serializable data object Inbox : TopLevelRoute()
+    @Serializable data object Profile : TopLevelRoute()
+}
+
+data class TopLevelDestination(
+    val route: TopLevelRoute,
+    val icon: ImageVector,
+    val label: String
+)
+
+val topLevelDestinations = listOf(
+    TopLevelDestination(TopLevelRoute.Home,    Icons.Default.Home,          "Home"),
+    TopLevelDestination(TopLevelRoute.Search,  Icons.Default.Search,        "Search"),
+    TopLevelDestination(TopLevelRoute.Inbox,   Icons.Default.MailOutline,   "Inbox"),
+    TopLevelDestination(TopLevelRoute.Profile, Icons.Default.Person,        "Profile")
+)
+
+@Composable
+fun App() {
+    val navController = rememberNavController()
+    val navBackStackEntry by navController.currentBackStackEntryAsState()
+    val currentRoute = navBackStackEntry?.destination
+
+    Scaffold(
+        bottomBar = {
+            NavigationBar {
+                topLevelDestinations.forEach { dest ->
+                    val selected = currentRoute?.hierarchy
+                        ?.any { it.hasRoute(dest.route::class) } == true
+
+                    NavigationBarItem(
+                        icon = { Icon(dest.icon, contentDescription = null) },
+                        label = { Text(dest.label) },
+                        selected = selected,
+                        onClick = {
+                            navController.navigate(dest.route) {
+                                popUpTo(navController.graph.findStartDestination().id) {
+                                    saveState = true
+                                }
+                                launchSingleTop = true
+                                restoreState = true
+                            }
+                        }
+                    )
+                }
+            }
+        }
+    ) { padding ->
+        AppNavHost(
+            navController = navController,
+            modifier = Modifier.padding(padding)
+        )
+    }
+}
+```
+
+---
+
+## Transitions & animations
+
+```kotlin
+composable<ProfileRoute>(
+    enterTransition = {
+        slideInHorizontally(initialOffsetX = { it }) + fadeIn()
+    },
+    exitTransition = {
+        slideOutHorizontally(targetOffsetX = { -it / 3 }) + fadeOut()
+    },
+    popEnterTransition = {
+        slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn()
+    },
+    popExitTransition = {
+        slideOutHorizontally(targetOffsetX = { it }) + fadeOut()
+    }
+) { /* ... */ }
+```
+
+`enter` runs when navigating forward; `popEnter` runs when returning via
+back. Define defaults for the whole graph:
+
+```kotlin
+NavHost(
+    navController = navController,
+    startDestination = HomeRoute,
+    enterTransition = { fadeIn(tween(300)) },
+    exitTransition = { fadeOut(tween(300)) }
+) { /* ... */ }
+```
+
+---
+
+## Shared element transitions (Compose 1.7+)
+
+```kotlin
+@OptIn(ExperimentalSharedTransitionApi::class)
+@Composable
+fun App() {
+    SharedTransitionLayout {
+        val navController = rememberNavController()
+        NavHost(navController = navController, startDestination = ListRoute) {
+            composable<ListRoute> {
+                ListScreen(
+                    sharedTransitionScope = this@SharedTransitionLayout,
+                    animatedVisibilityScope = this@composable,
+                    onItemClick = { id -> navController.navigate(DetailRoute(id)) }
+                )
+            }
+            composable<DetailRoute> {
+                DetailScreen(
+                    sharedTransitionScope = this@SharedTransitionLayout,
+                    animatedVisibilityScope = this@composable
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ListItem(
+    item: Item,
+    sharedTransitionScope: SharedTransitionScope,
+    animatedVisibilityScope: AnimatedVisibilityScope
+) {
+    with(sharedTransitionScope) {
+        AsyncImage(
+            model = item.imageUrl,
+            contentDescription = null,
+            modifier = Modifier
+                .sharedElement(
+                    state = rememberSharedContentState(key = "image-${item.id}"),
+                    animatedVisibilityScope = animatedVisibilityScope
+                )
+                .size(80.dp)
+                .clip(MaterialTheme.shapes.small)
+        )
+    }
+}
+```
+
+Matching `key` on both the list row and detail hero → the image animates
+from its list position to the detail position.
+
+---
+
+## Multi-module navigation
+
+When navigation routes cross feature modules, the consumer must depend on
+the provider's API. Two patterns:
+
+### Pattern 1 — Route in `:api` module
+
+```kotlin
+// :feature:profile:api
+@Serializable data class ProfileRoute(val userId: String)
+
+// :feature:profile:impl
+fun NavGraphBuilder.profileScreen(navController: NavController) {
+    composable<ProfileRoute> { backStackEntry ->
+        val args: ProfileRoute = backStackEntry.toRoute()
+        ProfileScreen(userId = args.userId, onBack = navController::popBackStack)
+    }
+}
+
+// :app (depends on both impl and api)
+NavHost(startDestination = HomeRoute) {
+    homeScreen(navController)
+    profileScreen(navController)
+}
+```
+
+### Pattern 2 — Navigation contract
+
+```kotlin
+// :core:navigation
+interface Navigator {
+    fun navigateTo(destination: Destination)
+}
+
+sealed interface Destination {
+    data class Profile(val userId: String) : Destination
+    data class Product(val productId: String) : Destination
+}
+
+// :feature:home:impl
+@Composable
+fun HomeScreen(viewModel: HomeViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    LazyColumn {
+        items(state.users) { user ->
+            UserRow(user = user, onClick = { viewModel.onUserClick(user.id) })
+        }
+    }
+}
+
+class HomeViewModel @Inject constructor(private val navigator: Navigator) : ViewModel() {
+    fun onUserClick(id: String) = navigator.navigateTo(Destination.Profile(id))
+}
+
+// :app — the only place that owns the actual navigate() call
+class NavigatorImpl(private val navController: NavHostController) : Navigator {
+    override fun navigateTo(destination: Destination) = when (destination) {
+        is Destination.Profile -> navController.navigate(ProfileRoute(destination.userId))
+        is Destination.Product -> navController.navigate(ProductRoute(destination.productId))
+    }
+}
+```
+
+<Callout kind="tip" title="Pick the pattern that matches your scale">
+- **< 10 feature modules**: Pattern 1 (route in :api) is simpler.
+- **30+ feature modules**: Pattern 2 (navigation contract) decouples
+  features from the navigation implementation. Changing the router
+  doesn't touch any feature module.
+</Callout>
+
+---
+
+## Passing complex data
+
+Don't pass large objects through route arguments. Two correct approaches:
+
+### 1. Fetch by ID
+
+```kotlin
+navController.navigate(ProductRoute(productId = "p1"))  // just the ID
+// ProductScreen fetches full product via repository
+```
+
+### 2. Shared ViewModel
+
+```kotlin
+// In parent / nested graph ViewModel
+val selectedProduct = MutableStateFlow<Product?>(null)
+
+// Navigate, then detail reads from shared VM
+navController.navigate(ProductDetailRoute)
+```
+
+---
+
+## Navigation testing
+
+```kotlin
+@Test
+fun navigates_to_profile_on_user_click() {
+    composeTestRule.setContent {
+        val navController = rememberNavController()
+        AppNavHost(navController)
+
+        composeTestRule.onNodeWithText("Aarav").performClick()
+
+        composeTestRule.waitUntil {
+            navController.currentDestination?.route?.contains("Profile") == true
+        }
+    }
+}
+```
+
+---
+
+## Common pitfalls
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Navigation traps',
+    variant: 'old',
+    points: [
+      'String routes with manual arg parsing',
+      'Passing Parcelable objects through bundle args',
+      'Deep links without autoVerify',
+      'Forgetting popUpTo after login / signup',
+      'Nested NavHost inside NavHost (broken backstack)',
+      'Mutating state after navigate() (race condition)'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Correct patterns',
+    variant: 'new',
+    points: [
+      '@Serializable data classes as routes',
+      'Pass IDs; fetch data via repository',
+      'App Links + assetlinks.json verified',
+      'popUpTo<AuthGraph>(inclusive = true) after login',
+      'Nested graphs via navigation<Graph>(...) inside one NavHost',
+      'Navigate first, then state updates propagate via Flow'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Navigation rules">
+- Use **type-safe routes** with `@Serializable` data classes — no strings.
+- **Nested graphs** group related screens and enable scoped ViewModels.
+- **App Links + assetlinks.json** open your app directly from web links.
+- **Bottom-nav** pattern: `popUpTo(start) { saveState = true }` + `restoreState = true`.
+- **Shared element transitions** via `SharedTransitionLayout` + `rememberSharedContentState`.
+- **Multi-module**: route in `:api` for small apps; Navigator contract for large.
+- Pass **IDs**, never heavy objects, through route arguments.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Type-safe routes', description: 'Replace all string routes in a NavHost with @Serializable data classes. Verify compile errors when you typo an arg.' },
+  { title: 'Bottom-nav state', description: 'Implement bottom navigation with saveState/restoreState. Verify each tab preserves its scroll and search state across switches.' },
+  { title: 'Deep link', description: 'Add a navDeepLink for ProfileRoute. Trigger it via adb and verify your app opens to the correct screen.' },
+  { title: 'Shared element transition', description: 'Animate a product image from list to detail using SharedTransitionLayout. Match keys correctly.' },
+  { title: 'Multi-module nav', description: 'Create a :feature:profile module with its route in :feature:profile:api. Wire it into :app via an extension on NavGraphBuilder.' }
+]} />
+
+## Next
+
+Continue to **[Animations Masterclass](./animations)** for every animation API in Compose.

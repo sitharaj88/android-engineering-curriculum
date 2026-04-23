@@ -1,0 +1,492 @@
+---
+id: lists-lazy-layouts
+title: Lists & Lazy Layouts
+sidebar_label: Lists & Lazy Layouts
+description: LazyColumn, LazyRow, LazyVerticalGrid, LazyVerticalStaggeredGrid — items, keys, contentType, sticky headers, scroll state, pull-to-refresh, Paging 3 integration.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Lists & Lazy Layouts
+
+Lazy layouts are how Compose renders thousands of items without choking.
+Unlike `Column`, they compose **only visible items** (plus a small buffer),
+recycle slots as content scrolls, and respond to scroll-driven state.
+This chapter covers every lazy API, scroll state, sticky headers, pull-to-
+refresh, and Paging 3 integration.
+
+## The lazy family
+
+| Composable                       | What it renders                                |
+|----------------------------------|------------------------------------------------|
+| `LazyColumn`                     | Vertical list                                  |
+| `LazyRow`                        | Horizontal list                                |
+| `LazyVerticalGrid`               | Fixed-column-count grid                        |
+| `LazyHorizontalGrid`             | Fixed-row-count horizontal grid                |
+| `LazyVerticalStaggeredGrid`      | Pinterest-style staggered vertical grid        |
+| `LazyHorizontalStaggeredGrid`    | Staggered horizontal grid                      |
+| `HorizontalPager` / `VerticalPager` | Snapping paged list                         |
+
+All share the same DSL: `items()`, `item()`, `stickyHeader()`, and scroll
+state management.
+
+---
+
+## `LazyColumn` — the core
+
+```kotlin
+@Composable
+fun MessageList(
+    messages: List<Message>,
+    onMessageClick: (Message) -> Unit
+) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(
+            top = 16.dp, bottom = 96.dp,   // extra bottom for FAB
+            start = 16.dp, end = 16.dp
+        ),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        item { Text("Today", style = MaterialTheme.typography.titleMedium) }
+
+        items(
+            items = messages,
+            key = { it.id },                              // stable identity
+            contentType = { "message" }                   // type hint for reuse
+        ) { message ->
+            MessageRow(message, onClick = { onMessageClick(message) })
+        }
+
+        item {
+            TextButton(onClick = { /* load older */ }) {
+                Text("Load older messages")
+            }
+        }
+    }
+}
+```
+
+### `itemsIndexed` — when position matters
+
+```kotlin
+itemsIndexed(
+    items = messages,
+    key = { _, msg -> msg.id }
+) { index, message ->
+    if (index == 0) TopBadge()
+    MessageRow(message)
+    if (index % 10 == 9) Banner()                // every 10th row
+}
+```
+
+### Multiple item types — section headers + items
+
+```kotlin
+sealed interface ListItem {
+    data class Header(val title: String) : ListItem
+    data class Row(val message: Message) : ListItem
+}
+
+LazyColumn {
+    items(
+        items = items,
+        key = {
+            when (it) {
+                is ListItem.Header -> "header-${it.title}"
+                is ListItem.Row -> "row-${it.message.id}"
+            }
+        },
+        contentType = {
+            when (it) {
+                is ListItem.Header -> "header"
+                is ListItem.Row -> "row"
+            }
+        }
+    ) { item ->
+        when (item) {
+            is ListItem.Header -> SectionHeader(item.title)
+            is ListItem.Row -> MessageRow(item.message)
+        }
+    }
+}
+```
+
+<Callout kind="warning" title="Keys and contentType are not cosmetic">
+- **Key**: without it, insertions/reorders re-compose every row below the
+  change and animation breaks.
+- **ContentType**: without it, Compose can't reuse item slots efficiently
+  across heterogeneous types, wasting composition work.
+
+Always provide both in a real list.
+</Callout>
+
+---
+
+## Sticky headers
+
+```kotlin
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun ContactsList(contacts: List<Contact>) {
+    val grouped = contacts.groupBy { it.name.first().uppercaseChar() }
+
+    LazyColumn {
+        grouped.forEach { (initial, list) ->
+            stickyHeader(key = "header-$initial") {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.surfaceVariant
+                ) {
+                    Text(
+                        text = "$initial",
+                        modifier = Modifier.padding(8.dp),
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
+            }
+            items(list, key = { it.id }) { contact -> ContactRow(contact) }
+        }
+    }
+}
+```
+
+---
+
+## Scroll state
+
+`rememberLazyListState()` exposes scroll position, animations, and drives
+effects:
+
+```kotlin
+@Composable
+fun TrackedList(items: List<Item>) {
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+
+    Column {
+        TopBar(
+            title = "Items",
+            onScrollToTop = { scope.launch { listState.animateScrollToItem(0) } }
+        )
+        LazyColumn(state = listState) {
+            items(items, key = { it.id }) { ItemRow(it) }
+        }
+    }
+
+    // Show a "scroll to top" FAB after scrolling past item 10
+    val showFab by remember {
+        derivedStateOf { listState.firstVisibleItemIndex > 10 }
+    }
+    AnimatedVisibility(showFab) {
+        FloatingActionButton(onClick = { scope.launch { listState.animateScrollToItem(0) } }) {
+            Icon(Icons.Default.KeyboardArrowUp, null)
+        }
+    }
+}
+```
+
+### Scroll-aware effects
+
+```kotlin
+// Log scroll depth for analytics without triggering recompositions
+LaunchedEffect(listState) {
+    snapshotFlow { listState.firstVisibleItemIndex }
+        .distinctUntilChanged()
+        .debounce(1_000)
+        .collect { analytics.logScrollDepth(it) }
+}
+
+// Load more when approaching the end
+LaunchedEffect(listState) {
+    snapshotFlow {
+        val layoutInfo = listState.layoutInfo
+        val visibleItems = layoutInfo.visibleItemsInfo
+        val lastVisible = visibleItems.lastOrNull()?.index ?: 0
+        val total = layoutInfo.totalItemsCount
+        lastVisible >= total - 5
+    }.filter { it }
+     .collect { viewModel.loadMore() }
+}
+```
+
+### Restore scroll position across navigation
+
+`LazyListState` is `Saveable` by default — scroll position survives
+configuration changes and process death automatically.
+
+---
+
+## Grids
+
+### Fixed grid
+
+```kotlin
+LazyVerticalGrid(
+    columns = GridCells.Fixed(3),                          // 3 columns
+    contentPadding = PaddingValues(8.dp),
+    verticalArrangement = Arrangement.spacedBy(8.dp),
+    horizontalArrangement = Arrangement.spacedBy(8.dp)
+) {
+    items(photos, key = { it.id }) { photo ->
+        AsyncImage(
+            model = photo.url,
+            contentDescription = photo.caption,
+            modifier = Modifier
+                .aspectRatio(1f)
+                .clip(MaterialTheme.shapes.small)
+        )
+    }
+}
+```
+
+### Adaptive grid (responsive)
+
+```kotlin
+LazyVerticalGrid(
+    columns = GridCells.Adaptive(minSize = 120.dp),   // as many columns as fit
+    /* ... */
+)
+```
+
+### Grid item spans
+
+```kotlin
+LazyVerticalGrid(columns = GridCells.Fixed(3)) {
+    item(span = { GridItemSpan(maxLineSpan) }) {      // full-width header
+        SectionHeader("Featured")
+    }
+    items(photos, span = { if (it.isFeatured) GridItemSpan(2) else GridItemSpan(1) }) { photo ->
+        PhotoCard(photo)
+    }
+}
+```
+
+### Staggered grid (Pinterest-style)
+
+```kotlin
+LazyVerticalStaggeredGrid(
+    columns = StaggeredGridCells.Fixed(2),
+    verticalItemSpacing = 8.dp,
+    horizontalArrangement = Arrangement.spacedBy(8.dp),
+    contentPadding = PaddingValues(8.dp)
+) {
+    items(items, key = { it.id }) { item ->
+        Card { /* variable-height content */ }
+    }
+}
+```
+
+---
+
+## Pull to refresh
+
+```kotlin
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun RefreshableFeed(viewModel: FeedViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val pullState = rememberPullToRefreshState()
+
+    PullToRefreshBox(
+        isRefreshing = state.isRefreshing,
+        onRefresh = viewModel::refresh,
+        state = pullState
+    ) {
+        LazyColumn(Modifier.fillMaxSize()) {
+            items(state.items, key = { it.id }) { FeedItem(it) }
+        }
+    }
+}
+```
+
+---
+
+## `HorizontalPager` / `VerticalPager`
+
+```kotlin
+@Composable
+fun Onboarding(pages: List<OnboardingPage>) {
+    val pagerState = rememberPagerState(pageCount = { pages.size })
+    val scope = rememberCoroutineScope()
+
+    Column {
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier.weight(1f),
+            contentPadding = PaddingValues(horizontal = 32.dp),
+            pageSpacing = 16.dp
+        ) { page ->
+            OnboardingCard(pages[page])
+        }
+
+        PagerIndicator(
+            pageCount = pages.size,
+            currentPage = pagerState.currentPage,
+            currentPageOffsetFraction = { pagerState.currentPageOffsetFraction }
+        )
+
+        Button(onClick = { scope.launch { pagerState.animateScrollToPage(pagerState.currentPage + 1) } }) {
+            Text("Next")
+        }
+    }
+}
+```
+
+`pagerState.currentPageOffsetFraction` is the real-time offset between
+pages — perfect for driving synchronized animations (scale, alpha,
+indicators).
+
+---
+
+## Integrating Paging 3
+
+Paging 3 is the right answer for lists larger than a few hundred items or
+backed by a remote API with cursor pagination.
+
+```kotlin
+@HiltViewModel
+class FeedViewModel @Inject constructor(
+    repository: ArticleRepository
+) : ViewModel() {
+    val articles: Flow<PagingData<Article>> = repository.pager()
+        .cachedIn(viewModelScope)   // cache across config changes
+}
+
+@Composable
+fun FeedScreen(viewModel: FeedViewModel = hiltViewModel()) {
+    val articles = viewModel.articles.collectAsLazyPagingItems()
+
+    LazyColumn {
+        items(
+            count = articles.itemCount,
+            key = articles.itemKey { it.id },
+            contentType = articles.itemContentType { "article" }
+        ) { index ->
+            val article = articles[index]
+            if (article != null) ArticleRow(article) else ArticlePlaceholder()
+        }
+
+        // Footer based on load state
+        when (val append = articles.loadState.append) {
+            is LoadState.Loading -> item { CircularProgressIndicator(Modifier.fillMaxWidth().padding(16.dp)) }
+            is LoadState.Error -> item { ErrorItem(append.error) { articles.retry() } }
+            else -> Unit
+        }
+
+        // Initial load / refresh state
+        when (val refresh = articles.loadState.refresh) {
+            is LoadState.Loading -> item { FullScreenLoader() }
+            is LoadState.Error -> item { FullScreenError(refresh.error) { articles.retry() } }
+            else -> Unit
+        }
+    }
+}
+```
+
+---
+
+## Item animations
+
+```kotlin
+@OptIn(ExperimentalFoundationApi::class)
+LazyColumn {
+    items(
+        items = messages,
+        key = { it.id }
+    ) { message ->
+        MessageRow(
+            message = message,
+            modifier = Modifier.animateItem()   // smooth re-order / insert / delete
+        )
+    }
+}
+```
+
+`animateItem()` (previously `animateItemPlacement()`) animates position
+changes when items are added, removed, or reordered. Requires stable keys.
+
+---
+
+## Performance tips for lazy lists
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Performance killers',
+    variant: 'old',
+    points: [
+      'No key on items',
+      'Unstable List<T> in state',
+      'Expensive computation in item composable',
+      'Modifier chain allocated per item',
+      'Nested LazyColumn inside LazyColumn (crashes)',
+      'Items reading state that changes every scroll pixel'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Proven patterns',
+    variant: 'new',
+    points: [
+      'Stable key + contentType always',
+      '@Immutable + ImmutableList for state',
+      'Precompute display strings in ViewModel',
+      'remember { } the shared Modifier chain',
+      'Use `items()` with a flat List and headers via `item()`',
+      'Pass lambdas (state providers), not raw state'
+    ]
+  }}
+/>
+
+### Measure scroll jank
+
+```kotlin
+@Test
+fun feedScrollJank() = benchmarkRule.measureRepeated(
+    packageName = "com.myapp",
+    metrics = listOf(FrameTimingMetric()),
+    compilationMode = CompilationMode.Partial(),
+    iterations = 10,
+    startupMode = StartupMode.COLD,
+    setupBlock = { startActivityAndWait() }
+) {
+    val list = device.findObject(By.res("feed"))
+    list.setGestureMargin(device.displayWidth / 5)
+    repeat(5) {
+        list.fling(Direction.DOWN)
+        device.waitForIdle()
+    }
+}
+```
+
+Use `FrameTimingMetric` from `:benchmark` module (Module 10) to get the
+P50/P95/P99 frame time distribution.
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Lazy layout rules">
+- **`LazyColumn` / `LazyRow` / `LazyVerticalGrid` / `LazyStaggeredGrid`** — one DSL, different arrangements.
+- **Always provide `key` + `contentType`** for items; without them, lists reorder badly and recompose too much.
+- **`rememberLazyListState()`** + `snapshotFlow` for scroll-driven side effects (analytics, infinite scroll).
+- **`PullToRefreshBox`** wraps the list; `pagerState.currentPageOffsetFraction` drives animation parallax.
+- **Paging 3** with `collectAsLazyPagingItems()` + load-state footers for remote lists.
+- **`Modifier.animateItem()`** for smooth insert/remove/reorder animations.
+- Profile scroll with `FrameTimingMetric` in Macrobenchmark.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Sticky-header list', description: 'Build a contacts list grouped by first letter with stickyHeader{}. Verify headers stick during scroll.' },
+  { title: 'Scroll-to-top FAB', description: 'Use rememberLazyListState + derivedStateOf to show a FAB after scrolling past item 10. Animate in/out.' },
+  { title: 'Staggered grid', description: 'Render a LazyVerticalStaggeredGrid of photos with random heights. Observe how staggered arrangement works.' },
+  { title: 'Paging 3 integration', description: 'Integrate a RemoteMediator-backed Pager into a LazyColumn with load-state footers for loading/error states.' },
+  { title: 'Item animation', description: 'Add Modifier.animateItem() to a list. Delete an item mid-list and confirm it animates out smoothly.' }
+]} />
+
+## Next
+
+Continue to **[Navigation Masterclass](./navigation)** for type-safe Nav Compose, nested graphs, deep links, and shared element transitions.

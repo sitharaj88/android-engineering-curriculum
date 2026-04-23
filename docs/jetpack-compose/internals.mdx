@@ -1,0 +1,495 @@
+---
+id: internals
+title: Compose Internals
+sidebar_label: Internals
+description: The slot table, gap buffer, positional memoization, composition vs recomposition, recomposition scopes, stability inference, and how the Compose compiler transforms your code.
+---
+
+import { Callout, StepList, ComparisonCard, Diagram, ComposeRecompositionDiagram, RenderFlowDiagram } from '@site/src/components/Doc';
+
+# Compose Internals
+
+At this point you can build anything in Compose. This chapter explains
+**how the magic works under the hood** — the slot table, recomposition
+scopes, stability inference, and what the Compose compiler actually does
+to your `@Composable` functions. Understanding this separates users from
+toolmakers.
+
+<Callout kind="tip" title="Why go this deep">
+Most Compose bugs — "this composable recomposes too often," "state is
+leaking," "why doesn't my modifier get called?" — trace back to an
+incorrect mental model of composition. An accurate model turns mysteries
+into obvious diagnoses.
+</Callout>
+
+## The three phases
+
+<Diagram title="Compose render flow" caption="Every frame: compose, measure+layout, draw. Each phase can invalidate the next.">
+  <RenderFlowDiagram />
+</Diagram>
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│  1. COMPOSITION                                                   │
+│     Execute @Composable functions                                │
+│     Build / update the node tree (LayoutNodes + their state)     │
+│                                                                   │
+│  2. MEASURE + LAYOUT                                              │
+│     Each LayoutNode asks its children to measure                 │
+│     Positions are assigned                                        │
+│                                                                   │
+│  3. DRAW                                                           │
+│     Each LayoutNode issues draw commands to a RenderNode         │
+│     RenderNodes are composited by the system                     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**State changes** can invalidate any phase independently:
+
+- Change state read inside a Composable → recompose only that scope
+- Change a layout input (size, offset) → skip composition, redo layout + draw
+- Change a draw input (color, alpha via `graphicsLayer`) → skip composition + layout, redo draw only
+
+This is why `graphicsLayer { alpha = x }` for fades is so cheap: it skips
+two phases.
+
+---
+
+## The slot table
+
+Compose stores the composition state in a **slot table** — a gap buffer
+that holds, in order, every value, state, remember, group, and node you
+produce. Think of it as a flat array with a cursor.
+
+```text
+Slot table (flat, ordered):
+  ┌────────────────────────────────────────────────────────────────┐
+  │ group(App) │ group(Column) │ group(Greeting) │ remember(name) │
+  │ node(Text) │ group(Text)   │ value("Aarav") │ ...             │
+  └────────────────────────────────────────────────────────────────┘
+            ↑ cursor during composition moves through the buffer
+```
+
+Each `@Composable` call site emits a **group** (a logical container). The
+compiler inserts a **key** automatically, based on the call site's source
+file and line number — so two calls to `Greeting("A")` at different lines
+get different keys and are independent.
+
+### Positional memoization
+
+The slot table is indexed **by position in the call tree**, not by input.
+
+```kotlin
+@Composable
+fun Screen() {
+    var text by remember { mutableStateOf("") }     // slot at position [0]
+
+    if (showName) {
+        Text("Hello $text")                          // group at position [1]
+    }
+
+    TextField(value = text, onValueChange = { text = it })  // group at position [2] (or [1] if showName=false)
+}
+```
+
+Because `TextField`'s slot depends on whether `showName` is true, toggling
+`showName` moves the TextField's slot — and **loses its state** (focus,
+scroll, etc.).
+
+### The fix — explicit keys
+
+```kotlin
+if (showName) {
+    Text("Hello $text")
+}
+
+key("text-field") {          // explicit key pins the slot
+    TextField(value = text, onValueChange = { text = it })
+}
+```
+
+`key { }` forces a stable slot identity. `LazyColumn`'s `key = { it.id }`
+does the same thing for list items.
+
+---
+
+## Composition vs recomposition
+
+**Composition** — the first time a composable runs, it creates groups,
+calls `remember`, emits nodes. The slot table is built.
+
+**Recomposition** — a state read inside a composable changes. Compose
+invalidates the scope containing that read, then re-runs only that scope.
+The slot table cursor advances to the group and re-executes from there,
+reusing existing `remember` values.
+
+```kotlin
+@Composable
+fun Parent() {
+    var count by remember { mutableIntStateOf(0) }
+
+    Column {
+        Header()                                    // no state read — skipped
+        Counter(count)                              // reads count — recomposes
+        Footer()                                    // no state read — skipped
+    }
+
+    Button(onClick = { count++ }) { Text("Inc") }
+}
+```
+
+When `count` changes, only `Counter(count)` recomposes. `Header` and
+`Footer` are marked **skippable** and retain their state.
+
+---
+
+## Recomposition scopes
+
+A **recomposition scope** is the smallest unit Compose can invalidate
+and re-run independently. Every `@Composable` function that returns
+`Unit` can become a scope — but only if it's **restartable**.
+
+### Restartable — the compiler-inserted wrapper
+
+The Compose compiler wraps most composables in a restart group:
+
+```kotlin
+// Your code
+@Composable
+fun Greeting(name: String) {
+    Text("Hello, $name")
+}
+
+// After compilation (simplified)
+@Composable
+fun Greeting(name: String, $composer: Composer, $changed: Int) {
+    $composer.startRestartGroup(key)
+    // ...
+    Text("Hello, $name", ...)
+    // ...
+    $composer.endRestartGroup()?.updateScope { $newComposer, $newChanged ->
+        Greeting(name, $newComposer, $newChanged or 1)   // restart point
+    }
+}
+```
+
+When a state read inside the scope changes, Compose calls `updateScope`
+— restarting only this function.
+
+### When is a composable NOT restartable?
+
+- Returns a value (e.g. `remember { computeSomething() }` is a direct call,
+  not a scope). Non-Unit-returning composables are inlined.
+- Has an `@ReadOnlyComposable` or `@NonRestartableComposable` annotation
+  (rare, used by the framework).
+- Is `@Composable inline fun` — inlined at call site.
+
+Check the Compose compiler metrics report (Module 10) for a
+`restartable skippable scheme(...)` annotation on every composable that
+can be skipped on recomposition.
+
+---
+
+## Skippability — the stability contract
+
+A restartable composable is **skippable** if all its parameters are
+**stable** and equal to the previous call.
+
+### What stability means
+
+A type `T` is stable if:
+
+1. Its `equals()` is consistent — same inputs always produce same output.
+2. When `T` mutates, Compose is notified (i.e., mutation happens via `State<T>`).
+
+The Compose compiler infers stability for:
+
+- Primitives (`Int`, `Boolean`, ...)
+- Function types (`() -> Unit`)
+- Types annotated `@Stable` or `@Immutable`
+- `data class` whose properties are all stable (Kotlin 2.0+ inference)
+
+**Not stable** by default:
+- `List`, `Map`, `Set` — interfaces; the runtime can't prove immutability
+- `MutableList`, arrays
+- Classes from modules without the Compose compiler plugin
+- Any class with a `var` property unless marked `@Stable`
+
+### Fixing instability
+
+```kotlin
+// ❌ Unstable — List is an interface
+data class Inbox(val messages: List<Message>)
+
+// ✅ Stable — annotate as immutable
+@Immutable
+data class Inbox(val messages: List<Message>)
+
+// ✅✅ Better — use kotlinx.collections.immutable
+@Immutable
+data class Inbox(val messages: ImmutableList<Message>)
+```
+
+`@Immutable` is a **promise**: every property is immutable for the
+lifetime of the instance. Violating it corrupts Compose's state.
+
+`@Stable` is weaker: the object may mutate, but it will notify Compose
+(e.g., via `MutableState`).
+
+---
+
+## Strong skipping mode (Compose 1.7+)
+
+Kotlin 2.0 + Compose Compiler 1.7 introduced **strong skipping**: even
+without `@Stable`/`@Immutable`, restartable composables skip when their
+parameters are reference-equal to the previous call.
+
+```kotlin
+// Before strong skipping: this was non-skippable if List is unstable
+@Composable
+fun MessageList(messages: List<Message>) { /* ... */ }
+
+// With strong skipping: skips when `messages` is the same reference
+```
+
+Strong skipping is on by default in Compose 1.7+. It reduces the
+stability-chasing tax, but you still benefit from `@Immutable` +
+`ImmutableList` because `.copy()` of a state holder produces a new
+reference — a stable class's members compared by `.equals()` would still
+skip.
+
+---
+
+## Snapshots — how state-tracking works
+
+Compose uses a **snapshot system** (inspired by software transactional
+memory) to track state reads and writes.
+
+```kotlin
+// Every read of a State<T> inside a composable registers the scope
+// with that State. When the State's value changes, every registered
+// scope is invalidated.
+
+val count = mutableStateOf(0)
+
+// Inside a composable:
+Text("$count")          // this scope is now a reader of `count`
+
+// Later:
+count.value = 1         // every reader scope invalidates
+```
+
+The snapshot system extends to nested reads — if your scope reads a
+`derivedStateOf`, which reads `count`, your scope is indirectly
+subscribed to `count` through the derivedStateOf's caching layer.
+
+### `snapshotFlow` — bridge to coroutines
+
+```kotlin
+LaunchedEffect(listState) {
+    snapshotFlow { listState.firstVisibleItemIndex }
+        .collect { analytics.logScroll(it) }
+}
+```
+
+`snapshotFlow` re-executes the lambda whenever any `State` read inside
+changes, then emits. This is the canonical bridge from Compose to Flow.
+
+---
+
+## What the Compose compiler does
+
+### Adding parameters
+
+Every `@Composable` function gets `$composer: Composer` and `$changed: Int`
+parameters appended:
+
+```kotlin
+// Your code
+@Composable fun Greeting(name: String) { Text("Hi $name") }
+
+// Transformed signature
+fun Greeting(name: String, $composer: Composer, $changed: Int) { ... }
+```
+
+### Stability parameter bits
+
+Each parameter contributes bits to `$changed` indicating whether it
+changed since last call and whether it's stable. The compiler generates
+early-exit code:
+
+```kotlin
+fun Greeting(name: String, $composer: Composer, $changed: Int) {
+    $composer.startRestartGroup(0x12345)
+
+    // If name didn't change and other params didn't either, skip
+    if ($composer.skipping && ($changed and 0b1) == 0) {
+        $composer.skipToGroupEnd()
+    } else {
+        // actual body
+        Text("Hi $name", ...)
+    }
+
+    $composer.endRestartGroup()?.updateScope { /* ... */ }
+}
+```
+
+### Group keys
+
+Each composable call gets a positional key derived from source-file + line:
+
+```kotlin
+Column {            // startReplaceableGroup(key = 0x7A8B9C)
+    Text("A")       // startReplaceableGroup(key = 0x8B9CAD)
+    Text("B")       // different line → different key
+}
+```
+
+This is the basis of positional memoization.
+
+### `remember` as compiler magic
+
+```kotlin
+val state = remember { mutableStateOf(0) }
+```
+
+Compiles to something like:
+
+```kotlin
+val state = $composer.cache(false) { mutableStateOf(0) }
+// cache() reads from the slot table; only runs the lambda the first time
+```
+
+The slot table cursor position determines which cached value you get.
+This is why `remember` inside an `if` branch resets when the condition
+changes — the cursor position changes, so a different slot is used.
+
+---
+
+## Why your composable has TWO bodies
+
+The compiler actually generates **three paths** through your composable:
+
+1. **Initial composition** — full execution, populates slot table.
+2. **Recomposition with changed inputs** — re-runs, updates slots.
+3. **Recomposition with same inputs** — skips via early-exit (skippable case).
+
+This is how the same source function serves all three scenarios without
+you writing any boilerplate.
+
+---
+
+## Debugging internals
+
+### Compose compiler metrics
+
+```kotlin
+// build-logic/convention/AndroidComposeConventionPlugin.kt
+tasks.withType<KotlinCompile>().configureEach {
+    compilerOptions {
+        if (project.findProperty("composeMetrics") == "true") {
+            val reportDir = project.layout.buildDirectory.dir("compose-reports").get().asFile.absolutePath
+            freeCompilerArgs.addAll(
+                "-P", "plugin:androidx.compose.compiler.plugins.kotlin:metricsDestination=$reportDir",
+                "-P", "plugin:androidx.compose.compiler.plugins.kotlin:reportsDestination=$reportDir"
+            )
+        }
+    }
+}
+```
+
+`./gradlew :app:assembleRelease -PcomposeMetrics=true` produces:
+
+- `-classes.txt` — every class with stability: `stable` / `unstable`
+- `-composables.txt` — every `@Composable` with `restartable skippable scheme(...)`
+- `-module.json` — aggregate counts
+
+An unstable class or non-skippable composable is a performance fix.
+
+### Layout Inspector — recomposition counts
+
+Android Studio → View → Tool Windows → Layout Inspector → enable
+**Recomposition counts**. Each composable shows **composition count** and
+**skip count**. Target: list items should show high skip counts — anything
+composing on every frame is wasted work.
+
+### `snapshotFlow { println(Snapshot.current) }` — see the snapshot ID
+
+```kotlin
+LaunchedEffect(Unit) {
+    snapshotFlow { Snapshot.current.id }
+        .collect { println("Snapshot $it") }
+}
+```
+
+Each state mutation advances the snapshot; this log traces every commit.
+
+---
+
+## Common misconceptions
+
+<ComparisonCard
+  left={{
+    label: 'Incorrect models',
+    title: 'Common misunderstandings',
+    variant: 'old',
+    points: [
+      '"Compose rebuilds the UI from scratch every frame"',
+      '"@Composable functions run on every frame"',
+      '"LazyColumn composes all items at once"',
+      '"remember is just like a static variable"',
+      '"Recomposition is the only cost"',
+      '"@Stable makes a class immutable"'
+    ]
+  }}
+  right={{
+    label: 'Correct models',
+    title: 'What really happens',
+    variant: 'new',
+    points: [
+      'Only invalidated scopes re-run; the rest is cached in the slot table',
+      'They run only when state they read changes',
+      'LazyColumn composes + retains only visible items + small buffer',
+      'remember is slot-table-indexed by call position',
+      'Layout and draw phases also have costs — graphicsLayer skips composition',
+      '@Stable is a promise the class reports mutations via State; it doesn\'t prevent mutation'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Compose internals">
+- Three phases: **composition → layout → draw**. Each can be invalidated independently.
+- The **slot table** indexes state by call-site position. `key { }` pins identity across conditionals.
+- **Restartable + skippable** composables skip recomposition when inputs are stable and equal.
+- **`@Immutable`** promises full immutability; **`@Stable`** promises state-tracked mutation.
+- **Strong skipping** (1.7+) skips on reference equality — stability still matters for `.copy()` flows.
+- **Snapshot system** tracks every State read and write; `snapshotFlow` bridges to Flow.
+- The **Compose compiler** rewrites your functions with `$composer`, `$changed`, and skip-to-group-end branches.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Inspect the compiler metrics', description: 'Enable composeMetrics=true, run assembleRelease, and find three unstable classes in your codebase. Fix them.' },
+  { title: 'Layout Inspector recomposition counts', description: 'Open a screen with a LazyColumn. Identify items with low skip counts. Investigate why and apply @Immutable / keys as needed.' },
+  { title: 'Slot table experiment', description: 'Put a TextField inside an if (showName) branch that flips. Observe that the TextField loses focus/text when the branch re-enters. Wrap in key { } and verify the fix.' },
+  { title: 'Stability contract violation', description: 'Create an @Immutable data class with a var property. Mutate it mid-composition. Observe that Compose doesn\'t recompose — because you violated the contract.' },
+  { title: 'Snapshot observer', description: 'Use snapshotFlow + Snapshot.current.id to log every snapshot commit in your app for 60s. Count commits; spot any runaway state churn.' }
+]} />
+
+## Further reading
+
+- [Under the hood of Jetpack Compose (Leland Richardson)](https://medium.com/androiddevelopers/under-the-hood-of-jetpack-compose-part-2-of-2-37b2c20c6cdd)
+- [Compose compiler internals (Google I/O)](https://www.youtube.com/@AndroidDevelopers)
+- `androidx.compose.runtime` source on [cs.android.com](https://cs.android.com/androidx/platform/frameworks/support/+/androidx-main:compose/runtime/)
+- Jetpack Compose Internals (book by Jorge Castillo)
+
+## Next
+
+You've now covered every corner of Jetpack Compose. Return to
+**[Module 03 Overview](./overview)** or continue to the next module:
+**[Module 04 — Architecture & Patterns](/docs/architecture-patterns/overview)**.

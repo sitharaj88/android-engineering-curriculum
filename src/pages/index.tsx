@@ -8,7 +8,7 @@ import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 const modules = [
   { num: 1, title: 'Kotlin Foundation', desc: 'Language, coroutines deep dive, advanced patterns — generics, DSLs, value classes, K2 compiler.', weeks: '3 Weeks', topics: '3 Chapters', link: '/docs/kotlin-foundation/overview' },
   { num: 2, title: 'Android Fundamentals', desc: 'Platform architecture, Activities, Intents, Fragments, ViewGroups, ConstraintLayout, resources.', weeks: '3 Weeks', topics: '3 Topics', link: '/docs/android-fundamentals/overview' },
-  { num: 3, title: 'Jetpack Compose', desc: 'Declarative UI, Material 3, state hoisting, performance with compiler metrics, custom layouts & gestures.', weeks: '4 Weeks', topics: '3 Chapters', link: '/docs/jetpack-compose/overview' },
+  { num: 3, title: 'Jetpack Compose', desc: 'The definitive Compose deep dive — state, theming, lists, navigation, animations, forms, testing, interop, modifiers, performance, internals.', weeks: '4 Weeks', topics: '13 Chapters', link: '/docs/jetpack-compose/overview' },
   { num: 4, title: 'Architecture & Patterns', desc: 'MVVM, MVI state machines, Clean Architecture, offline-first with outbox pattern, Hilt DI.', weeks: '3 Weeks', topics: '3 Chapters', link: '/docs/architecture-patterns/overview' },
   { num: 5, title: 'Data & Persistence', desc: 'DataStore, Room, migrations, Content Providers, encrypted storage, caching strategies.', weeks: '2 Weeks', topics: '2 Topics', link: '/docs/data-persistence/overview' },
   { num: 6, title: 'Networking & API', desc: 'REST, GraphQL with Apollo, WebSocket, gRPC, Server-Sent Events — the full modern networking stack.', weeks: '3 Weeks', topics: '2 Chapters', link: '/docs/networking-api/overview' },
