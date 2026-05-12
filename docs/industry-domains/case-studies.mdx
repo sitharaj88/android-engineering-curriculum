@@ -1,0 +1,696 @@
+---
+id: case-studies
+title: Real-World Case Studies
+sidebar_label: Case Studies
+description: Technical deep-dives on how Cash App, Tinder, Duolingo, Tally and others built notable parts of their Android apps.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Real-World Case Studies
+
+The best way to internalize patterns is to study **how shipped apps
+actually solve them.** This chapter walks through technical case studies
+from companies that have published their architectures via blog posts,
+conference talks, and open-source repos. Each follows the same
+structure: the problem, the approach, what worked, what didn't.
+
+<Callout kind="tip" title="Note on accuracy">
+These are based on public information (talks, blog posts, OSS repos)
+through 2024. Implementations evolve. Treat as inspiration for **why**
+they chose specific patterns, not exact blueprints.
+</Callout>
+
+---
+
+## Case study 1 — Cash App's KMP migration
+
+### The problem
+
+Cash App (Square) ships on Android, iOS, and web. By 2022, they had ~10
+years of duplicate business logic across platforms. Bug fixes required
+fixes in both Kotlin (Android) and Swift (iOS) — perpetual drift,
+double the QA cost.
+
+### The approach
+
+Phased migration to **Kotlin Multiplatform** for the shared layers:
+
+```text
+1. Started with the lowest-risk layer: networking + serialization
+2. Then state management (presenters + business logic)
+3. Then domain models
+4. Eventually: navigation
+```
+
+Used **Trio** (now Mosaic / Molecule from Cash App) — a presenter-based
+architecture where presenters are pure Kotlin functions, decoupled from
+UI framework.
+
+### Architecture
+
+```kotlin
+// Pure Kotlin in commonMain
+class PaymentPresenter @Inject constructor(
+    private val payments: PaymentsRepository
+) {
+    fun models(events: Flow<Event>): Flow<UiModel> = launchMolecule {
+        var amount by mutableStateOf("")
+        var recipient by mutableStateOf<Contact?>(null)
+        var error by mutableStateOf<Error?>(null)
+
+        LaunchedEffect(Unit) {
+            events.collect { event ->
+                when (event) {
+                    is Event.AmountChanged -> amount = event.value
+                    is Event.RecipientSelected -> recipient = event.contact
+                    Event.Send -> { /* ... */ }
+                }
+            }
+        }
+
+        UiModel.Ready(amount = amount, recipient = recipient, error = error)
+    }
+}
+```
+
+The presenter produces a `Flow<UiModel>`. Android collects it via
+`collectAsState`, iOS via SwiftUI's `ObservableObject` bridge.
+
+### What worked
+
+- **Shared business logic** ~70% of the codebase
+- **Bug fixes ship to both platforms** simultaneously
+- **Native UI layer** preserved (Compose on Android, SwiftUI on iOS)
+- **Hiring** Kotlin engineers serves both platforms
+
+### What didn't
+
+- iOS integration took longer than expected (Kotlin/Native debugging is harder)
+- KMP build configuration churn through 2021-2023
+- Some Kotlin-specific APIs (coroutines) needed Swift bridges
+
+### Takeaways
+
+- Migrate gradually; don't rewrite
+- Pure Kotlin presenters are platform-agnostic
+- Compose Multiplatform wasn't ready when they started; native UI was the right call
+
+See [KMP Deep Dive](/docs/advanced-trending/kmp-deep-dive) for the
+foundations.
+
+---
+
+## Case study 2 — Tinder's Compose migration
+
+### The problem
+
+Tinder's Android app had 6 years of accumulated View-based code:
+fragments, XML layouts, RxJava streams, dozens of custom view controls.
+Adding new features was painful; junior devs couldn't navigate the
+architecture.
+
+### The approach
+
+Module-by-module migration to Compose + coroutines/Flow:
+
+```text
+1. New screens: Compose from day one
+2. Existing screens: migrate during planned redesigns
+3. Convert custom Views to Composables as they're touched
+4. RxJava → coroutines wave by wave
+```
+
+They didn't enforce a deadline. Migration ran for ~2 years organically.
+
+### Patterns adopted
+
+- **Single-activity** architecture with Navigation Compose
+- **MVVM** with `StateFlow<UiState>` (replaced RxJava `Observable<UiState>`)
+- **Hilt** for DI (migrated from Dagger 2)
+- **Coil** for image loading (replaced Glide)
+- **Modularization** in parallel — feature modules introduced as
+  migrations completed
+
+### Compose patterns specific to dating apps
+
+```kotlin
+@Composable
+fun DiscoveryDeck(
+    profiles: List<Profile>,
+    onSwipe: (Profile, Direction) -> Unit
+) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        profiles.take(3).reversed().forEachIndexed { index, profile ->
+            ProfileCard(
+                profile = profile,
+                isTop = index == profiles.size - 1,
+                offsetFactor = profiles.size - 1 - index,
+                onSwipe = { direction -> onSwipe(profile, direction) }
+            )
+        }
+    }
+}
+
+@Composable
+fun ProfileCard(
+    profile: Profile,
+    isTop: Boolean,
+    offsetFactor: Int,
+    onSwipe: (Direction) -> Unit
+) {
+    val offsetX = remember { Animatable(0f) }
+    val rotation by derivedStateOf { offsetX.value / 50f }
+
+    Card(
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer {
+                translationX = offsetX.value
+                rotationZ = rotation
+                scaleX = 1f - (offsetFactor * 0.05f)
+                scaleY = 1f - (offsetFactor * 0.05f)
+            }
+            .pointerInput(profile) {
+                detectDragGestures(
+                    onDragEnd = {
+                        when {
+                            offsetX.value > 300 -> onSwipe(Direction.RIGHT)
+                            offsetX.value < -300 -> onSwipe(Direction.LEFT)
+                            else -> launch { offsetX.animateTo(0f) }
+                        }
+                    },
+                    onDrag = { _, drag -> launch { offsetX.snapTo(offsetX.value + drag.x) } }
+                )
+            }
+    ) { /* content */ }
+}
+```
+
+### What worked
+
+- Compose ergonomics — feature velocity went up after the initial dip
+- Animation code shrank ~80%
+- New engineers productive in days, not weeks
+- Recomposition tooling caught performance regressions early
+
+### What didn't
+
+- Initial Compose maturity issues (1.0 → 1.4) caused some rework
+- Coexistence with RxJava streams was awkward during migration
+- Some advanced View features (custom render passes) took deep Compose
+  knowledge to replicate
+
+### Takeaways
+
+- Migration via opportunity (during redesign), not big-bang
+- Compose drag/swipe is dramatically simpler than View-based equivalents
+- Hilt + Compose + Flow is a synergistic stack
+
+See [Compose Performance](/docs/jetpack-compose/performance) for the
+compositional patterns.
+
+---
+
+## Case study 3 — Duolingo's offline-first
+
+### The problem
+
+Duolingo's users are global; many in markets with unreliable internet
+(India, Brazil, Indonesia). Lessons need to work offline, sync progress
+when online, sync streaks across devices.
+
+### The approach
+
+**Local-first** architecture: every lesson lives in Room; sync is
+opportunistic. Users complete lessons offline; progress syncs in the
+background.
+
+### Sync architecture
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│  UI                                                         │
+│    Always observes Room (single source of truth)            │
+├────────────────────────────────────────────────────────────┤
+│  LessonRepository (offline-first)                           │
+│    - Lessons cached in Room                                 │
+│    - Progress updates write locally first                   │
+│    - Outbox queue for backend sync                          │
+├────────────────────────────────────────────────────────────┤
+│  Sync Worker (WorkManager)                                  │
+│    - Drains outbox when connectivity returns                │
+│    - Handles conflicts via server-side merge                │
+│    - Skips work on metered networks                         │
+├────────────────────────────────────────────────────────────┤
+│  Lesson Downloader (WorkManager + Wi-Fi only)               │
+│    - Predictive download: next 2 lessons in current course  │
+│    - Aggressive cache cleanup for storage-constrained users │
+└────────────────────────────────────────────────────────────┘
+```
+
+### Predictive download
+
+Users typically complete sequential lessons. Duolingo pre-downloads the
+next 2-3 lessons whenever you complete one:
+
+```kotlin
+class LessonPrefetcher @Inject constructor(
+    private val workManager: WorkManager,
+    private val courseRepo: CourseRepository
+) {
+    fun prefetchAfter(completedLessonId: String) {
+        val nextIds = courseRepo.nextLessonIds(completedLessonId, count = 3)
+
+        nextIds.forEach { id ->
+            val request = OneTimeWorkRequestBuilder<LessonDownloadWorker>()
+                .setInputData(workDataOf("lesson_id" to id))
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.UNMETERED)
+                        .setRequiresStorageNotLow(true)
+                        .build()
+                )
+                .build()
+
+            workManager.enqueueUniqueWork(
+                "prefetch_$id",
+                ExistingWorkPolicy.KEEP,
+                request
+            )
+        }
+    }
+}
+```
+
+User completes Lesson 5 on Wi-Fi → Lessons 6, 7, 8 download in the
+background. By the time they're on the subway with no signal, Lessons 6
+and 7 are ready.
+
+### What worked
+
+- Lesson completion rate up significantly in low-connectivity markets
+- Users tolerate slow downloads (background, expected)
+- Conflict resolution rare — most users use one device at a time
+
+### What didn't
+
+- Predictive download chooses wrong lessons sometimes (course branching)
+- Storage management for power users (200+ lessons cached) needed
+  cleanup logic
+- Battery drain monitored carefully; background downloads constrained
+
+### Takeaways
+
+- Offline-first isn't just for emergencies — it's the right default for
+  global users
+- WorkManager + constraints + outbox is the dominant pattern
+- Predictive prefetching during foreground use is invisible to users
+
+See [Offline-First Architecture](/docs/architecture-patterns/offline-first).
+
+---
+
+## Case study 4 — Reddit's video pipeline
+
+### The problem
+
+Reddit users upload tens of millions of videos. Each needs:
+- Transcoding to multiple resolutions (HLS adaptive)
+- Generated thumbnails
+- Closed captions (Whisper / Vosk)
+- Content moderation (NSFW + safety classifiers)
+- Storage tiering (hot → warm → cold)
+
+Originally on phone via foreground service → user complaints about
+battery + storage + time.
+
+### The approach
+
+**Hybrid client + cloud transcode**:
+
+```text
+1. User picks video (Photo Picker)
+2. Client checks size + resolution
+   - Short + low-res → transcode on device
+   - Long + high-res → upload original; cloud transcodes
+3. Background upload via WorkManager + resumable upload protocol
+4. Client receives push when transcoded video is live
+```
+
+### Resumable upload
+
+```kotlin
+class ResumableUpload @Inject constructor(
+    private val api: UploadApi,
+    private val chunkSize: Int = 5 * 1024 * 1024     // 5 MB
+) {
+    suspend fun upload(file: File, onProgress: (Long, Long) -> Unit): Outcome<Uri, UploadError> {
+        // 1. Initiate
+        val session = api.initiateUpload(file.length(), file.name)
+
+        // 2. Resume from server's last byte
+        var uploaded = session.uploaded
+
+        while (uploaded < file.length()) {
+            val chunk = readChunk(file, uploaded, chunkSize)
+            val nextOffset = api.uploadChunk(session.id, uploaded, chunk)
+            uploaded = nextOffset
+            onProgress(uploaded, file.length())
+        }
+
+        // 3. Finalize
+        return Outcome.Ok(api.finalize(session.id).uri)
+    }
+}
+```
+
+If the network drops at 80%, the upload resumes from 80% on next
+connection. Critical for 200MB videos on 3G.
+
+### What worked
+
+- Upload success rate jumped significantly
+- Battery impact dropped (cloud transcode for the hard cases)
+- New codecs (AV1) deployed centrally without client updates
+
+### What didn't
+
+- Photo Picker on Android 10 / 11 was limited; required fallbacks
+- Resumable protocol on flaky carriers took multiple iterations to
+  stabilize
+
+### Takeaways
+
+- For heavy media: client uploads, cloud processes
+- Resumable upload protocols are non-negotiable for large files
+- WorkManager + foreground service for upload tasks (visible progress)
+
+See [WorkManager Deep Dive](/docs/advanced-components/workmanager).
+
+---
+
+## Case study 5 — Spotify's app modularization
+
+### The problem
+
+Spotify Android in 2017: one app module, 4 minute incremental builds,
+20+ teams stepping on each other's PRs. By 2019, build times threatening
+team productivity.
+
+### The approach
+
+Modularization to 100+ feature modules over 18 months:
+
+```text
+:app
+├── :feature:home
+├── :feature:search
+├── :feature:player
+├── :feature:library
+├── :feature:podcast
+├── ... ~80 feature modules
+:core
+├── :core:design
+├── :core:ui
+├── :core:network
+├── :core:data
+├── :core:domain
+├── :core:player        <-- shared audio engine
+├── :core:auth
+:test
+├── :test:fixtures
+├── :test:fakes
+:build-logic
+└── :convention plugins
+```
+
+Each feature module < 5,000 LOC. Build time per module < 5s incremental.
+
+### Konsist for enforcement
+
+Boundaries enforced via Konsist tests:
+
+```kotlin
+@Test fun `features never import other features`() {
+    Konsist.scopeFromProject()
+        .files
+        .filter { it.moduleName.startsWith("feature.") }
+        .assertFalse { file ->
+            file.imports.any { imp ->
+                imp.name.contains(".feature.") &&
+                imp.name.substringAfter(".feature.").substringBefore(".") != file.moduleName.substringAfter("feature.")
+            }
+        }
+}
+```
+
+PRs that violate fail CI immediately.
+
+### What worked
+
+- Incremental build time: 4 min → 30s
+- PR review scope: clearer (touches one module)
+- Team autonomy: teams own their modules
+- Parallel CI: jobs run module-by-module
+
+### What didn't
+
+- 18-month migration was painful (ongoing feature work +
+  modularization debt)
+- Some shared state required careful re-modeling
+- Onboarding new engineers requires understanding module graph
+
+### Takeaways
+
+- Modularization pays off when build times start hurting
+- Enforce boundaries with Konsist; don't rely on convention
+- Convention plugins (Module 14) keep all modules consistent
+- Tooling investment is essential
+
+See [Modularization at Scale](/docs/modularization/overview) and
+[Konsist & Dynamic Features](/docs/modularization/konsist-dynamic-features).
+
+---
+
+## Case study 6 — Tally's offline-first finance
+
+### The problem
+
+Tally (debt management) handles users' bank credentials, balances, and
+payment instructions. Service must work even when banks rate-limit or
+their API has issues.
+
+### The approach
+
+**Local model** of every user's accounts:
+
+```text
+1. Plaid sync → Room (authoritative local cache)
+2. UI reads from Room (instant)
+3. Background sync every N hours
+4. On schedule + relevant events: refresh affected accounts
+```
+
+### Tiered caching
+
+```kotlin
+class AccountRepository @Inject constructor(
+    private val plaidApi: PlaidApi,
+    private val dao: AccountDao,
+    private val workManager: WorkManager
+) {
+    fun observe(accountId: String): Flow<Account> = dao.observe(accountId)
+        .onStart { ensureFreshness(accountId) }
+
+    private suspend fun ensureFreshness(accountId: String) {
+        val account = dao.get(accountId)
+        val staleness = System.currentTimeMillis() - (account?.fetchedAt ?: 0)
+
+        when {
+            staleness < 30_000 -> { /* fresh — skip */ }
+            staleness < 3600_000 -> refreshInBackground(accountId)   // < 1h: background refresh
+            else -> refreshNow(accountId)                             // > 1h: blocking refresh
+        }
+    }
+}
+```
+
+Users always see something (cached). Background refresh runs when stale.
+
+### Idempotency for payments
+
+Critical for fintech — Plaid + Tally's own payment engine all use
+idempotency keys:
+
+```kotlin
+class PaymentService {
+    suspend fun schedulePayment(payment: PaymentRequest): Outcome<PaymentId, PaymentError> {
+        // Client-generated UUID
+        val idempotencyKey = UUID.randomUUID().toString()
+        // Stored in pending state in Room
+        ledger.insert(LedgerEntry(idempotencyKey, payment, status = PENDING))
+        // Retry-safe — server dedupes by idempotency key
+        return apiCall { api.schedulePayment(payment, idempotencyKey) }
+            .onSuccess { id -> ledger.update(idempotencyKey, status = COMPLETED, serverId = id) }
+            .onFailure { err -> ledger.update(idempotencyKey, status = FAILED, error = err) }
+    }
+}
+```
+
+### What worked
+
+- Service availability during Plaid outages (cached data still works)
+- User trust — instant responses build confidence
+- Audit log via the ledger entries
+
+### What didn't
+
+- Bank webhook reliability varied; required reconciliation jobs
+- Some banks block frequent polling — adaptive backoff per institution
+
+### Takeaways
+
+- Fintech apps are offline-first by necessity (network reliability)
+- Idempotency keys are non-negotiable
+- Ledger pattern provides audit + retry safety
+
+See [Fintech Patterns](./fintech) and [Offline-First Architecture](/docs/architecture-patterns/offline-first).
+
+---
+
+## Case study 7 — Notion's collaborative editor
+
+### The problem
+
+Notion's mobile editor needs real-time collaboration. Multiple users
+editing the same document; offline editing + conflict resolution.
+
+### The approach
+
+**Operational Transform (OT)** with a CRDT-like protocol:
+
+```text
+1. Each document is a tree of blocks
+2. Each user has a local copy
+3. Every edit produces an "operation" (insert block, update text)
+4. Operations have logical timestamps + author
+5. Server reconciles concurrent operations; broadcasts to other clients
+6. Clients apply incoming operations to converge state
+```
+
+### Local-first editing
+
+```kotlin
+class DocumentEditor @Inject constructor(
+    private val docDao: DocumentDao,
+    private val webSocket: SyncSocket
+) {
+    fun editText(blockId: String, range: IntRange, newText: String) {
+        val op = Operation.UpdateText(
+            blockId = blockId,
+            range = range,
+            text = newText,
+            timestamp = LamportClock.now(),
+            author = currentUser.id
+        )
+
+        // 1. Apply locally
+        docDao.applyOperation(op)
+
+        // 2. Queue for broadcast
+        webSocket.queue(op)
+    }
+}
+```
+
+Edits are instant (local). Sync happens in the background. Other users'
+edits arrive as operations and merge cleanly.
+
+### Conflict resolution
+
+When two users edit the same paragraph simultaneously:
+- **Same field, different timestamps** → later wins
+- **Insertions** → both kept, ordered by timestamp
+- **Concurrent deletes** → one deletes; the other becomes a no-op
+- **Hard conflicts** (delete + edit) → user prompted
+
+### What worked
+
+- Sub-second edit latency feels native
+- Offline editing for hours works (changes sync on reconnect)
+- Server-side reconciliation centralizes complex logic
+
+### What didn't
+
+- Large documents (1000+ blocks) had memory pressure
+- Permissions checks layered on top of OT operations were tricky
+- Some edits felt "out of order" when sync was slow
+
+### Takeaways
+
+- CRDTs / OT shine for collaborative editing
+- Server-side reconciliation simpler than peer-to-peer for typical apps
+- WebSocket + WorkManager fallback for resilience
+
+See [GraphQL, WebSocket & gRPC](/docs/networking-api/graphql-websocket-grpc).
+
+---
+
+## Common patterns across cases
+
+| Pattern | Cash App | Tinder | Duolingo | Reddit | Spotify | Tally | Notion |
+|---------|----------|--------|----------|--------|---------|-------|--------|
+| Offline-first | ✓ | | ✓ | | | ✓ | ✓ |
+| Optimistic UI | ✓ | ✓ | ✓ | | | ✓ | ✓ |
+| WorkManager + outbox | | | ✓ | ✓ | | ✓ | ✓ |
+| State machine (FSM) | ✓ | ✓ | | | | ✓ | |
+| Real-time push | | | | ✓ | | | ✓ |
+| Idempotency keys | ✓ | | | ✓ | | ✓ | ✓ |
+| Modularization | ✓ | ✓ | | | ✓ | | |
+| KMP / multiplatform | ✓ | | | | | | |
+| Compose | ✓ | ✓ | ✓ | | ✓ | ✓ | |
+| Hilt | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | |
+
+Patterns repeat. Get them right; apply with discipline.
+
+---
+
+## How to read more case studies
+
+- **Engineering blogs**: Cash App, Spotify, Duolingo, Pinterest, Lyft, Reddit, Tinder, GoDaddy, Adobe
+- **Conference talks**: Droidcon, Mobius, KotlinConf, Google I/O sessions
+- **OSS projects**: Square's apps (often open-source patterns), Tinder's `StateMachine`, JetBrains' Toolbox
+- **Tech podcasts**: Android Backstage, Talking Kotlin, Fragmented
+
+Spend time understanding **why** decisions were made. The patterns
+themselves are universal; the reasoning is what transfers.
+
+---
+
+## Common case-study takeaways
+
+<Callout kind="success" title="Themes across real-world apps">
+- **Offline-first** is the default for any user-base spanning unreliable networks.
+- **Modularization** is worth it when build times start hurting (~5+ min incremental).
+- **Migrations are gradual** — feature-by-feature, not big-bang.
+- **Idempotency** is non-negotiable for money / state-changing operations.
+- **WorkManager + outbox** for background sync; **WebSocket** for real-time.
+- **Konsist / architectural tests** prevent regression as teams grow.
+- **State machines** model complex flows (checkout, game, payment) cleanly.
+- **Pre-fetching during foreground** is invisible UX magic.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Pick one case study, apply locally', description: 'Take one pattern from the chapter (e.g., Duolingo\'s prefetch). Implement in a small sample app. Measure user-facing behavior.' },
+  { title: 'Read three engineering blogs', description: 'Cash App, Spotify, Lyft each have rich blogs. Read 3 Android-related posts. Identify shared patterns.' },
+  { title: 'Conference talk study', description: 'Watch one Droidcon / KotlinConf talk per week for a month. Take notes on architectures + tooling.' },
+  { title: 'Write your own case study', description: 'Pick one app you\'ve worked on. Write a 1-page case study using the same structure: problem, approach, patterns, what worked, what didn\'t, takeaways.' }
+]} />
+
+## Next
+
+Return to **[Industry Domains overview](/docs/industry-domains)** or
+continue to **[Developer Productivity](/docs/developer-productivity)**.

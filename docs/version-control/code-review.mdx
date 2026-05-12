@@ -1,0 +1,567 @@
+---
+id: code-review
+title: Code Review & Conventional Commits
+sidebar_label: Code Review
+description: PR best practices, code review etiquette, Conventional Commits, automated changelog generation, and the workflow that scales from solo to 50+ engineers.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Code Review & Conventional Commits
+
+Code review is the single highest-leverage practice in a healthy
+engineering org — it catches bugs, propagates knowledge, and shapes
+culture. Done well, reviews take 15-30 minutes and ship better code.
+Done poorly, they become bottlenecks. This chapter covers the workflow.
+
+## The PR lifecycle
+
+```text
+1. Author drafts PR
+2. CI runs (lint, test, build, security scan)
+3. Reviewers approve / request changes
+4. Author addresses feedback
+5. Reviewers re-approve
+6. Merge (squash) into main
+7. CI deploys (if applicable)
+```
+
+Target: from draft → merge in **< 24 hours** for routine PRs, < 2 hours
+for hotfixes. Longer cycles indicate process problems.
+
+---
+
+## Writing PRs
+
+### Keep PRs small
+
+Target: **< 400 lines changed**. Big PRs:
+- Take longer to review (reviewer fatigue)
+- Catch fewer bugs (eyes glaze over)
+- Are harder to revert
+- Block other work
+
+If your change is 1000+ lines, split:
+- Refactor first (no behavior change)
+- New scaffolding second (no integration)
+- Feature integration third
+- Tests + polish fourth
+
+Each PR independently reviewable; each independently revertable.
+
+### PR title — concise + categorized
+
+```text
+feat(checkout): support Apple Pay
+fix(home): prevent crash on empty cart
+refactor(domain): extract OrderRepository
+chore: bump Kotlin to 2.1.0
+docs: update README installation steps
+test(payments): cover declined-card flow
+```
+
+The `type(scope):` prefix is **Conventional Commits** — covered below.
+Scannable in a long PR list.
+
+### PR description template
+
+```markdown
+## What
+
+One sentence: what changed.
+
+## Why
+
+Two sentences: why this change is needed, what problem it solves.
+
+## How
+
+Short bullet list of the technical approach.
+
+## Testing
+
+- [ ] Tested on Pixel 7 (API 34)
+- [ ] Tested at fontScale 2.0
+- [ ] Manual flow: checkout with saved card → success
+- [ ] All unit tests pass
+- [ ] Macrobenchmark unchanged
+
+## Screenshots / Recording
+
+(Required for UI changes)
+
+## Risk
+
+- [ ] Low — small, isolated, well-tested
+- [ ] Medium — touches core path
+- [ ] High — schema migration, behind feature flag
+
+## Rollout
+
+How this ships: behind flag X, % rollout, etc.
+```
+
+Save as `.github/PULL_REQUEST_TEMPLATE.md`. Every new PR uses it.
+
+### Self-review first
+
+Before requesting review:
+1. Re-read your own diff line by line
+2. Run the app on a device
+3. Verify CI is green
+4. Add comments explaining non-obvious decisions
+5. Check for committed secrets / debug code
+
+The author catches more bugs in self-review than any reviewer.
+
+---
+
+## Reviewing PRs
+
+### What reviewers look for
+
+| Layer                    | Questions to ask                                    |
+|--------------------------|-----------------------------------------------------|
+| **Correctness**          | Does it do what the PR says? Edge cases?           |
+| **Architecture**         | Does it fit the codebase's patterns?               |
+| **Testing**              | Are tests adequate? Will they catch regressions?  |
+| **Performance**          | Allocation, threading, memory, network?            |
+| **Security**             | Input validation, auth, PII handling?              |
+| **A11y / i18n**          | TalkBack, RTL, font scale considered?              |
+| **Readability**          | Will someone unfamiliar understand it in 6 months? |
+| **Documentation**        | API changes documented? Public APIs commented?    |
+
+### Comment levels
+
+Adopt prefixes so authors know how to respond:
+
+- **nit:** minor / stylistic; author can ignore
+- **suggestion:** improvement; author should consider
+- **question:** seeking understanding
+- **issue:** must address before merge
+- **blocker:** critical; will request changes
+
+```text
+nit: Could rename `tmp` to `decodedBitmap` for clarity.
+
+suggestion: Consider extracting this 30-line lambda into a private function.
+
+question: Why use Mutex here instead of MutableStateFlow.update?
+
+issue: This Toast is shown without checking if the activity is finishing — may crash.
+
+blocker: This drops the user's session token to logs in production.
+```
+
+### Reviewing approach
+
+1. **First pass — high level**: scan the description, file list, big-
+   picture architecture. 5 minutes.
+2. **Second pass — details**: read every line. Inspect tests in
+   particular.
+3. **Third pass — run it**: pull the branch, run the app, exercise the
+   change.
+
+A 15-minute review on a 200-line PR is appropriate. 30+ minutes on
+larger PRs.
+
+### Tone
+
+> "Why did you choose X over Y? I would have expected Y because..."
+
+Not:
+
+> "This is wrong."
+
+Code review is **about the code, not the person**. Specific, curious,
+non-judgmental.
+
+When you disagree, propose alternatives. When you're unsure, ask. When
+you're certain something's a problem, say so clearly with the reason.
+
+---
+
+## Approvals and merging
+
+### Minimum 1 approval
+
+For most teams, 1 approval is enough. For critical paths (security,
+payments, build config), require 2 approvals via CODEOWNERS:
+
+```text
+/core/security/  @security-team-lead @platform-team-lead
+/feature/payments/  @payments-team @platform-team
+```
+
+Both teams must approve.
+
+### Author shouldn't approve own PR
+
+Even if technically possible, don't. The whole point of review is a
+second pair of eyes.
+
+### Resolve before merge
+
+All comment threads must be resolved (either with a "done" reply, a
+code change, or explicit "won't fix because..."). Unresolved threads
+indicate undiscussed disagreements.
+
+---
+
+## Conventional Commits
+
+```text
+<type>[optional scope]: <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+### Types
+
+| Type        | When                                                  |
+|-------------|-------------------------------------------------------|
+| `feat`      | New user-facing feature                              |
+| `fix`       | Bug fix                                               |
+| `docs`      | Documentation only                                    |
+| `refactor`  | Code change, no behavior change                       |
+| `perf`      | Performance improvement                               |
+| `test`      | Adding / fixing tests                                 |
+| `build`     | Build system / dependency updates                     |
+| `ci`        | CI configuration                                      |
+| `chore`     | Routine maintenance (version bumps, repo hygiene)    |
+| `style`     | Formatting only (rare with Spotless)                 |
+| `revert`    | Reverting a previous commit                           |
+
+### Breaking changes
+
+```text
+feat(api): rename UserService.fetch to UserService.find
+
+BREAKING CHANGE: callers must rename .fetch() to .find()
+```
+
+The `BREAKING CHANGE:` footer or a `!` after type (`feat!`) signals
+major version bump.
+
+### Scope
+
+The component being changed. For Android: feature names, modules,
+layers:
+
+```text
+feat(checkout): ...
+fix(home-screen): ...
+refactor(network): ...
+build(gradle): bump AGP to 8.7
+```
+
+Use consistently. Helps automated changelog tools group entries.
+
+---
+
+## Automated changelog
+
+With Conventional Commits, you can auto-generate `CHANGELOG.md`:
+
+```kotlin
+// build.gradle.kts (root)
+plugins {
+    id("io.github.gradle-nexus.publish-plugin")
+    id("com.gradleup.gr8") version "0.10"
+}
+
+// Or use a standalone tool
+```
+
+**`git-cliff`** is the recommended tool:
+
+```bash
+brew install git-cliff
+git-cliff --tag v2.5.0 -o CHANGELOG.md
+```
+
+```toml
+# cliff.toml
+[changelog]
+header = "# Changelog"
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+## {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }} ({{ commit.id | truncate(length=7, end="") }})
+{% endfor %}
+{% endfor %}
+"""
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+commit_parsers = [
+    { message = "^feat", group = "Features" },
+    { message = "^fix", group = "Bug Fixes" },
+    { message = "^perf", group = "Performance" },
+    { message = "^refactor", group = "Refactor" },
+    { message = "^docs", group = "Documentation" },
+    { message = "^test", group = "Tests" },
+    { message = "^chore", skip = true },
+    { message = "^ci", skip = true },
+]
+```
+
+Run in CI on release:
+
+```yaml
+- name: Generate changelog
+  run: git-cliff --tag ${{ github.ref_name }} -o CHANGELOG.md
+
+- name: Commit changelog
+  uses: stefanzweifel/git-auto-commit-action@v5
+  with:
+    commit_message: "docs: update changelog for ${{ github.ref_name }}"
+```
+
+Tag → CHANGELOG updated automatically. Release notes in Play Store
+written from it.
+
+---
+
+## ADRs — Architecture Decision Records
+
+For non-trivial architecture choices, write an ADR:
+
+```markdown
+# 0042 — Use Hilt instead of Koin for DI
+
+## Status
+Accepted
+
+## Date
+2025-03-15
+
+## Context
+
+We need a DI library. The team has experience with both Hilt and Koin.
+The codebase is large (50+ modules) and uses KSP for annotation
+processing.
+
+## Decision
+
+Use Hilt.
+
+## Consequences
+
+### Positive
+- Compile-time verification of the DI graph
+- Standard Android integration
+- KSP support (fast builds)
+- Aligned with Google's recommended stack
+
+### Negative
+- Slightly heavier build than Koin
+- Harder learning curve for new Kotlin devs
+- Required Hilt-specific test setup
+```
+
+Save in `/docs/adr/0042-use-hilt.md`. Numbered sequentially. Never edit
+old ADRs — supersede with a new one if the decision changes.
+
+ADRs preserve **why** decisions were made. Six months later when
+someone asks "why Hilt?", you point them to the ADR.
+
+---
+
+## Pre-commit hooks
+
+Block bad commits before they reach the remote:
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+
+  - repo: local
+    hooks:
+      - id: ktlint
+        name: ktlint
+        entry: ./gradlew spotlessCheck
+        language: system
+        types: [kotlin]
+```
+
+```bash
+brew install pre-commit
+pre-commit install
+```
+
+Now `git commit` runs the hooks. Bad commits are blocked before they
+become PRs.
+
+---
+
+## Quality gates in CI
+
+Block PRs from merging if any of these fail:
+
+```yaml
+# .github/workflows/pr-checks.yml
+jobs:
+  pr:
+    steps:
+      - uses: actions/checkout@v4
+
+      # PR title format
+      - uses: amannn/action-semantic-pull-request@v5
+        with:
+          types: |
+            feat
+            fix
+            docs
+            refactor
+            test
+            chore
+
+      # PR size check
+      - uses: codelytv/pr-size-labeler@v1
+        with:
+          xs_max_size: 100
+          s_max_size: 250
+          m_max_size: 500
+          l_max_size: 1000
+          fail_if_xl: true
+
+      # Standard checks
+      - run: ./gradlew spotlessCheck detekt lint test
+```
+
+PR title must follow Conventional Commits; size must be reasonable;
+all quality gates pass. Else, merge blocked.
+
+---
+
+## Review SLA
+
+Set team norms:
+- **First review** within 4 working hours
+- **Re-review** within 2 hours after author addresses feedback
+- **Merge** within 24 hours of approval
+
+Without an SLA, PRs sit in limbo. Set it; track it; discuss in retro
+if missed.
+
+### Designated reviewers
+
+For large teams, rotate "PR shepherd" — one person per day per team
+prioritizes review over their own feature work. Average review latency
+drops dramatically.
+
+---
+
+## Pair programming as live review
+
+For complex features, pair-program from the start. Two engineers, one
+keyboard, swap every 15-30 min. The "PR" becomes a knowledge-transfer
+session afterwards — fewer review surprises.
+
+Works well for:
+- Onboarding juniors
+- Cross-team integrations
+- Tricky algorithms
+- Sensitive paths (auth, payments)
+
+Doesn't replace formal review — but reduces PR-time questions to zero.
+
+---
+
+## Mentorship through review
+
+Reviews are how juniors learn. Tips:
+- Explain **why**, not just what
+- Link to references (docs, codebase examples, blog posts)
+- Praise good patterns (positive feedback is powerful)
+- Pair-program if a review will require many rounds
+
+```text
+nit: We typically use viewModelScope.launch here rather than CoroutineScope —
+see [Coroutines Deep Dive](/docs/kotlin-foundation/coroutines-deep-dive) for why.
+Want to pair on it tomorrow?
+```
+
+Junior dev learns + feels valued. Future PRs from them follow the
+pattern.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Review anti-patterns',
+    title: 'What hurts',
+    variant: 'old',
+    points: [
+      'PRs > 1000 lines',
+      'Snippy comments ("this is wrong")',
+      'Reviewers nit-picking style (Spotless\'s job)',
+      'Authors merging without approval',
+      'Review SLA in days, not hours',
+      'No PR template — descriptions are 1 word'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Healthy reviews',
+    variant: 'new',
+    points: [
+      'PRs < 400 lines; split bigger ones',
+      'Curious, specific, alternative-suggesting',
+      'Style enforced by tooling; review focuses on logic',
+      'Branch protection requires N approvals',
+      'First review < 4h, merge < 24h',
+      'Template with What/Why/How/Testing/Risk'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Code review rules">
+- **PR size < 400 lines**; split bigger changes.
+- **PR template** with What / Why / How / Testing / Risk.
+- **Conventional Commits** drive automated changelogs.
+- **CODEOWNERS** for critical paths; 2-approval requirement for security / payments / build config.
+- **Comment prefixes** (nit, suggestion, question, issue, blocker) clarify intent.
+- **Pre-commit hooks** block secrets, format issues, large files.
+- **ADRs** preserve why decisions were made.
+- **Review SLA** (first review < 4h, merge < 24h).
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Add a PR template', description: 'Create .github/PULL_REQUEST_TEMPLATE.md with What/Why/How/Testing/Risk sections. Open a PR and confirm it loads.' },
+  { title: 'Conventional commits enforcement', description: 'Add the amannn/action-semantic-pull-request workflow. Try to open a PR with title "wip" — verify it fails.' },
+  { title: 'Generate a changelog', description: 'Install git-cliff. Tag your repo v0.1.0. Run git-cliff to generate CHANGELOG.md. Verify all commits since the last tag appear, grouped by type.' },
+  { title: 'Write an ADR', description: 'Pick a recent architectural decision. Write a docs/adr/NNNN-title.md following the template. Get team review.' },
+  { title: 'CODEOWNERS', description: 'Define ownership for build-logic/, core/security/, and feature/payments/. Verify required reviewers auto-assign on PRs touching those paths.' }
+]} />
+
+## Next
+
+Return to **[Module 13 Overview](./overview)**.

@@ -1,0 +1,55 @@
+---
+id: overview
+title: Industry-Specific Patterns
+sidebar_label: Overview
+description: Architecture patterns, compliance, and design considerations specific to fintech, healthcare, e-commerce, gaming, and other verticals.
+slug: /industry-domains
+---
+
+import { Callout, FeatureGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Section:</strong> Industry-Specific Patterns</span>
+  <span><strong>Topics:</strong> 3 chapters</span>
+  <span><strong>Prerequisites:</strong> Architecture, Security modules</span>
+</div>
+
+# Industry-Specific Patterns
+
+Generic Android best practices apply everywhere. **Industry-specific
+patterns** apply only when you're building a fintech / healthcare / e-
+commerce / gaming app — and they're load-bearing for those verticals.
+This section covers the architecture, compliance, and design
+considerations that separate a generic shopping app from a payment-
+processing app subject to PCI DSS, or a health app subject to HIPAA.
+
+<FeatureGrid columns={3} features={[
+  { icon: '💳', title: 'Fintech', description: 'Payment processing, PCI DSS, fraud detection, multi-factor auth, transaction integrity, regulatory reporting.' },
+  { icon: '🏥', title: 'Healthcare', description: 'HIPAA compliance, Health Connect, EHR integration, telemedicine, patient privacy, FDA considerations.' },
+  { icon: '🛒', title: 'E-commerce & Gaming', description: 'Cart abandonment, search, recommendations, real-time game state, anti-cheat, virtual goods, leaderboards.' }
+]} />
+
+## Why industry knowledge matters
+
+A shopping app that takes credit cards is **subject to PCI DSS** — even
+if you use Stripe. A fitness app that stores heart rate is **subject to
+HIPAA** in the US if marketed to clinicians. A game with in-app purchases
+crosses **virtual-currency regulations** in some jurisdictions.
+
+Engineers who understand these constraints command higher salaries —
+you're not just an Android dev, you're a fintech / health / gaming
+engineer. And the patterns transfer: once you've worked through PCI,
+the patterns for GDPR / HIPAA / SOC 2 feel familiar.
+
+## How to read this section
+
+Don't try to absorb all three. Pick the vertical that matches your work
+or interview goals. Each chapter is **independent** — you don't need
+the others.
+
+## Chapters
+
+- **[Fintech Patterns](/docs/industry-domains/fintech)** — PCI DSS, payment SDK integration, fraud detection, transaction integrity, regulatory compliance
+- **[Healthcare Patterns](/docs/industry-domains/healthcare)** — HIPAA, Health Connect, EHR/FHIR, telemedicine, patient privacy, BAAs
+- **[E-Commerce & Gaming Patterns](/docs/industry-domains/ecommerce-gaming)** — cart, search, recommendations, real-time multiplayer, anti-cheat, in-app purchases
+- **[Real-World Case Studies](/docs/industry-domains/case-studies)** — technical deep-dives on Cash App, Tinder, Duolingo, Reddit, Spotify, Tally, and Notion

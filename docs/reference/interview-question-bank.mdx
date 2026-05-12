@@ -1,0 +1,248 @@
+---
+id: interview-question-bank
+title: Interview Question Bank
+sidebar_label: Question Bank
+description: 100+ Android interview questions across Kotlin, Compose, architecture, networking, performance, system design, and behavioral rounds.
+---
+
+import { Callout } from '@site/src/components/Doc';
+
+# Interview Question Bank
+
+100+ questions Android engineers actually face at L4–L6 interviews,
+grouped by category. Treat as drill material — for each, prepare a
+30-second answer + a 2-minute deep dive.
+
+<Callout kind="tip" title="How to use this">
+Don't memorize answers. Practice **explaining the underlying concept**
+in your own words. Use a peer or rubber duck. If you can't explain
+something simply, you don't understand it yet — go re-read the relevant
+chapter.
+</Callout>
+
+---
+
+## Kotlin (20 questions)
+
+### Language fundamentals
+
+1. **`val` vs `var` vs `const val` — when to use each?**
+2. **What is null safety and how does the type system enforce it?**
+3. **Explain the difference between `?:`, `?.`, and `!!`.**
+4. **What's the difference between a `class` and `data class`? When NOT to use data class?**
+5. **Sealed class vs sealed interface — pros / cons?**
+6. **`lateinit` vs `lazy` — when to use each?**
+7. **What does `inline` do? When does it matter?**
+8. **What's a value class (`@JvmInline value class`)? When does it box?**
+9. **Object expression vs object declaration vs companion object — three?**
+10. **Explain extension functions. Can they access private members?**
+
+### Coroutines
+
+11. **`launch` vs `async` — when to use each?**
+12. **What is structured concurrency? Why does it matter?**
+13. **Explain `CoroutineExceptionHandler` vs try/catch — where does each work?**
+14. **`Job` vs `SupervisorJob` — how do they differ in failure propagation?**
+15. **What happens if a coroutine is cancelled mid-await?**
+16. **Difference between `Dispatchers.IO`, `Default`, `Main`, `Main.immediate`, `Unconfined`?**
+17. **`Flow` vs `Channel` — when to pick each?**
+18. **Cold vs hot flow — example of each?**
+19. **What does `flowOn` actually do? Does it affect the collector?**
+20. **`SharedFlow` vs `StateFlow` — semantic differences?**
+
+---
+
+## Jetpack Compose (25 questions)
+
+### Basics
+
+21. **What makes a function a Composable? What's `@Composable` doing under the hood?**
+22. **Explain recomposition. When does it happen? When is it skipped?**
+23. **What is positional memoization in the slot table?**
+24. **`remember` vs `rememberSaveable` vs `SavedStateHandle` — when each?**
+25. **Why does Compose need stable parameters? What is `@Immutable` vs `@Stable`?**
+
+### State + side effects
+
+26. **`mutableStateOf` vs `mutableIntStateOf` — difference?**
+27. **`derivedStateOf` — when is it useful?**
+28. **Explain `LaunchedEffect` vs `DisposableEffect` vs `SideEffect`.**
+29. **When would you use `rememberUpdatedState`?**
+30. **`snapshotFlow` — what does it do?**
+
+### Layout + drawing
+
+31. **Modifier order: `padding(8.dp).background(Red)` vs `background(Red).padding(8.dp)` — what's the difference?**
+32. **What's a Slot API? Give an Android example.**
+33. **`AndroidView` vs `ComposeView` — when each?**
+34. **Why is `LazyColumn` necessary vs `Column` with scroll?**
+35. **Explain `Modifier.graphicsLayer { }` vs `Modifier.rotate()` — performance difference.**
+
+### Performance
+
+36. **What is composition vs measure vs draw phase? Which can graphicsLayer skip?**
+37. **How do you detect a composable that recomposes too often?**
+38. **Why does `List<T>` cause re-composition issues? How do you fix it?**
+39. **Strong skipping mode — what does it change?**
+40. **Compose compiler metrics — what do you look for?**
+
+### Navigation + integration
+
+41. **Navigation Compose type-safe routes — how do they work?**
+42. **How do you handle deep links in Compose Navigation?**
+43. **Shared element transitions — basic mechanism?**
+44. **How does a Composable preserve state across navigation?**
+45. **Compose in a Fragment — what's the correct `ViewCompositionStrategy`?**
+
+---
+
+## Architecture (15 questions)
+
+46. **MVVM vs MVI — when to pick each?**
+47. **What is Unidirectional Data Flow? Why is it preferred?**
+48. **Explain Single Source of Truth for an Android app.**
+49. **What's the Repository pattern? Why use it?**
+50. **Hilt vs Koin vs Dagger 2 — pros/cons?**
+51. **`@Singleton` vs `@ViewModelScoped` vs `@ActivityScoped` — when each?**
+52. **Explain `@AssistedInject` and when you'd use it.**
+53. **What is Clean Architecture? Worth the effort for a 5-screen app?**
+54. **How would you model offline-first messaging?**
+55. **Sealed error hierarchies vs `Result<T>` — when to pick each?**
+56. **Explain typed errors with `Outcome<T, E>` or Arrow's `Either`.**
+57. **Why are value classes useful in domain modeling?**
+58. **What's an aggregate root? Give an Android example.**
+59. **How do you enforce module boundaries in a 30-module app?**
+60. **When does dynamic feature delivery make sense vs install-time modules?**
+
+---
+
+## Networking (10 questions)
+
+61. **REST vs GraphQL vs gRPC — when each?**
+62. **Why use OkHttp interceptors? Give three real interceptor examples.**
+63. **How do you implement auth + token refresh with thundering-herd protection?**
+64. **How does Paging 3 work? PagingSource vs RemoteMediator?**
+65. **Explain idempotency keys and why they matter for payments.**
+66. **WebSocket reconnection strategy with exponential backoff + jitter — sketch?**
+67. **How do you cache HTTP responses with OkHttp?**
+68. **What is certificate pinning? When does it backfire?**
+69. **How do you handle a 401 in your network stack?**
+70. **Coil vs Glide — pros/cons?**
+
+---
+
+## Data & persistence (10 questions)
+
+71. **Room migrations — how do you write + test one?**
+72. **What is the Room `@Transaction` annotation? Why critical with `@Relation`?**
+73. **How does Room's Flow auto-invalidate?**
+74. **Preferences DataStore vs Proto DataStore — when each?**
+75. **How do you migrate from SharedPreferences to DataStore?**
+76. **Explain SQLCipher for Room encryption.**
+77. **Scoped storage on Android 10+ — what changed?**
+78. **Photo Picker vs READ_MEDIA_IMAGES — which to use and why?**
+79. **What does EncryptedSharedPreferences actually encrypt? Where is the key?**
+80. **When does Room emit Flow updates across processes?**
+
+---
+
+## Concurrency + performance (10 questions)
+
+81. **What is jank? What causes it? How do you measure it?**
+82. **What is the frame budget on a 90Hz device?**
+83. **How does a baseline profile work? What does it speed up?**
+84. **Explain Doze and App Standby. How does WorkManager interact?**
+85. **`viewModelScope` vs `lifecycleScope` — when each?**
+86. **How does a foreground service differ from a regular Service since Android 8?**
+87. **What's the difference between expedited work and regular periodic work?**
+88. **Memory profiling: how do you find a leak?**
+89. **What is Strict Mode? What can it detect?**
+90. **OkHttp connection pool — what is it; how big should it be?**
+
+---
+
+## Security + testing (10 questions)
+
+91. **What is Play Integrity? When do you use Standard vs Classic API?**
+92. **HIPAA — what technical controls must your app implement?**
+93. **Biometric-bound Keystore key — how does it work?**
+94. **Explain `setUserAuthenticationRequired(true)` on a Keystore key.**
+95. **Testing pyramid for Android — what's the ratio?**
+96. **`StandardTestDispatcher` vs `UnconfinedTestDispatcher` — when each?**
+97. **What's MockK's `coVerify` vs `verify`?**
+98. **Why are fakes better than mocks for domain tests?**
+99. **What does Turbine do? Give one assertion API.**
+100. **`runTest` vs `runBlocking` — when each?**
+
+---
+
+## System design (10 questions)
+
+101. **Design an offline-first chat app. Walk me through.**
+102. **Design Instagram's photo feed for mobile.**
+103. **Design Uber's rider app — request → match → ride.**
+104. **Design a fitness tracker with Wear OS companion.**
+105. **Design a video-sharing app like TikTok (upload + feed).**
+106. **Design a banking app that survives bank API outages.**
+107. **Design a collaborative editor (like Google Docs) on mobile.**
+108. **Design a podcast app with offline playback.**
+109. **Design a music streaming app with cast support.**
+110. **Design an e-commerce checkout flow with payment + inventory.**
+
+---
+
+## Behavioral (15 questions)
+
+111. **Tell me about a time you disagreed with a teammate.**
+112. **Tell me about your most complex technical project.**
+113. **Tell me about a bug you shipped and how you handled it.**
+114. **Tell me about a time you missed a deadline.**
+115. **Tell me about a time you mentored someone junior.**
+116. **Tell me about a time you influenced without authority.**
+117. **Tell me about a technical decision you made that turned out wrong.**
+118. **Tell me about a time you received difficult feedback.**
+119. **Tell me about a time you changed your mind.**
+120. **Tell me about your favorite project. Why?**
+121. **Tell me about a time you went outside your role.**
+122. **Tell me about a time you had to learn something quickly.**
+123. **Tell me about a conflict you resolved between teams.**
+124. **What's the hardest production incident you've worked through?**
+125. **Tell me about a time you said no to a feature request.**
+
+---
+
+## Compensation + negotiation (5 questions)
+
+126. **What are your salary expectations?** (correct answer: deflect)
+127. **What's your current compensation?** (correct answer: deflect or reframe)
+128. **Why are you leaving your current job?**
+129. **What are you looking for in your next role?**
+130. **You have 24 hours to decide — can you give us an answer by EOD?** (correct answer: push back)
+
+---
+
+## How to use this bank
+
+<Callout kind="success" title="Drill plan">
+**Week 1**: Pick 10 random questions per category. Answer aloud. Time each (target 30s for fact-based, 2-3 min for system design / behavioral).
+
+**Week 2**: Record yourself answering 5 system design and 5 behavioral. Re-listen. Note ums, tangents, missing structure.
+
+**Week 3**: Do 3 mock interviews with peers — one technical, one system design, one behavioral.
+
+**Week 4**: Tighten the weakest 10 questions. Refresh story bank.
+</Callout>
+
+## Where to deep-dive
+
+| Topic | Chapter |
+|-------|---------|
+| Coroutines / Flow | [Coroutines Deep Dive](/docs/kotlin-foundation/coroutines-deep-dive) |
+| Compose internals | [Compose Internals](/docs/jetpack-compose/internals) |
+| MVI | [MVI & State Machines](/docs/architecture-patterns/mvi-state-machines) |
+| Networking | [Retrofit & OkHttp](/docs/networking-api/retrofit-okhttp-deep-dive) |
+| Performance | [Memory + LeakCanary](/docs/performance/memory-leakcanary), [Jank Hunting](/docs/performance/jank-hunting) |
+| Security | [Crypto + Keystore](/docs/security-compliance/cryptography-keystore) |
+| System design | [System Design Walkthroughs](/docs/career-interview/system-design-walkthroughs) |
+| Behavioral | [Behavioral & Negotiation](/docs/career-interview/behavioral-negotiation) |
+| Coding patterns | [Coding Interview Patterns](/docs/career-interview/coding-interview-patterns) |

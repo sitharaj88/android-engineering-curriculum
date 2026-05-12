@@ -1,0 +1,734 @@
+---
+id: fastlane
+title: Fastlane Deep Dive
+sidebar_label: Fastlane
+description: Fastlane for Android — lanes, supply, screenshots, metadata, secrets management, and integrating with GitHub Actions.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Fastlane Deep Dive
+
+Fastlane is Ruby-based automation for mobile release tasks: build,
+sign, upload, screenshot capture, metadata sync, beta distribution.
+It's the de-facto standard for serious Android release pipelines —
+GitHub Actions handles CI; Fastlane handles **release plumbing**.
+
+## Why Fastlane
+
+<ComparisonCard
+  left={{
+    label: 'Without Fastlane',
+    title: 'Manual or custom',
+    variant: 'old',
+    points: [
+      'Build via ./gradlew bundleRelease + manual Play Console upload',
+      'Custom shell scripts for sign + upload',
+      'No screenshot automation',
+      'Metadata updated by hand in Play Console',
+      'Each CI re-implements upload logic',
+      'Fragile, undocumented, brittle'
+    ]
+  }}
+  right={{
+    label: 'With Fastlane',
+    title: 'Battle-tested',
+    variant: 'new',
+    points: [
+      'supply plugin uploads AAB + metadata + screenshots',
+      'Lanes encode release types (internal, beta, production)',
+      'screengrab automates per-device screenshots',
+      'Metadata as git-tracked text files',
+      'Reusable across team and CI',
+      'Plugin ecosystem (Slack, Firebase, Crashlytics)'
+    ]
+  }}
+/>
+
+---
+
+## Setup
+
+```bash
+# Install
+gem install fastlane
+
+# Or via Bundler (recommended for CI)
+cat > Gemfile <<EOF
+source "https://rubygems.org"
+gem "fastlane"
+EOF
+
+bundle install
+```
+
+Initialize in your Android project:
+
+```bash
+fastlane init
+# Pick "Manual setup" — we'll configure lanes ourselves
+```
+
+Creates:
+```text
+fastlane/
+├── Fastfile             ← lane definitions
+├── Appfile              ← app-wide config
+└── metadata/             ← release notes, descriptions per locale
+    └── android/
+        └── en-US/
+            ├── full_description.txt
+            ├── short_description.txt
+            ├── title.txt
+            └── changelogs/
+                └── default.txt
+```
+
+---
+
+## The supply plugin — Play Console API
+
+`supply` (built into Fastlane) talks to the Play Developer API.
+
+### Service account setup
+
+1. Google Cloud Console → IAM → Service Accounts → Create
+2. Grant **Service Account User** role
+3. Generate JSON key, download
+4. Play Console → Setup → API access → Grant access to the service account
+5. Permissions: Release manager (or finer per-track)
+
+```ruby
+# fastlane/Appfile
+json_key_file("../play-service-account.json")
+package_name("com.myapp")
+```
+
+### Internal track upload
+
+```ruby
+# fastlane/Fastfile
+
+default_platform(:android)
+
+platform :android do
+
+  desc "Build and upload to internal track"
+  lane :internal do
+    gradle(
+      task: "bundle",
+      build_type: "Release",
+      properties: {
+        "android.injected.signing.store.file"     => ENV["KEYSTORE_PATH"],
+        "android.injected.signing.store.password" => ENV["KEYSTORE_PASSWORD"],
+        "android.injected.signing.key.alias"      => ENV["KEY_ALIAS"],
+        "android.injected.signing.key.password"   => ENV["KEY_PASSWORD"]
+      }
+    )
+
+    upload_to_play_store(
+      track: "internal",
+      aab: lane_context[SharedValues::GRADLE_AAB_OUTPUT_PATH],
+      release_status: "completed",
+      skip_upload_metadata: false,
+      skip_upload_changelogs: false,
+      skip_upload_images: false,
+      skip_upload_screenshots: false
+    )
+  end
+end
+```
+
+Run:
+
+```bash
+bundle exec fastlane internal
+```
+
+Output:
+
+```text
+[18:42:03]: -------------
+[18:42:03]: --- Step: gradle ---
+[18:42:03]: -------------
+[18:42:03]: $ ./gradlew bundle ...
+[18:43:25]: ▸ BUILD SUCCESSFUL
+[18:43:25]: -------------
+[18:43:25]: --- Step: upload_to_play_store ---
+[18:43:25]: -------------
+[18:43:25]: Uploading new release...
+[18:43:42]: Successfully uploaded
+```
+
+---
+
+## Promotion lanes
+
+After QA validates internal, promote to closed beta:
+
+```ruby
+desc "Promote internal → alpha"
+lane :promote_to_alpha do
+  upload_to_play_store(
+    track: "internal",
+    track_promote_to: "alpha",
+    skip_upload_aab: true,           # promotion only, no new bundle
+    skip_upload_metadata: true,
+    skip_upload_changelogs: false    # update release notes
+  )
+end
+
+desc "Promote alpha → beta"
+lane :promote_to_beta do
+  upload_to_play_store(
+    track: "alpha",
+    track_promote_to: "beta",
+    skip_upload_aab: true,
+    skip_upload_changelogs: false
+  )
+end
+
+desc "Promote to production (staged rollout)"
+lane :promote_to_production do |options|
+  upload_to_play_store(
+    track: options[:from] || "beta",
+    track_promote_to: "production",
+    rollout: options[:rollout] || "0.05",
+    skip_upload_aab: true,
+    skip_upload_changelogs: false
+  )
+end
+
+desc "Halt production rollout"
+lane :halt do
+  upload_to_play_store(
+    track: "production",
+    rollout: "0.0",
+    skip_upload_aab: true,
+    skip_upload_metadata: true
+  )
+end
+
+desc "Increase rollout percentage"
+lane :increase_rollout do |options|
+  upload_to_play_store(
+    track: "production",
+    rollout: options[:to] || "0.10",
+    skip_upload_aab: true,
+    skip_upload_metadata: true
+  )
+end
+```
+
+### Usage
+
+```bash
+bundle exec fastlane promote_to_production rollout:0.05
+# ... monitor for 24h ...
+bundle exec fastlane increase_rollout to:0.10
+# ... another 24h ...
+bundle exec fastlane increase_rollout to:0.25
+# ... and so on until 1.0
+```
+
+Or in an emergency:
+
+```bash
+bundle exec fastlane halt
+```
+
+Drops production rollout to 0% — existing installs unaffected, new
+installs revert to previous version.
+
+---
+
+## Metadata as files
+
+```text
+fastlane/metadata/android/
+├── en-US/
+│   ├── title.txt                    "My App"
+│   ├── short_description.txt        "80-character marketing line"
+│   ├── full_description.txt         "Up to 4000 characters of marketing copy"
+│   ├── video.txt                    "https://youtube.com/watch?v=..."
+│   ├── images/
+│   │   ├── icon.png                 512×512
+│   │   ├── featureGraphic.png       1024×500
+│   │   ├── phoneScreenshots/
+│   │   │   ├── 01_home.png
+│   │   │   ├── 02_search.png
+│   │   │   └── 03_detail.png
+│   │   └── sevenInchScreenshots/
+│   │       └── ...
+│   └── changelogs/
+│       ├── default.txt
+│       └── 1234.txt                  versionCode-specific
+├── es-ES/
+│   └── ...
+└── hi-IN/
+    └── ...
+```
+
+Edit text files. Commit. Run `fastlane internal`. Play Console updated.
+
+Designers can update screenshots via PR — git-tracked changes,
+reviewable, revertable.
+
+### Per-version changelog
+
+```text
+# fastlane/metadata/android/en-US/changelogs/default.txt
+- Added dark mode
+- Fixed crash when applying expired discount codes
+- 30% faster checkout
+```
+
+`default.txt` applies to all version codes unless `{versionCode}.txt`
+exists.
+
+---
+
+## Screenshots automation — screengrab
+
+For test-driven screenshots:
+
+```kotlin
+// app/src/androidTest/kotlin/.../ScreenshotsTest.kt
+@RunWith(AndroidJUnit4::class)
+class ScreenshotsTest {
+
+    @get:Rule val composeRule = createAndroidComposeRule<MainActivity>()
+
+    @get:Rule val localeRule = LocaleTestRule()
+
+    @Test fun screenshots() {
+        Screengrab.screenshot("01_home")
+
+        composeRule.onNodeWithText("Search").performClick()
+        Screengrab.screenshot("02_search")
+
+        composeRule.onNodeWithText("Wireless Earbuds").performClick()
+        Screengrab.screenshot("03_detail")
+    }
+}
+```
+
+```ruby
+# fastlane/Screengrabfile
+package_name "com.myapp"
+use_tests_in_packages [ "com.myapp.screenshots" ]
+locales ["en-US", "es-ES", "hi-IN", "ar"]
+```
+
+```bash
+bundle exec fastlane screengrab
+```
+
+Captures screenshots per locale, copies to
+`fastlane/metadata/android/{locale}/images/phoneScreenshots/`. Next
+`upload_to_play_store` ships them.
+
+---
+
+## Slack / notifications
+
+```ruby
+desc "Internal release with Slack notification"
+lane :internal_with_slack do
+  internal
+
+  slack(
+    message: "📱 Internal release ready: #{lane_context[SharedValues::GRADLE_AAB_OUTPUT_PATH]}",
+    success: true,
+    slack_url: ENV["SLACK_WEBHOOK"],
+    payload: {
+      "Version" => last_git_tag,
+      "Branch" => `git rev-parse --abbrev-ref HEAD`.strip,
+      "Build time" => Time.now.to_s
+    }
+  )
+end
+
+error do |lane, exception|
+  slack(
+    message: "🚨 Lane `#{lane}` failed",
+    success: false,
+    slack_url: ENV["SLACK_WEBHOOK"],
+    attachment_properties: { fields: [ { title: "Error", value: exception.message } ] }
+  )
+end
+```
+
+The `error do` block fires on **any lane failure** — Slack alerts your
+team without manual intervention.
+
+---
+
+## Firebase App Distribution (beta to internal testers)
+
+```ruby
+desc "Build + push to Firebase App Distribution"
+lane :distribute do
+  gradle(task: "assemble", build_type: "Staging")
+
+  firebase_app_distribution(
+    app: ENV["FIREBASE_APP_ID"],
+    groups: "qa-team, designers",
+    release_notes: changelog_from_git_commits(
+      between: [last_git_tag, "HEAD"],
+      pretty: "- %s"
+    ),
+    apk_path: lane_context[SharedValues::GRADLE_APK_OUTPUT_PATH],
+    service_credentials_file: ENV["FIREBASE_SERVICE_ACCOUNT_PATH"]
+  )
+end
+```
+
+Testers get an email + install link. No Play Console hassle for
+pre-alpha builds.
+
+---
+
+## Crashlytics upload
+
+```ruby
+desc "Upload mapping file to Crashlytics"
+lane :upload_mapping do
+  upload_symbols_to_crashlytics(
+    binary_path: "app/build/outputs/mapping/release/mapping.txt",
+    app_id: ENV["FIREBASE_APP_ID"]
+  )
+end
+```
+
+Run as part of release lane — Crashlytics de-obfuscates stack traces
+using the mapping file.
+
+---
+
+## Tagging git on release
+
+```ruby
+desc "Production release with git tag"
+lane :production do
+  internal           # reuses the internal lane
+
+  # Tag the commit
+  version = sh("../gradlew", "-q", "printVersion").strip
+  add_git_tag(tag: "v#{version}")
+  push_git_tags
+
+  upload_to_play_store(
+    track: "internal",
+    track_promote_to: "production",
+    rollout: "0.05"
+  )
+
+  slack(message: "🚀 v#{version} → production 5%", success: true)
+end
+```
+
+```kotlin
+// app/build.gradle.kts — expose version to Fastlane
+tasks.register("printVersion") {
+    doLast {
+        println(android.defaultConfig.versionName)
+    }
+}
+```
+
+Every production release leaves a git tag — audit trail correlated with
+Play Store version.
+
+---
+
+## Secrets management
+
+### Locally — `.env` file
+
+```bash
+# fastlane/.env (gitignored)
+KEYSTORE_PATH=/Users/me/secrets/release.keystore
+KEYSTORE_PASSWORD=...
+KEY_ALIAS=upload
+KEY_PASSWORD=...
+SLACK_WEBHOOK=https://hooks.slack.com/...
+FIREBASE_SERVICE_ACCOUNT_PATH=/Users/me/secrets/firebase.json
+```
+
+```bash
+bundle exec fastlane internal --env=staging
+```
+
+Loads from `fastlane/.env.staging`.
+
+### CI — GitHub Actions secrets
+
+```yaml
+# .github/workflows/release.yml
+- name: Decode secrets
+  env:
+    KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+    PLAY_SA_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+  run: |
+    echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
+    echo "$PLAY_SA_JSON" > play-service-account.json
+
+- name: Run Fastlane
+  env:
+    KEYSTORE_PATH: ${{ github.workspace }}/release.keystore
+    KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+    KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+    KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+    SUPPLY_JSON_KEY: ${{ github.workspace }}/play-service-account.json
+    SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+  run: bundle exec fastlane internal
+```
+
+### Never commit secrets
+
+`.gitignore` — minimum:
+
+```text
+fastlane/.env*
+*.keystore
+*service-account*.json
+```
+
+Add `git-secrets` or `detect-secrets` pre-commit hook to block accidents.
+
+---
+
+## Plugins
+
+Fastlane has 800+ community plugins. Common Android ones:
+
+```bash
+fastlane add_plugin firebase_app_distribution
+fastlane add_plugin upload_symbols_to_crashlytics
+fastlane add_plugin appcenter
+fastlane add_plugin run_tests_app
+fastlane add_plugin android_versioning
+```
+
+`fastlane/Pluginfile`:
+
+```ruby
+gem 'fastlane-plugin-firebase_app_distribution'
+gem 'fastlane-plugin-versioning_android'
+```
+
+---
+
+## Multi-flavor support
+
+```ruby
+desc "Internal release for a specific flavor"
+lane :internal do |options|
+  flavor = options[:flavor] || "prod"
+
+  gradle(
+    task: "bundle#{flavor.capitalize}",
+    build_type: "Release",
+    properties: { ... }
+  )
+
+  upload_to_play_store(
+    package_name: "com.myapp.#{flavor}",
+    track: "internal",
+    aab: lane_context[SharedValues::GRADLE_AAB_OUTPUT_PATH]
+  )
+end
+```
+
+```bash
+bundle exec fastlane internal flavor:enterprise
+bundle exec fastlane internal flavor:consumer
+```
+
+For multi-app repos (white-label, region-specific apps), one lane covers
+all flavors.
+
+---
+
+## Versioning
+
+```ruby
+desc "Bump versionCode and version name"
+lane :bump_version do |options|
+  android_set_version_code(
+    version_code: options[:code] || (android_get_version_code.to_i + 1)
+  )
+  android_set_version_name(
+    version_name: options[:name] || android_get_version_name
+  )
+
+  git_commit(path: "app/build.gradle.kts", message: "chore: bump version to #{options[:name]}")
+  add_git_tag(tag: "v#{options[:name]}")
+  push_to_git_remote
+end
+```
+
+```bash
+bundle exec fastlane bump_version name:2.5.0
+```
+
+Auto-increments versionCode, tags, pushes. Combined with a CI hook on
+tag push → triggers the release lane.
+
+---
+
+## Testing Fastlane locally before CI
+
+```bash
+# Dry run — no actual upload
+bundle exec fastlane internal --verbose
+
+# Test all metadata uploads work
+bundle exec fastlane validate_play_store_json_key
+```
+
+Validate the lane works on your machine before pushing CI changes.
+
+---
+
+## Common patterns — full Fastfile
+
+```ruby
+default_platform(:android)
+
+platform :android do
+
+  before_all do
+    ensure_git_status_clean
+    ensure_git_branch(branch: "main|release/.*")
+  end
+
+  desc "Run tests"
+  lane :test do
+    gradle(task: "testDebugUnitTest")
+    gradle(task: "detekt")
+    gradle(task: "lint")
+  end
+
+  desc "Build signed AAB"
+  lane :build do
+    test
+    gradle(
+      task: "bundle",
+      build_type: "Release",
+      properties: signing_props
+    )
+  end
+
+  desc "Internal track release"
+  lane :internal do
+    build
+    upload_to_play_store(track: "internal")
+    slack(message: "📱 Internal release shipped", success: true)
+  end
+
+  desc "Promote to production at staged rollout"
+  lane :production do |options|
+    rollout = options[:rollout] || "0.05"
+    upload_to_play_store(
+      track: "internal",
+      track_promote_to: "production",
+      rollout: rollout,
+      skip_upload_aab: true
+    )
+    add_git_tag(tag: "v#{android_get_version_name}-rollout-#{rollout}")
+    push_git_tags
+  end
+
+  desc "Halt rollout"
+  lane :halt do
+    upload_to_play_store(
+      track: "production",
+      rollout: "0.0",
+      skip_upload_aab: true,
+      skip_upload_metadata: true
+    )
+    slack(message: "🚨 Production rollout HALTED", success: false)
+  end
+
+  error do |lane, exception|
+    slack(
+      message: "Fastlane `#{lane}` failed: #{exception.message}",
+      success: false
+    )
+  end
+end
+
+def signing_props
+  {
+    "android.injected.signing.store.file"     => ENV["KEYSTORE_PATH"],
+    "android.injected.signing.store.password" => ENV["KEYSTORE_PASSWORD"],
+    "android.injected.signing.key.alias"      => ENV["KEY_ALIAS"],
+    "android.injected.signing.key.password"   => ENV["KEY_PASSWORD"]
+  }
+end
+```
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Fastlane anti-patterns',
+    title: 'Problems',
+    variant: 'old',
+    points: [
+      'Hardcoded paths and credentials in Fastfile',
+      'No before_all sanity checks (dirty git status)',
+      'Single mega-lane doing everything',
+      'No error handler (silent failures)',
+      'Metadata edits straight in Play Console (lost)',
+      'Re-implementing supply manually'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Solid releases',
+    variant: 'new',
+    points: [
+      'Env vars + bundler-managed secrets',
+      'before_all { ensure_git_status_clean; ensure_git_branch }',
+      'Small lanes composed via `build` + `internal` + `production`',
+      'error do block notifies Slack',
+      'Metadata in fastlane/metadata, git-tracked',
+      'Use supply + maintained plugins'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Fastlane rules">
+- **One Fastfile** with composable lanes — test, build, internal, promote, halt.
+- **Metadata as files** — title, descriptions, screenshots in git.
+- **Service account JSON** for Play API authentication.
+- **Secrets via env vars** (`.env` local, GitHub Secrets on CI).
+- **Slack `error do` handler** for instant failure notification.
+- **`before_all`** sanity checks prevent shipping uncommitted changes.
+- **`screengrab` automates screenshots** across locales / devices.
+- **Versioning + tagging** in the production lane for audit trails.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Build internal lane', description: 'Write a Fastfile with an `internal` lane that builds, signs, and uploads to Play internal track. Run locally end-to-end.' },
+  { title: 'Metadata sync', description: 'Move release notes + screenshots to fastlane/metadata. Commit. Run fastlane internal and verify Play Console updates.' },
+  { title: 'Promotion + halt', description: 'Write promote_to_production rollout:0.05 and halt lanes. Test the halt by promoting then halting — verify production rollout returns to 0.' },
+  { title: 'Slack on failure', description: 'Add error do block + Slack webhook. Cause a deliberate failure (wrong keystore password); verify Slack alerts.' },
+  { title: 'CI integration', description: 'Wire Fastlane into a GitHub Actions tag-triggered release workflow. Push a tag; confirm AAB lands on Play internal.' }
+]} />
+
+## Next
+
+Return to **[Module 17 Overview](./overview)** or continue to
+**[Module 18 — Observability](/docs/observability/overview)**.

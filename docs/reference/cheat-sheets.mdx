@@ -1,0 +1,501 @@
+---
+id: cheat-sheets
+title: Cheat Sheets
+sidebar_label: Cheat Sheets
+description: One-page references for Compose, Coroutines, Flow, Hilt, Modifiers, and the patterns you reach for daily.
+---
+
+import { Callout } from '@site/src/components/Doc';
+
+# Cheat Sheets
+
+Quick references for the APIs you use daily. Print-friendly, scannable,
+no fluff.
+
+## Compose state APIs
+
+```kotlin
+// Hold state across recompositions
+var count by remember { mutableIntStateOf(0) }
+
+// Survive config change (rotation)
+var draft by rememberSaveable { mutableStateOf("") }
+
+// Survive process death (ViewModel)
+val state by viewModel.state.collectAsStateWithLifecycle()
+
+// Compute from other state; only re-emit when result changes
+val showFab by remember { derivedStateOf { listState.firstVisibleItemIndex > 10 } }
+
+// Convert async source to State
+val image by produceState<ImageBitmap?>(initialValue = null, key1 = userId) {
+    value = imageLoader.load(userId)
+}
+
+// Bridge Compose state to coroutine world
+LaunchedEffect(listState) {
+    snapshotFlow { listState.firstVisibleItemIndex }
+        .collect { analytics.logScroll(it) }
+}
+```
+
+## Compose side effects
+
+| API | When |
+|-----|------|
+| `LaunchedEffect(key)` | Coroutine tied to composition, restarts on key change |
+| `rememberCoroutineScope()` | Launch from event handlers (click) |
+| `DisposableEffect(key)` | Setup + cleanup pair |
+| `SideEffect` | Run after every successful recomposition |
+| `rememberUpdatedState(value)` | Capture latest value in long-running effects |
+
+## Coroutines
+
+```kotlin
+// Structured concurrency
+coroutineScope {
+    val a = async { fetchA() }
+    val b = async { fetchB() }
+    a.await() + b.await()                              // both must succeed
+}
+
+supervisorScope {
+    launch { fetchOptionalA() }                        // failure isolated
+    launch { fetchOptionalB() }
+}
+
+// Dispatchers
+withContext(Dispatchers.IO) { File("...").readBytes() }
+withContext(Dispatchers.Default) { heavyCompute() }
+withContext(Dispatchers.Main) { uiUpdate() }
+
+// Cancellation
+viewModelScope.launch {
+    try {
+        doWork()
+    } catch (c: CancellationException) {
+        throw c                                         // always re-throw
+    } catch (e: Exception) {
+        handle(e)
+    }
+}
+
+// Timeout
+withTimeout(5.seconds) { api.fetch() }
+withTimeoutOrNull(5.seconds) { api.fetch() }            // returns null on timeout
+```
+
+## Flow operators
+
+```kotlin
+flow                                                   // builder
+.map { transform }                                     // T → R
+.filter { predicate }                                  // keep matching
+.distinctUntilChanged()                                // drop consecutive duplicates
+.debounce(300)                                         // wait for quiet
+.throttleFirst(500)                                    // leading edge throttle
+.sample(1000)                                          // fixed-interval emit
+.combine(other) { a, b -> a to b }                     // latest from each
+.zip(other) { a, b -> a to b }                         // pair 1:1
+.merge(other)                                          // interleave
+.flatMapConcat { f }                                   // serial flatten
+.flatMapMerge(concurrency = 4) { f }                   // parallel
+.flatMapLatest { f }                                   // cancel previous (user input)
+.onStart { /* setup */ }
+.onCompletion { cause -> /* teardown */ }
+.catch { e -> emit(default) }
+.retry(3) { it is IOException }
+.flowOn(Dispatchers.IO)                                // upstream dispatcher
+.stateIn(scope, SharingStarted.WhileSubscribed(5_000), initialValue)
+```
+
+## Hilt cheats
+
+```kotlin
+@HiltAndroidApp class App : Application()
+
+@AndroidEntryPoint class MainActivity : ComponentActivity()
+@AndroidEntryPoint class MyFragment : Fragment()
+@AndroidEntryPoint class WorkerService : Service()
+
+@HiltViewModel
+class MyViewModel @Inject constructor(
+    private val repo: Repository
+) : ViewModel()
+
+// Modules
+@Module @InstallIn(SingletonComponent::class)
+object NetworkModule {
+    @Provides @Singleton
+    fun provideRetrofit(): Retrofit = Retrofit.Builder()...
+}
+
+@Module @InstallIn(SingletonComponent::class)
+abstract class RepoModule {
+    @Binds @Singleton
+    abstract fun bind(impl: RepositoryImpl): Repository
+}
+
+// Qualifiers
+@Qualifier annotation class IoDispatcher
+@Provides @IoDispatcher fun io() = Dispatchers.IO
+
+// Assisted injection
+class MyVm @AssistedInject constructor(
+    @Assisted val id: String,
+    private val repo: Repo
+) {
+    @AssistedFactory
+    interface Factory {
+        fun create(id: String): MyVm
+    }
+}
+
+// Testing
+@HiltAndroidTest
+class MyTest {
+    @get:Rule(order = 0) val hilt = HiltAndroidRule(this)
+    @get:Rule(order = 1) val compose = createAndroidComposeRule<HiltTestActivity>()
+
+    @BindValue @JvmField val repo: Repository = FakeRepo()
+}
+```
+
+## Hilt scopes
+
+| Scope | Lifetime |
+|-------|----------|
+| `@Singleton` | App process |
+| `@ActivityRetainedScoped` | Survives rotation, not process death |
+| `@ViewModelScoped` | Per ViewModel |
+| `@ActivityScoped` | Per Activity |
+| `@FragmentScoped` | Per Fragment |
+| `@ServiceScoped` | Per Service |
+| `@ViewScoped` | Per View |
+
+## Modifier order — the rule
+
+```kotlin
+Modifier
+    .size(100.dp)                          // 1. Size
+    .clip(RoundedCornerShape(8.dp))        // 2. Clip
+    .background(Color.Blue)                // 3. Background (after clip)
+    .border(1.dp, Color.Black)             // 4. Border
+    .clickable { }                          // 5. Click
+    .padding(16.dp)                        // 6. Padding (last; affects children only)
+```
+
+Modifier order applies **left-to-right**. Padding **after** background
+adds padding inside; before, around.
+
+## Compose performance checklist
+
+```kotlin
+// Stable inputs
+@Immutable data class UiState(val items: ImmutableList<Item>)
+
+// Stable callbacks
+val onClick = remember { { id: String -> vm.click(id) } }
+
+// Stable keys + content type
+items(items, key = { it.id }, contentType = { "item" }) { ... }
+
+// Derive expensive computations
+val canSubmit by remember { derivedStateOf { email.isValid && pw.isStrong } }
+
+// Defer state reads
+Modifier.graphicsLayer { translationX = scrollState.value.toFloat() }
+
+// GPU transforms
+Modifier.graphicsLayer { rotationZ = rotation }     // not .rotate(rotation)
+```
+
+## Room cheats
+
+```kotlin
+@Entity(tableName = "users", indices = [Index("email", unique = true)])
+data class UserEntity(@PrimaryKey val id: String, val email: String, val name: String)
+
+@Dao
+interface UserDao {
+    @Query("SELECT * FROM users WHERE id = :id")
+    suspend fun getById(id: String): UserEntity?
+
+    @Query("SELECT * FROM users")
+    fun observeAll(): Flow<List<UserEntity>>           // auto-emits on table change
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(user: UserEntity)
+
+    @Update suspend fun update(user: UserEntity)
+    @Delete suspend fun delete(user: UserEntity)
+
+    @Query("DELETE FROM users WHERE id = :id")
+    suspend fun deleteById(id: String)
+
+    @Transaction
+    suspend fun insertWithProfile(user: UserEntity, profile: ProfileEntity) {
+        upsert(user)
+        upsertProfile(profile)
+    }
+
+    // Relations
+    @Transaction
+    @Query("SELECT * FROM users WHERE id = :id")
+    suspend fun getWithProfile(id: String): UserWithProfile
+
+    // Paging 3
+    @Query("SELECT * FROM users ORDER BY name")
+    fun pagingSource(): PagingSource<Int, UserEntity>
+}
+
+@Database(entities = [UserEntity::class], version = 2, exportSchema = true)
+@TypeConverters(MyConverters::class)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun userDao(): UserDao
+    companion object {
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE users ADD COLUMN avatar TEXT")
+            }
+        }
+    }
+}
+```
+
+## OkHttp / Retrofit cheats
+
+```kotlin
+val client = OkHttpClient.Builder()
+    .addInterceptor(authInterceptor)
+    .addInterceptor(HttpLoggingInterceptor().setLevel(BODY))
+    .cache(Cache(File(cacheDir, "http"), 50L * 1024 * 1024))
+    .connectTimeout(10.seconds.toJavaDuration())
+    .readTimeout(30.seconds.toJavaDuration())
+    .certificatePinner(pinner)
+    .build()
+
+val retrofit = Retrofit.Builder()
+    .baseUrl("https://api.example.com/")
+    .client(client)
+    .addConverterFactory(MoshiConverterFactory.create(moshi))
+    .build()
+
+interface UserApi {
+    @GET("users/{id}") suspend fun getUser(@Path("id") id: String): UserDto
+    @POST("users") suspend fun create(@Body req: CreateUserRequest): UserDto
+    @Multipart @POST("users/{id}/avatar")
+    suspend fun uploadAvatar(@Path("id") id: String, @Part file: MultipartBody.Part): UserDto
+}
+```
+
+## Navigation Compose cheats
+
+```kotlin
+@Serializable data object Home
+@Serializable data class Profile(val userId: String)
+
+NavHost(navController, startDestination = Home) {
+    composable<Home> {
+        HomeScreen(onProfileClick = { id -> navController.navigate(Profile(id)) })
+    }
+    composable<Profile> { entry ->
+        val args: Profile = entry.toRoute()
+        ProfileScreen(userId = args.userId, onBack = navController::popBackStack)
+    }
+}
+
+// Pop up to start
+navController.navigate(Home) {
+    popUpTo(navController.graph.findStartDestination().id) { saveState = true }
+    launchSingleTop = true
+    restoreState = true
+}
+
+// Deep link
+composable<Profile>(
+    deepLinks = listOf(navDeepLink<Profile>(basePath = "https://myapp.com/user"))
+) { ... }
+```
+
+## WorkManager cheats
+
+```kotlin
+@HiltWorker
+class SyncWorker @AssistedInject constructor(
+    @Assisted ctx: Context,
+    @Assisted params: WorkerParameters,
+    private val repo: Repository
+) : CoroutineWorker(ctx, params) {
+    override suspend fun doWork(): Result = try {
+        repo.sync()
+        Result.success()
+    } catch (e: IOException) {
+        Result.retry()
+    }
+}
+
+// One-time
+val req = OneTimeWorkRequestBuilder<SyncWorker>()
+    .setConstraints(Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.CONNECTED)
+        .setRequiresBatteryNotLow(true)
+        .build())
+    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+    .build()
+WorkManager.getInstance(ctx).enqueueUniqueWork("sync", ExistingWorkPolicy.KEEP, req)
+
+// Periodic
+val periodic = PeriodicWorkRequestBuilder<SyncWorker>(6, TimeUnit.HOURS).build()
+WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(
+    "background_sync", ExistingPeriodicWorkPolicy.KEEP, periodic
+)
+
+// Expedited
+.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+
+// Observe
+WorkManager.getInstance(ctx).getWorkInfoByIdFlow(req.id)
+    .collect { info -> ... }
+```
+
+## R8 keep rules (common)
+
+```proguard
+# Models with reflection
+-keep @com.squareup.moshi.JsonClass class * { *; }
+-keep class * implements com.squareup.moshi.JsonAdapter { *; }
+
+# Retrofit
+-keepattributes Signature, InnerClasses, EnclosingMethod
+-keepclassmembers,allowshrinking,allowobfuscation interface * {
+    @retrofit2.http.* <methods>;
+}
+
+# Hilt
+-keep,allowobfuscation @dagger.hilt.android.AndroidEntryPoint class *
+
+# Coroutines
+-keepclassmembers class kotlinx.coroutines.** { volatile <fields>; }
+
+# Crashlytics — keep stack frames readable
+-keepattributes SourceFile, LineNumberTable
+-renamesourcefileattribute SourceFile
+
+# Compose
+-keep,allowobfuscation class androidx.compose.runtime.** { *; }
+```
+
+## Gradle properties (production)
+
+```properties
+org.gradle.jvmargs=-Xmx6g -XX:+UseG1GC -XX:MaxMetaspaceSize=1g \
+    -Dfile.encoding=UTF-8 \
+    -Dkotlin.daemon.jvm.options="-Xmx4g"
+
+org.gradle.parallel=true
+org.gradle.caching=true
+org.gradle.configuration-cache=true
+org.gradle.workers.max=8
+
+kotlin.code.style=official
+kotlin.incremental=true
+kotlin.incremental.useClasspathSnapshot=true
+
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+android.nonFinalResIds=true
+android.defaults.buildfeatures.buildconfig=false
+android.defaults.buildfeatures.aidl=false
+```
+
+## Common testing utilities
+
+```kotlin
+// JUnit 5
+@Test fun `name with spaces`() { }
+@ParameterizedTest @CsvSource("1,1", "2,4", "3,9") fun square(n: Int, sq: Int) { }
+
+// Coroutines test
+runTest { advanceTimeBy(300); runCurrent() }
+val dispatcher = StandardTestDispatcher()
+
+// Turbine
+flow.test {
+    assertEquals(initial, awaitItem())
+    flow.emit(updated)
+    assertEquals(updated, awaitItem())
+}
+
+// MockK
+val repo = mockk<Repo>()
+coEvery { repo.fetch(any()) } returns user
+coEvery { repo.save(any()) } throws IOException()
+coVerify(exactly = 1) { repo.fetch("u1") }
+
+// Compose
+composeRule.onNodeWithText("OK").performClick()
+composeRule.onNodeWithTag("submit").assertIsEnabled()
+composeRule.waitUntil { composeRule.onAllNodesWithText("Loaded").fetchSemanticsNodes().isNotEmpty() }
+```
+
+## ADB cheat sheet
+
+```bash
+# Quick references
+adb devices
+adb install app.apk
+adb uninstall com.myapp
+adb shell pm clear com.myapp
+adb shell am force-stop com.myapp
+adb shell am start -n com.myapp/.MainActivity
+adb shell am start -a android.intent.action.VIEW -d "https://myapp.com/path"
+
+# Logcat
+adb logcat | grep "MyTag"
+adb logcat *:E
+
+# Doze testing
+adb shell dumpsys deviceidle force-idle
+adb shell dumpsys deviceidle unforce
+
+# Permissions
+adb shell pm grant com.myapp android.permission.CAMERA
+
+# Screenshots / recording
+adb shell screencap /sdcard/s.png && adb pull /sdcard/s.png
+adb shell screenrecord /sdcard/r.mp4
+
+# Battery
+adb shell dumpsys batterystats --reset
+adb bugreport bugreport.zip      # for Battery Historian
+
+# Database files
+adb shell run-as com.myapp ls /data/data/com.myapp/databases/
+```
+
+## Keyboard shortcuts (Android Studio)
+
+| Action | macOS | Windows |
+|--------|-------|---------|
+| Search everywhere | `⇧⇧` | `Shift+Shift` |
+| Recent files | `⌘E` | `Ctrl+E` |
+| Quick fix | `⌥↩` | `Alt+Enter` |
+| Find action | `⌘⇧A` | `Ctrl+Shift+A` |
+| Go to declaration | `⌘B` | `Ctrl+B` |
+| Find usages | `⌥F7` | `Alt+F7` |
+| Rename | `⇧F6` | `Shift+F6` |
+| Extract method | `⌘⌥M` | `Ctrl+Alt+M` |
+| Reformat | `⌘⌥L` | `Ctrl+Alt+L` |
+| Run | `⌃R` | `Shift+F10` |
+| Debug | `⌃D` | `Shift+F9` |
+| Step over | `F8` | `F8` |
+| Step into | `F7` | `F7` |
+| Resume | `F9` | `F9` |
+| File structure | `⌘F12` | `Ctrl+F12` |
+| Terminal | `⌥F12` | `Alt+F12` |
+
+<Callout kind="success" title="Print this">
+This page is designed to be printable / saved as a single reference.
+Bookmark it; return when you need a quick syntax check.
+</Callout>

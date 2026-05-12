@@ -1,0 +1,557 @@
+---
+id: jank-hunting
+title: Jank Hunting
+sidebar_label: Jank Hunting
+description: Frame timing, Choreographer, GPU profiling, Compose recomposition counts, Perfetto traces, and the playbook for hunting dropped frames.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Jank Hunting
+
+A **janky** app drops frames — the user sees stutter, lag, or missed
+animations. The Android frame budget is **16.67 ms at 60 Hz**, **11.11 ms
+at 90 Hz**, **8.33 ms at 120 Hz**. Cross that, and the frame is dropped.
+This chapter covers detection, diagnosis, and the common fixes.
+
+## The frame pipeline
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  Frame N starts (VSYNC)                                       │
+│    ↓                                                          │
+│  1. Input handling                                            │
+│    ↓                                                          │
+│  2. Animation update                                          │
+│    ↓                                                          │
+│  3. Measure + Layout                                          │
+│    ↓                                                          │
+│  4. Compose recomposition (Compose only)                      │
+│    ↓                                                          │
+│  5. Draw — record GPU display list                            │
+│    ↓                                                          │
+│  6. Sync — upload to GPU                                      │
+│    ↓                                                          │
+│  Frame N done (~16.67 ms budget)                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Anything that takes longer than the budget drops the frame. Symptoms:
+- Stuttering scroll
+- Animation that "snaps" or skips
+- Tap response delay
+- Periodic freezing
+
+---
+
+## Detection — automated
+
+### `FrameMetricsAggregator` / `JankStats`
+
+```kotlin
+// libs.versions.toml
+metrics-performance = { module = "androidx.metrics:metrics-performance", version = "1.0.0-beta02" }
+```
+
+```kotlin
+class JankReporter @Inject constructor(
+    private val analytics: Analytics
+) {
+    fun install(activity: ComponentActivity) {
+        val window = activity.window
+        val jankStats = JankStats.createAndTrack(window) { frame ->
+            if (frame.isJank) {
+                analytics.log("jank",
+                    durationMs = (frame.frameDurationUiNanos / 1_000_000).toString(),
+                    states = frame.states.joinToString { "${it.key}:${it.value}" }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun TrackScreen(name: String) {
+    val view = LocalView.current
+    val metricsHolder = remember(view) {
+        PerformanceMetricsState.getHolderForHierarchy(view)
+    }
+
+    DisposableEffect(name) {
+        metricsHolder.state?.putState("screen", name)
+        onDispose { metricsHolder.state?.removeState("screen") }
+    }
+}
+```
+
+Ships jank rate to your observability backend (Module 18). Real users
+on real devices — far more valuable than your dev phone.
+
+### Macrobenchmark — `FrameTimingMetric`
+
+```kotlin
+@Test
+fun feedScrollJank() = rule.measureRepeated(
+    packageName = "com.myapp",
+    metrics = listOf(FrameTimingMetric()),
+    compilationMode = CompilationMode.Partial(BaselineProfileMode.Require),
+    iterations = 10
+) {
+    val list = device.findObject(By.res("feed"))
+    list.setGestureMargin(device.displayWidth / 5)
+    repeat(5) {
+        list.fling(Direction.DOWN)
+        device.waitForIdle()
+    }
+}
+```
+
+Output:
+
+```
+feedScrollJank
+  frameDurationCpuMs    P50=8.2  P90=14.5  P99=22.1
+  frameOverrunMs        P50=-8.5 P90=-2.1  P99=5.4    ← positive = dropped
+```
+
+Target: P99 < 16 ms at 60Hz. P99 > 16 ms is your jank budget exceeded.
+
+### Layout Inspector — Compose recomposition counts
+
+`Android Studio → Layout Inspector → Show recomposition counts`
+
+Each composable shows two numbers:
+- **Composition count** — how many times the function ran
+- **Skip count** — how many were skipped (good)
+
+Composables in scrolling lists should have **skip count ≫ composition
+count**. If both are high, the composable recomposes on every scroll —
+your stability is broken. See [Compose Performance](/docs/jetpack-compose/performance).
+
+---
+
+## Detection — manual
+
+### GPU Rendering bars
+
+Developer Options → **Profile GPU rendering** → On screen as bars.
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  Frame budget (16ms green line)                               │
+│  ▓▓▓▓ ░░░░ ▓▓▓▓ ░░░░ ▓▓▓▓ ░░░░ ▓▓▓ ░░░ ▓▓▓ ░░░ ▓▓▓ ░░░         │
+│  ↑ bar height = frame time                                    │
+│  Color coding: input, animation, measure/layout, draw, sync   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+If green line is crossed → jank. Color of the over-budget portion tells
+you which phase took too long.
+
+### Show GPU view updates
+
+Developer Options → **Debug GPU overdraw** + **Show GPU view updates**.
+
+View updates flash colors as they redraw. Red = drew this frame.
+Animated regions should redraw; static regions shouldn't.
+
+---
+
+## Diagnosis — Perfetto
+
+Perfetto is the deep-trace tool. Capture a 10-second trace while
+exhibiting the jank:
+
+```bash
+# Method 1 — System Trace (Quick Settings tile in Developer Options)
+# Method 2 — Android Studio Profiler → CPU → System Trace
+# Method 3 — adb
+adb shell perfetto -o /data/misc/perfetto-traces/trace.pftrace \
+  -c - <<EOF
+duration_ms: 10000
+buffers { size_kb: 63488 }
+data_sources { config { name: "linux.ftrace" } }
+data_sources { config { name: "android.power" } }
+EOF
+
+adb pull /data/misc/perfetto-traces/trace.pftrace
+```
+
+Open in https://ui.perfetto.dev. You see:
+- Main thread activity per frame
+- Choreographer callbacks
+- Compose recomposition pulses
+- Binder calls
+- GPU work
+
+### What to look for
+
+1. **Long Choreographer#doFrame** (> 16 ms) — frame budget exceeded.
+2. **Main thread blocked on Binder** — IPC waiting for system service.
+3. **`measure` / `layout` > 5 ms** — heavy layout pass.
+4. **Compose recomposition every frame** — stability issue.
+5. **GC pauses > 30 ms** — memory pressure (see
+   [Memory & LeakCanary](./memory-leakcanary)).
+
+### Custom trace sections
+
+```kotlin
+import androidx.tracing.trace
+
+trace("LoadProfile") {
+    val user = repo.fetch(id)
+    val orders = repo.recentOrders(id)
+}
+
+// or inline
+Trace.beginSection("ComputeChart")
+val points = computePoints()
+Trace.endSection()
+```
+
+Your sections appear in Perfetto. Annotate hot paths so you can find them
+in the timeline.
+
+---
+
+## Common jank causes + fixes
+
+### 1. Main thread I/O
+
+```kotlin
+// ❌ Reading a file on main thread
+override fun onCreate(savedInstanceState: Bundle?) {
+    val cached = File(filesDir, "cache.json").readText()
+}
+
+// ✅ Background
+lifecycleScope.launch {
+    val cached = withContext(Dispatchers.IO) { File(filesDir, "cache.json").readText() }
+    render(cached)
+}
+```
+
+StrictMode penalty flashes the screen — enable in debug to catch every
+violation.
+
+### 2. Synchronous binder calls
+
+```kotlin
+// ❌ Synchronous PackageManager call on main thread
+val info = packageManager.getApplicationInfo("com.someapp", 0)
+
+// ✅ Move off main
+withContext(Dispatchers.IO) {
+    packageManager.getApplicationInfo("com.someapp", 0)
+}
+```
+
+Most `getSystemService` calls are fast, but some block on Binder (Package
+queries, ConnectivityManager status checks). Profile to confirm.
+
+### 3. Heavy Compose recomposition
+
+```kotlin
+// ❌ Lambda capture causes recomposition every scroll
+@Composable
+fun List(items: List<Item>, onClick: (Item) -> Unit) {
+    LazyColumn {
+        items(items, key = { it.id }) { item ->
+            ItemRow(item, onClick = { onClick(item) })   // new lambda every recomposition
+        }
+    }
+}
+
+// ✅ Stable callback
+@Composable
+fun List(items: ImmutableList<Item>, onClick: (String) -> Unit) {
+    LazyColumn {
+        items(items, key = { it.id }, contentType = { "item" }) { item ->
+            ItemRow(item, onClick = onClick)              // function reference is stable
+        }
+    }
+}
+```
+
+Run Compose compiler metrics (Module 03 Performance) to identify
+unstable types.
+
+### 4. Bitmap decoding
+
+```kotlin
+// ❌ Synchronous decode at full resolution on main thread
+val bitmap = BitmapFactory.decodeFile(path)
+
+// ✅ Coil / Glide — async decode at display size
+AsyncImage(model = file, contentDescription = null, modifier = Modifier.size(80.dp))
+```
+
+See [Image Loading](/docs/networking-api/image-loading).
+
+### 5. Allocation pressure
+
+```kotlin
+// ❌ Allocates a Paint per frame
+@Composable
+fun Chart() {
+    Canvas(...) {
+        val paint = Paint().apply { color = Color.Red.toArgb() }
+        drawIntoCanvas { it.nativeCanvas.drawRect(0f, 0f, 100f, 100f, paint) }
+    }
+}
+
+// ✅ remember to allocate once
+@Composable
+fun Chart() {
+    val paint = remember { Paint().apply { color = Color.Red.toArgb() } }
+    Canvas(...) {
+        drawIntoCanvas { it.nativeCanvas.drawRect(0f, 0f, 100f, 100f, paint) }
+    }
+}
+```
+
+Heavy allocations → GC pauses → dropped frames.
+
+### 6. Overdraw
+
+GPU pipeline only has so much fill rate. Excessive overdraw stalls the
+GPU. Detect with **Debug GPU overdraw** (Dev Options); fix by removing
+redundant backgrounds.
+
+```kotlin
+// ❌ Multiple overlapping backgrounds
+Scaffold(
+    modifier = Modifier.background(Color.White),       // root
+) {
+    Column(modifier = Modifier.background(Color.White)) {  // unnecessary
+        Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+            Text("Hello")
+        }
+    }
+}
+
+// ✅ One background; transparent children
+Scaffold(modifier = Modifier.background(MaterialTheme.colorScheme.surface)) {
+    Column {
+        Card { Text("Hello") }
+    }
+}
+```
+
+### 7. RecyclerView ViewHolder bind cost
+
+```kotlin
+override fun onBindViewHolder(holder: ViewHolder, position: Int) {
+    val item = items[position]
+    holder.title.text = item.title
+    holder.subtitle.text = item.subtitleFormatter.format(item)    // ❌ formatting per bind
+    Glide.with(holder.itemView).load(item.imageUrl).into(holder.image)
+}
+
+// ✅ Precompute in ViewModel
+data class ItemUiModel(val title: String, val subtitle: String, val imageUrl: String)
+
+override fun onBindViewHolder(holder: ViewHolder, position: Int) {
+    val ui = items[position]
+    holder.title.text = ui.title
+    holder.subtitle.text = ui.subtitle
+    Glide.with(holder.itemView).load(ui.imageUrl).into(holder.image)
+}
+```
+
+Precompute display strings in the ViewModel mapping — `bind` becomes
+pure assignment.
+
+### 8. Reflection / costly lookups
+
+```kotlin
+// ❌ Reflection per access
+Class.forName(packageName).getMethod("getInfo").invoke(...)
+
+// ✅ Cache or replace with direct call
+```
+
+Anything reflection-based is slow. Common offenders: Gson (replace with
+Moshi/kotlinx-serialization), older annotation processors (replace kapt
+with KSP).
+
+### 9. Window animations slowing down low-end devices
+
+Developer Options → **Animator duration scale**. Setting to 0 disables
+animations entirely. Many users keep this off — your animations should
+respect the system scale.
+
+```kotlin
+val scale = Settings.Global.getFloat(
+    context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f
+)
+val effectiveDuration = (baseDurationMs * scale).toInt()
+```
+
+### 10. Long inflate on startup
+
+```kotlin
+override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    setContentView(R.layout.activity_main)        // could be slow for complex XML
+}
+```
+
+For Compose: `setContent { App() }` instead. Compose avoids the XML
+inflate cost.
+
+For unavoidable XML: use `AsyncLayoutInflater` to inflate off-main.
+
+---
+
+## Compose-specific jank causes
+
+### Unstable parameters
+
+If a composable receives a `List<T>` or any mutable type, Compose can't
+prove the value hasn't changed and re-composes regardless.
+
+**Fix**: `@Immutable` data classes + `ImmutableList<T>` from
+kotlinx.collections.immutable.
+
+### Reading state in parents
+
+```kotlin
+// ❌ Parent recomposes on every scroll position change
+@Composable
+fun Screen(listState: LazyListState) {
+    Text("Position: ${listState.firstVisibleItemIndex}")    // reads state
+    LazyColumn(state = listState) { /* items */ }
+}
+
+// ✅ Defer reads to children
+@Composable
+fun Screen(listState: LazyListState) {
+    Text(text = derivedStateOf { "Position: ${listState.firstVisibleItemIndex}" }
+        .let { remember { it } }.value)
+    LazyColumn(state = listState) { /* items */ }
+}
+```
+
+`derivedStateOf` only invalidates when the **result** changes — not on
+every input change. Saves huge amounts of recomposition.
+
+### Large lambdas captured
+
+```kotlin
+@Composable
+fun ProductCard(product: Product) {
+    val viewModel: ViewModel = hiltViewModel()
+    Column(modifier = Modifier.clickable {
+        viewModel.onProductSelected(product)        // captures product + viewModel
+    }) { /* ... */ }
+}
+
+// Better — hoist the callback as a function reference
+@Composable
+fun ProductCard(product: Product, onProductSelected: (Product) -> Unit) {
+    Column(modifier = Modifier.clickable { onProductSelected(product) }) { /* ... */ }
+}
+```
+
+Stable callback references survive recomposition — Compose can skip the
+card if `product` is reference-equal.
+
+---
+
+## Choreographer instrumentation
+
+For surgical investigation:
+
+```kotlin
+Choreographer.getInstance().postFrameCallback(object : Choreographer.FrameCallback {
+    private var lastFrame = 0L
+    override fun doFrame(frameTimeNanos: Long) {
+        if (lastFrame != 0L) {
+            val delta = (frameTimeNanos - lastFrame) / 1_000_000
+            if (delta > 16) Log.w("Jank", "Frame: ${delta}ms")
+        }
+        lastFrame = frameTimeNanos
+        Choreographer.getInstance().postFrameCallback(this)
+    }
+})
+```
+
+Log every frame slower than 16 ms with a timestamp. Useful when you need
+correlation with specific events.
+
+---
+
+## Performance budgets per screen
+
+| Screen type           | P99 frame time target | P99 cold start target |
+|-----------------------|-----------------------|------------------------|
+| Main / home           | < 16 ms (60Hz)        | < 1.5 s                |
+| Detail / hero         | < 16 ms               | < 1.0 s                |
+| Animated / interactive| < 11 ms (90Hz)        | n/a                    |
+| Scroll-heavy lists    | < 16 ms               | < 1.0 s                |
+| Camera / video        | < 11 ms (90Hz)        | < 2.0 s                |
+
+Track per-screen via JankStats. Regressions block release.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Jank causes',
+    variant: 'old',
+    points: [
+      'Main thread I/O (file, db, network)',
+      'Compose lambda capture of unstable types',
+      'Overdraw from redundant backgrounds',
+      'Allocations per frame',
+      'Synchronous bitmap decoding',
+      'Reflection in hot paths'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Smooth UI',
+    variant: 'new',
+    points: [
+      'Dispatchers.IO + Dispatchers.Default for work',
+      '@Immutable + ImmutableList; stable callbacks',
+      'Single background; transparent children',
+      'remember { ... } for paint, paths, brushes',
+      'Coil / Glide with size constraints',
+      'KSP, kotlinx-serialization, no runtime reflection'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Jank hunting rules">
+- **16.67 ms / 11.11 ms / 8.33 ms** frame budgets at 60/90/120 Hz.
+- **JankStats** in production for real-user data.
+- **Macrobenchmark + FrameTimingMetric** in CI to prevent regressions.
+- **Layout Inspector recomposition counts** — diagnose unstable composables.
+- **Perfetto** for deep traces; annotate with `trace { }`.
+- **Common fixes**: stable Compose inputs, no main-thread I/O, kill overdraw, allocate once.
+- **Per-screen frame budgets** in your observability dashboard.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Profile GPU rendering bars', description: 'Enable in Developer Options. Walk through 3 screens. Identify which screen exceeds the 16ms line.' },
+  { title: 'JankStats integration', description: 'Wire JankStats.createAndTrack on every Activity. Ship metrics to Firebase / your observability backend.' },
+  { title: 'Layout Inspector audit', description: 'Open Layout Inspector with recomposition counts on a list screen. Identify composables that recompose without skipping. Fix one.' },
+  { title: 'Macrobenchmark a scroll', description: 'Write a Macrobenchmark for your main scroll. Capture FrameTimingMetric. Establish a baseline; set a CI threshold.' },
+  { title: 'Perfetto trace', description: 'Capture a System Trace during a janky moment. Find the longest frame; identify the cause (main-thread work, GC, layout, etc).' }
+]} />
+
+## Next
+
+Continue to **[APK Size Optimization](./apk-size)** for shipping smaller
+binaries.

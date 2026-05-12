@@ -1,0 +1,533 @@
+---
+id: memory-leakcanary
+title: Memory Profiling & LeakCanary
+sidebar_label: Memory & LeakCanary
+description: Finding memory leaks with LeakCanary, Android Studio Memory Profiler, heap dump analysis, common leak patterns, and the OOM prevention playbook.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Memory Profiling & LeakCanary
+
+Memory leaks are silent killers — your app works fine in QA, ships, then
+crashes for users with 6 hours of session time. This chapter covers the
+detection tools (LeakCanary, Android Studio Profiler), the common leak
+patterns Android developers hit repeatedly, and the OOM prevention
+playbook.
+
+## Why memory matters
+
+Android kills apps that use too much heap. The JVM heap on a typical
+phone is 256-512 MB. Cross that and your app receives `OutOfMemoryError`
+or gets killed by the OOM killer — users see a crash or a force-close.
+
+Less dramatically: high memory pressure triggers more GC pauses → frame
+drops → janky UI. Memory leaks slowly retain views, bitmaps, or
+Activities that should have been freed, eating into the budget.
+
+---
+
+## LeakCanary — the leak detector
+
+LeakCanary auto-detects retained references that should have been garbage
+collected. **One-line setup**, runs in debug builds only.
+
+```kotlin
+// libs.versions.toml
+leakcanary = { module = "com.squareup.leakcanary:leakcanary-android", version = "2.14" }
+
+dependencies {
+    debugImplementation(libs.leakcanary)
+}
+```
+
+That's it. No initialization code. LeakCanary auto-starts on first
+debug build.
+
+### How it works
+
+1. When an Activity / Fragment / View is destroyed, LeakCanary keeps a
+   `WeakReference` to it.
+2. After a delay + GC, it checks whether the WeakReference cleared.
+3. If still referenced, LeakCanary dumps the heap, computes the
+   shortest-path-to-GC-root, and pops a notification with the leak
+   trace.
+
+### Reading a LeakCanary report
+
+```text
+┌───────────────────────────────────────────────────────────────┐
+│  LEAK CAN BE FIXED BY APPS                                    │
+│                                                                │
+│  GC Root: System class                                         │
+│                                                                │
+│  Thread: main (PID: 12345)                                     │
+│   │                                                            │
+│   ├─ static SingletonHolder                                    │
+│   │    .instance                                                │
+│   │    ↓                                                        │
+│   ├─ AnalyticsTracker.context                                   │
+│   │    ↓ (this Context is leaking ProfileActivity)             │
+│   ├─ ProfileActivity                                            │
+│   │    .someField                                                │
+│   │    ↓                                                        │
+│   └─ Leaks: ProfileActivity                                    │
+└───────────────────────────────────────────────────────────────┘
+```
+
+Read **top to bottom**: GC root → object holding the reference → object
+that's leaked. The chain shows you exactly what to fix.
+
+**Fix in this example**: `AnalyticsTracker` is a singleton holding the
+`Activity` context. Pass `application` context instead, or scope
+AnalyticsTracker to the Activity lifecycle.
+
+### Common leak patterns
+
+#### Activity leaked by a Singleton
+
+```kotlin
+// ❌ Singleton retains Activity
+@Singleton
+class Analytics @Inject constructor(private val context: Context) {
+    // If you @Inject Context here, Hilt provides Application — but
+    // someone might bind it to ActivityContext by mistake
+}
+
+// ✅ Bind @ApplicationContext explicitly
+@Singleton
+class Analytics @Inject constructor(
+    @ApplicationContext private val context: Context
+) { ... }
+```
+
+#### Listener / callback never removed
+
+```kotlin
+class MyActivity : AppCompatActivity() {
+    private val listener = object : LocationCallback() {
+        override fun onLocationResult(result: LocationResult) { /* ... */ }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        fusedClient.requestLocationUpdates(request, listener, mainLooper)
+        // ❌ Never removed — fusedClient holds listener, listener holds Activity
+    }
+
+    // ✅ Paired removeLocationUpdates
+    override fun onDestroy() {
+        super.onDestroy()
+        fusedClient.removeLocationUpdates(listener)
+    }
+}
+```
+
+Modern fix: use `lifecycle.coroutineScope.launch + flow + repeatOnLifecycle(STARTED)`.
+
+#### Static reference to View
+
+```kotlin
+class MyActivity : AppCompatActivity() {
+    companion object {
+        var cachedView: View? = null    // ❌ leaks Activity via View → Context
+    }
+}
+```
+
+Anything `static` (or `companion object`) holding a View / Context
+**will leak**. Use weak references or, better, redesign to not need it.
+
+#### Inner classes capturing outer
+
+```kotlin
+class MyActivity : AppCompatActivity() {
+    inner class MyTimerTask : TimerTask() {        // ❌ inner — captures Activity
+        override fun run() { /* ... */ }
+    }
+}
+
+// ✅ Static / top-level class
+class MyTimerTask(private val weakActivity: WeakReference<MyActivity>) : TimerTask() {
+    override fun run() {
+        weakActivity.get()?.doSomething()
+    }
+}
+
+// Or in Kotlin: avoid `inner` keyword
+class MyTimerTask : TimerTask() { /* doesn't capture */ }
+```
+
+#### Handlers with delayed messages
+
+```kotlin
+class MyActivity : AppCompatActivity() {
+    private val handler = Handler(Looper.getMainLooper())
+
+    fun postDelayed() {
+        handler.postDelayed({
+            // ❌ Lambda captures `this` Activity
+            updateUi()
+        }, 10_000)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        handler.removeCallbacksAndMessages(null)    // ✅
+    }
+}
+```
+
+#### ViewBinding in Fragments
+
+```kotlin
+class MyFragment : Fragment() {
+    private var _binding: FragmentMyBinding? = null
+    private val binding get() = _binding!!
+
+    override fun onCreateView(/* ... */): View {
+        _binding = FragmentMyBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onDestroyView() {
+        _binding = null         // ✅ critical — Fragment outlives its view
+        super.onDestroyView()
+    }
+}
+```
+
+The Fragment instance survives in the back stack while its View
+hierarchy is destroyed. Holding a non-null `binding` after
+`onDestroyView` leaks the entire View tree.
+
+---
+
+## Android Studio Memory Profiler
+
+For deeper analysis or non-leak issues (just "we use a lot of memory"):
+
+1. Run app on device
+2. Tools → Profiler → Memory tab
+3. Watch heap usage over time
+4. Click **Record** to capture allocations
+5. Click **Capture heap dump** for instant snapshot
+
+### Heap dump analysis
+
+```text
+Class                       Count        Size       Total
+Bitmap                      45           5.2 MB     45 MB    ← suspect
+StringBuilder               12,453       0.5 KB     6 MB
+HashMap$Node                89,234       28 B       2.4 MB
+```
+
+Sort by Total. Anything > 5 MB merits investigation.
+
+Click a class → see **instances**. Click an instance → see **references**
+holding it (the leak chain).
+
+### Native memory
+
+Android Studio also profiles **native** memory (NDK / Skia / texture
+caches). Check if your Bitmap pool or image cache is growing
+unbounded.
+
+### Allocation tracking
+
+Record allocations for 30 seconds while interacting with a screen:
+
+```text
+Class                  Allocations   Size
+String                 12,345         500 KB
+ProductDto             3,200          150 KB
+Lambda$$inlined        5,000          80 KB     ← suspicious lambda allocation
+```
+
+5,000 lambda allocations in 30 seconds means a hot path is creating
+fresh lambdas on every frame — common in Compose composables that fail
+the stability check. See [Compose Performance](/docs/jetpack-compose/performance).
+
+---
+
+## Bitmap management
+
+Bitmaps are the #1 memory hog:
+
+```kotlin
+// 4K image: 4032 × 3024 × 4 bytes = 49 MB
+val bitmap = BitmapFactory.decodeFile(path)
+```
+
+### Always decode at target size
+
+```kotlin
+fun decodeSampledBitmap(path: String, reqWidth: Int, reqHeight: Int): Bitmap? {
+    val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, options)
+
+    var sampleSize = 1
+    while (options.outHeight / sampleSize > reqHeight &&
+           options.outWidth / sampleSize > reqWidth) {
+        sampleSize *= 2
+    }
+
+    options.inJustDecodeBounds = false
+    options.inSampleSize = sampleSize
+    options.inPreferredConfig = Bitmap.Config.RGB_565   // 50% memory if no transparency
+
+    return BitmapFactory.decodeFile(path, options)
+}
+```
+
+Coil and Glide do this automatically — see [Image Loading](/docs/networking-api/image-loading).
+Roll your own only for non-standard sources.
+
+### Bitmap config
+
+| Config         | Bytes/pixel | When                                  |
+|----------------|-------------|---------------------------------------|
+| `ARGB_8888`    | 4           | Default; transparency + full color    |
+| `RGB_565`      | 2           | No transparency; solid photos        |
+| `ARGB_4444`    | 2           | Deprecated; visible banding           |
+| `HARDWARE`     | n/a         | Lives in GPU; can't be modified       |
+
+For photo galleries, `RGB_565` saves 50% memory. Photo apps that lean on
+this configuration can hold twice as many thumbnails.
+
+### Recycle when done
+
+```kotlin
+val bitmap: Bitmap = ...
+// ... use it
+bitmap.recycle()    // releases native memory; the Bitmap is unusable after
+```
+
+Coil / Glide handle this automatically. For manual decode, `recycle()`
+is mandatory.
+
+---
+
+## RecyclerView memory tips
+
+```kotlin
+class ProductAdapter : RecyclerView.Adapter<ViewHolder>() {
+    override fun onViewRecycled(holder: ViewHolder) {
+        super.onViewRecycled(holder)
+        Glide.with(holder.itemView.context).clear(holder.imageView)
+    }
+}
+```
+
+Always clear bitmap loads in `onViewRecycled`. Without it, scrolling a
+1000-item list pins 1000 bitmaps in memory.
+
+`RecyclerView.setHasFixedSize(true)` enables further optimizations
+(reuse same-size ViewHolders without re-measuring).
+
+---
+
+## Compose memory tips
+
+### Avoid `lambda` capture of unstable types
+
+```kotlin
+// ❌ Lambda captures the unstable list — re-allocated on every parent recompose
+@Composable
+fun Parent(viewModel: VM) {
+    val items: List<Item> = viewModel.items
+    LazyColumn {
+        items(items) { item ->
+            ItemRow(item, onClick = { viewModel.click(item) })   // captures `viewModel`
+        }
+    }
+}
+
+// ✅ Hoist callback so it's stable
+@Composable
+fun Parent(viewModel: VM) {
+    val items by viewModel.items.collectAsState()
+    val onClick = remember(viewModel) { { id: String -> viewModel.click(id) } }
+    LazyColumn {
+        items(items, key = { it.id }) { item ->
+            ItemRow(item = item, onClick = { onClick(item.id) })
+        }
+    }
+}
+```
+
+See [Compose Performance](/docs/jetpack-compose/performance) for the
+full stability + skippability story.
+
+### remember a heavy object
+
+```kotlin
+@Composable
+fun ChartScreen() {
+    val expensiveCalculation = remember {       // computed once
+        computeChartPoints()
+    }
+    Chart(expensiveCalculation)
+}
+```
+
+Without `remember`, the calculation runs every recomposition. With it,
+the result is cached for the composition lifetime.
+
+---
+
+## ProcessLifecycle + LowMemoryListener
+
+Listen for system memory pressure:
+
+```kotlin
+class MyApp : Application(), ComponentCallbacks2 {
+
+    override fun onCreate() {
+        super.onCreate()
+        registerComponentCallbacks(this)
+    }
+
+    override fun onTrimMemory(level: Int) {
+        when (level) {
+            ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE -> { /* moderate */ }
+            ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> { imageCache.clear() }
+            ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> { imageCache.clear(); db.clear() }
+            ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN -> { releaseUiResources() }
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {}
+    override fun onLowMemory() {
+        imageCache.clear()
+    }
+}
+```
+
+Drop caches when the system is under pressure — your app survives the
+OOM killer longer.
+
+---
+
+## OOM diagnosis checklist
+
+When users report OOM:
+
+<StepList steps={[
+  { title: 'Check Crashlytics for OutOfMemoryError', description: 'Look at the stack trace. Common culprits: BitmapFactory.decodeStream, Bitmap.createBitmap, ArrayList grow.' },
+  { title: 'Repro on a low-RAM device', description: 'Android Studio emulator with 1 GB RAM. Often the issue only appears on real-world budget phones.' },
+  { title: 'Run with LeakCanary in debug', description: 'Walk through the user\'s reported flow. Any leak notifications? Fix in order of frequency.' },
+  { title: 'Heap dump at the crash point', description: 'Memory Profiler → capture heap dump just before the OOM scenario. Inspect what\'s holding the most memory.' },
+  { title: 'Check image sizes', description: 'Are bitmaps decoded at display size or original? AsyncImage without Modifier.size is a classic culprit.' },
+  { title: 'Audit ImageLoader cache sizes', description: 'Coil memoryCache.maxSizePercent default is 25% — drop to 15% for memory-constrained apps.' }
+]} />
+
+---
+
+## Strict Mode — catch leaks in debug
+
+```kotlin
+class MyApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        if (BuildConfig.DEBUG) {
+            StrictMode.setThreadPolicy(StrictMode.ThreadPolicy.Builder()
+                .detectDiskReads()
+                .detectDiskWrites()
+                .detectNetwork()
+                .penaltyLog()
+                .penaltyFlashScreen()
+                .build())
+
+            StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder()
+                .detectActivityLeaks()
+                .detectLeakedClosableObjects()
+                .detectLeakedRegistrationObjects()
+                .detectLeakedSqlLiteObjects()
+                .penaltyLog()
+                .build())
+        }
+    }
+}
+```
+
+StrictMode penalties make leaks visible during dev. Pairs well with
+LeakCanary — LeakCanary catches Activity / Fragment leaks; StrictMode
+catches resource leaks (sockets, cursors).
+
+---
+
+## Memory budget targets
+
+| Memory metric              | Target                                       |
+|----------------------------|----------------------------------------------|
+| Total heap (steady state)  | < 100 MB                                     |
+| Total heap (peak)          | < 200 MB                                     |
+| Bitmap memory              | < 40% of total                               |
+| Time to GC                 | < 50 ms                                      |
+| OOM-killer kill rate       | < 0.1% of sessions                           |
+
+Real-world apps run higher (e.g., camera apps with heavy bitmap usage).
+Aim low on screens that don't justify it.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Memory leaks',
+    variant: 'old',
+    points: [
+      'Static / companion object holding Activity / Context',
+      'Listeners registered without removal',
+      'Bitmaps decoded at original resolution',
+      'Inner classes capturing outer Activity',
+      'No clear(view) on RecyclerView item recycle',
+      'Fragment ViewBinding not nulled in onDestroyView'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Memory-safe code',
+    variant: 'new',
+    points: [
+      'Singleton dependencies via Hilt @ApplicationContext',
+      'DisposableEffect / repeatOnLifecycle for listeners',
+      'Modifier.size in AsyncImage; inSampleSize in raw decode',
+      'Static / top-level classes; WeakReference if needed',
+      'Glide.clear(view) / Coil auto-disposes',
+      'private var _binding = null in onDestroyView'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Memory rules">
+- **LeakCanary** in debug builds — catches Activity / Fragment leaks automatically.
+- **Memory Profiler** for heap dumps; sort allocations by Total size.
+- **Bitmaps**: decode at display size, use RGB_565 where transparency isn't needed.
+- **RecyclerView**: `clear(view)` on recycle; **Fragment**: null binding in onDestroyView.
+- **StrictMode** catches resource leaks (sockets, cursors) in debug.
+- **`onTrimMemory`** + cache clearing helps survive system pressure.
+- Target < 100 MB steady-state heap for typical apps.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Add LeakCanary', description: 'Add the dependency. Run your app, navigate through the primary flow, force GC. Fix any leak notifications.' },
+  { title: 'Heap dump audit', description: 'Capture a heap dump from your most memory-hungry screen. Find the top 3 classes by Total size; investigate if any are unexpected.' },
+  { title: 'Bitmap optimization', description: 'Find one AsyncImage / ImageView in your app without explicit size. Add a size; measure memory delta with the profiler.' },
+  { title: 'StrictMode setup', description: 'Add StrictMode VmPolicy in debug builds with detectActivityLeaks + penaltyLog. Fix every printed violation.' },
+  { title: 'OOM canary screen', description: 'Build a stress-test screen that loads 100 large images. Confirm your ImageLoader + RecyclerView clear pattern survives without OOM.' }
+]} />
+
+## Next
+
+Continue to **[Jank Hunting](./jank-hunting)** for frame-timing issues
+or **[APK Size Optimization](./apk-size)** for binary size.

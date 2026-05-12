@@ -1,0 +1,54 @@
+---
+id: overview
+title: Library & Open Source
+sidebar_label: Overview
+description: Building, publishing, and contributing to the Android library ecosystem — Maven Central, AOSP, Jetpack, and your own open-source projects.
+slug: /library-ecosystem
+---
+
+import { Callout, FeatureGrid, StepList } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Section:</strong> Library & Open Source</span>
+  <span><strong>Topics:</strong> 2 chapters</span>
+  <span><strong>Prerequisites:</strong> Module 14 (Gradle)</span>
+</div>
+
+# Library & Open Source
+
+Most developers consume libraries. Few publish them. Even fewer contribute
+upstream. **Publishing a library** elevates your profile, deepens your
+understanding of API design, and gives back to the community.
+**Contributing to AOSP / Jetpack** is the highest-prestige Android work
+and one of the strongest signals on a resume.
+
+This section covers both ends:
+
+<FeatureGrid columns={2} features={[
+  { icon: '📦', title: 'Building Libraries', description: 'Designing public APIs, semantic versioning, Maven Central publishing, JitPack, documentation, multi-platform libraries.' },
+  { icon: '🌍', title: 'Open Source Contribution', description: 'Contributing to AOSP, Jetpack, third-party libraries. Issue triage, PR etiquette, code review, becoming a committer.' }
+]} />
+
+## When to publish a library
+
+<StepList steps={[
+  { title: 'You\'ve solved a generic problem 3 times', description: 'If you\'ve written the same retry-with-backoff helper for three different projects, it\'s a library.' },
+  { title: 'Your team needs to share code across apps', description: 'Internal libraries — same publishing pipeline, private Maven repo.' },
+  { title: 'You want to grow your profile / network', description: 'Published libraries with traction (>100 stars, >1k downloads) are powerful resume signals.' },
+  { title: 'You want to learn API design', description: 'Library authors face design pressure 10× greater than app authors. Sharpens skills.' }
+]} />
+
+## Why contribute upstream
+
+- **Signal**: a Jetpack contribution is interview catnip.
+- **Learning**: reviewing core-library code teaches patterns you'd never see elsewhere.
+- **Influence**: your patch affects millions of apps.
+- **Recognition**: Google credits external contributors in release notes.
+
+Most contributions are **small** — a doc fix, a missing default, a bug
+fix. Don't aim for the heroic 5000-line PR on your first attempt.
+
+## Chapters
+
+- **[Publishing Libraries](/docs/library-ecosystem/publishing-libraries)** — Maven Central, JitPack, semver, API design, documentation
+- **[Open Source Contribution](/docs/library-ecosystem/open-source-contribution)** — AOSP, Jetpack, third-party libraries, becoming a committer

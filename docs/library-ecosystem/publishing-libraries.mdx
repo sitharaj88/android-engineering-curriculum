@@ -1,0 +1,666 @@
+---
+id: publishing-libraries
+title: Publishing Libraries
+sidebar_label: Publishing Libraries
+description: Designing public APIs, semantic versioning, publishing to Maven Central + JitPack, documentation with Dokka, KMP libraries.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Publishing Libraries
+
+A published library is an interface contract with every consumer.
+Get it right and they thank you with stars and PRs. Get it wrong and
+you'll spend years patching breaking changes. This chapter covers API
+design, packaging, and the actual publishing pipeline.
+
+## API design — start here
+
+### The five rules
+
+<StepList steps={[
+  { title: 'Public surface is forever', description: 'Anything publicly visible (class, function, property, parameter name) is your forever contract. Default to internal/private; make public only what you commit to maintain.' },
+  { title: 'Backwards compatibility, always', description: 'Patch + minor releases must not break consumers. Adding a parameter? Make it have a default. Adding a method? Default implementation. Renaming? Deprecate and ship both.' },
+  { title: 'Be hard to misuse', description: 'Required parameters first, optional with defaults later. Sealed types over magic strings. Builder for >5 params; data class with named args otherwise.' },
+  { title: 'Pit of success', description: 'The easy path should be the right path. If users naturally write `Foo()`, that constructor should work safely.' },
+  { title: 'Document why, not what', description: 'Code shows what. Documentation explains why this API exists, what problem it solves, when to use it.' }
+]} />
+
+### Visibility discipline
+
+```kotlin
+// ❌ Internal helpers exposed
+class HttpClient(val timeout: Duration) {
+    val cache = mutableMapOf<String, Response>()         // public — consumers will depend on it
+    fun get(url: String): Response {
+        return cache[url] ?: fetchFresh(url).also { cache[url] = it }
+    }
+    fun fetchFresh(url: String): Response = TODO()       // public — exposes internals
+}
+
+// ✅ Minimal public surface
+class HttpClient internal constructor(
+    private val timeout: Duration,
+    private val cache: MutableMap<String, Response>
+) {
+    fun get(url: String): Response {
+        return cache[url] ?: fetchFresh(url).also { cache[url] = it }
+    }
+    private fun fetchFresh(url: String): Response = TODO()
+
+    companion object {
+        operator fun invoke(timeout: Duration = 30.seconds): HttpClient =
+            HttpClient(timeout, mutableMapOf())
+    }
+}
+```
+
+Default everything to `internal` or `private`. Public only when you've
+**decided** it's part of the API.
+
+### Stable IDs over magic strings
+
+```kotlin
+// ❌ Magic string
+fun setHeader(name: String, value: String)
+client.setHeader("Authorization", "Bearer $token")     // typos compile
+
+// ✅ Enum / sealed / value class
+@JvmInline
+value class HeaderName(val value: String) {
+    companion object {
+        val Authorization = HeaderName("Authorization")
+        val ContentType = HeaderName("Content-Type")
+    }
+}
+
+fun setHeader(name: HeaderName, value: String)
+client.setHeader(HeaderName.Authorization, "Bearer $token")
+```
+
+Typos are compile errors. IDE auto-completes the named constants.
+
+### Default parameters > overloads
+
+```kotlin
+// ❌ Java-style overloads
+fun connect(host: String): Connection
+fun connect(host: String, port: Int): Connection
+fun connect(host: String, port: Int, timeout: Duration): Connection
+fun connect(host: String, port: Int, timeout: Duration, tls: Boolean): Connection
+
+// ✅ Defaults — one function, all combinations
+fun connect(
+    host: String,
+    port: Int = 443,
+    timeout: Duration = 30.seconds,
+    tls: Boolean = true
+): Connection
+```
+
+Cleaner API, named arguments at call sites, easier to extend.
+
+### Lambda over interface for single-method types
+
+```kotlin
+// ❌ One-method interface
+interface OnClickListener { fun onClick(v: View) }
+fun setOnClick(listener: OnClickListener)
+view.setOnClick(object : OnClickListener { override fun onClick(v: View) = ... })
+
+// ✅ Function type
+fun setOnClick(listener: (View) -> Unit)
+view.setOnClick { v -> ... }
+```
+
+For Java interop, `fun interface` (SAM) gives you both:
+
+```kotlin
+fun interface OnClickListener {
+    fun onClick(v: View)
+}
+// Kotlin: view.setOnClick { v -> ... }
+// Java: view.setOnClick(v -> ...);
+```
+
+---
+
+## Module structure
+
+```text
+my-library/
+├── library/                            ← published artifact
+│   ├── build.gradle.kts
+│   └── src/main/kotlin/
+│       └── com/myorg/mylib/
+│           ├── PublicApi.kt
+│           ├── internal/
+│           └── ...
+├── sample-app/                         ← consumer demonstrating usage
+│   ├── build.gradle.kts
+│   └── src/main/kotlin/...
+├── docs/                                ← usage guide, getting started
+├── README.md
+├── CHANGELOG.md
+├── LICENSE
+└── build.gradle.kts (root)
+```
+
+Always ship a **sample app**. It's the primary test that your library
+works from a consumer's perspective + the best documentation.
+
+---
+
+## Semantic versioning
+
+```text
+MAJOR.MINOR.PATCH
+  ↓     ↓      ↓
+  1.    2.     3
+breaking add bug
+change   feat fix
+```
+
+| Change                              | Bump          |
+|-------------------------------------|---------------|
+| Bug fix (no API change)            | PATCH (1.2.3 → 1.2.4) |
+| New feature (backwards compatible) | MINOR (1.2.4 → 1.3.0) |
+| Breaking change                    | MAJOR (1.3.0 → 2.0.0) |
+
+### What counts as breaking
+
+- Removing a public class / function / property
+- Renaming any of the above
+- Changing parameter order (without defaults)
+- Changing return type
+- Changing exception types thrown
+- Adding required abstract method to an open class
+
+### What is NOT breaking
+
+- Adding a new public function / class
+- Adding a parameter with a default value (Kotlin) — though for Java
+  consumers this is breaking; ship `@JvmOverloads`
+- Adding a non-required default method to an interface
+- Bug fixes that don't change behavior
+
+### Pre-1.0 is the wild west
+
+Convention: < 1.0.0 means "anything can change." Use `0.1.0`, `0.2.0`,
+... while figuring out the API. Hit `1.0.0` when you commit to stability.
+
+---
+
+## Publishing to Maven Central
+
+The most widely-used Android library repository. Free, requires
+verification.
+
+### Setup
+
+1. **Sonatype JIRA account** — create at issues.sonatype.org
+2. **Open a New Project ticket** — claim a `groupId` (typically your
+   reverse domain, e.g., `com.myorg`)
+3. **Verify ownership** — DNS record or matching GitHub repo
+4. **PGP key** — generate, upload to OpenPGP keyserver
+
+```bash
+gpg --gen-key
+gpg --list-secret-keys --keyid-format LONG
+gpg --keyserver keyserver.ubuntu.com --send-keys YOUR_KEY_ID
+gpg --export-secret-keys YOUR_KEY_ID > secring.gpg
+```
+
+### Build config
+
+```kotlin
+// library/build.gradle.kts
+plugins {
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
+    id("maven-publish")
+    id("signing")
+}
+
+android {
+    namespace = "com.myorg.mylib"
+    compileSdk = 35
+    defaultConfig {
+        minSdk = 24
+        consumerProguardFiles("consumer-rules.pro")
+    }
+    publishing {
+        singleVariant("release") {
+            withSourcesJar()
+            withJavadocJar()
+        }
+    }
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            create<MavenPublication>("release") {
+                from(components["release"])
+
+                groupId = "com.myorg"
+                artifactId = "mylib"
+                version = "1.0.0"
+
+                pom {
+                    name.set("MyLib")
+                    description.set("A description of what it does.")
+                    url.set("https://github.com/myorg/mylib")
+
+                    licenses {
+                        license {
+                            name.set("The Apache License, Version 2.0")
+                            url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
+                        }
+                    }
+                    developers {
+                        developer {
+                            id.set("alex")
+                            name.set("Alex Doe")
+                            email.set("alex@myorg.com")
+                        }
+                    }
+                    scm {
+                        connection.set("scm:git:github.com/myorg/mylib.git")
+                        developerConnection.set("scm:git:ssh://github.com/myorg/mylib.git")
+                        url.set("https://github.com/myorg/mylib/tree/main")
+                    }
+                }
+            }
+        }
+
+        repositories {
+            maven {
+                name = "Sonatype"
+                url = uri(
+                    if (version.toString().endsWith("SNAPSHOT"))
+                        "https://s01.oss.sonatype.org/content/repositories/snapshots/"
+                    else
+                        "https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/"
+                )
+                credentials {
+                    username = providers.gradleProperty("ossrhUsername").orNull
+                    password = providers.gradleProperty("ossrhPassword").orNull
+                }
+            }
+        }
+    }
+
+    signing {
+        useInMemoryPgpKeys(
+            providers.gradleProperty("signingKey").orNull,
+            providers.gradleProperty("signingPassword").orNull
+        )
+        sign(publishing.publications["release"])
+    }
+}
+```
+
+### Publish
+
+```bash
+./gradlew publishReleasePublicationToSonatypeRepository
+```
+
+Then in Sonatype web UI: close + release the staging repository.
+Synchronizes to Maven Central in 10-30 minutes.
+
+### Easier path — `vanniktech/gradle-maven-publish-plugin`
+
+Reduces 100 lines of build config to 10:
+
+```kotlin
+plugins {
+    id("com.vanniktech.maven.publish") version "0.30.0"
+}
+
+mavenPublishing {
+    coordinates("com.myorg", "mylib", "1.0.0")
+    pom {
+        name.set("MyLib")
+        // ... same pom config
+    }
+    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL)
+    signAllPublications()
+}
+```
+
+```bash
+./gradlew publishToMavenCentral
+```
+
+Handles signing, POM generation, and the Sonatype API automatically.
+
+---
+
+## JitPack — the easy on-ramp
+
+For pre-1.0 libraries or libraries that don't need Maven Central, **JitPack**:
+
+1. Tag a release on GitHub
+2. JitPack builds + publishes automatically
+3. Consumers add JitPack to repositories + the dependency:
+
+```kotlin
+// settings.gradle.kts
+dependencyResolutionManagement {
+    repositories {
+        maven { url = uri("https://jitpack.io") }
+    }
+}
+
+// app/build.gradle.kts
+implementation("com.github.myorg:mylib:1.0.0")
+```
+
+No setup beyond a public GitHub repo. Great for proof-of-concept
+libraries.
+
+---
+
+## API documentation with Dokka
+
+```kotlin
+// libs.versions.toml
+dokka = "1.9.20"
+
+dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }
+```
+
+```kotlin
+// library/build.gradle.kts
+plugins {
+    alias(libs.plugins.dokka)
+}
+
+tasks.dokkaHtml.configure {
+    outputDirectory.set(rootDir.resolve("docs/api"))
+    moduleName.set("mylib")
+}
+```
+
+```bash
+./gradlew dokkaHtml
+```
+
+Generates HTML KDoc at `docs/api/`. Host on GitHub Pages.
+
+### KDoc — write it
+
+```kotlin
+/**
+ * Builds an HTTP client with retry and caching.
+ *
+ * Example:
+ * ```
+ * val client = HttpClient(timeout = 10.seconds)
+ * val response = client.get("https://api.example.com/data")
+ * ```
+ *
+ * @param timeout maximum duration for a single request. Default 30 seconds.
+ * @param retries number of retries on 5xx / network failure. Default 3.
+ * @sample com.myorg.mylib.samples.HttpClientSamples.basicGet
+ * @see [HttpClient.get]
+ * @since 1.0.0
+ */
+class HttpClient(
+    val timeout: Duration = 30.seconds,
+    val retries: Int = 3
+) {
+    /**
+     * Performs a GET request.
+     *
+     * @param url the absolute URL to fetch.
+     * @return the response body as a `String`.
+     * @throws HttpException on a non-2xx response after retries are exhausted.
+     */
+    suspend fun get(url: String): String { ... }
+}
+```
+
+`@sample` references an actual function — Dokka inlines its code. Keeps
+samples compiled and correct.
+
+---
+
+## Multi-platform libraries (KMP)
+
+Same publishing pipeline, plus an iOS-target artifact:
+
+```kotlin
+plugins {
+    kotlin("multiplatform")
+    id("com.vanniktech.maven.publish") version "0.30.0"
+}
+
+kotlin {
+    androidTarget { publishAllLibraryVariants() }
+    iosX64(); iosArm64(); iosSimulatorArm64()
+    jvm()
+
+    sourceSets {
+        commonMain.dependencies { ... }
+    }
+}
+```
+
+Publishes:
+- `mylib-android-1.0.0.aar` for Android consumers
+- `mylib-iosarm64-1.0.0.klib` for iOS
+- `mylib-jvm-1.0.0.jar` for desktop / server JVM
+- A `mylib-1.0.0` parent POM that resolves to the right variant per
+  consumer
+
+See [KMP Deep Dive](/docs/advanced-trending/kmp-deep-dive).
+
+---
+
+## Distribution checklist
+
+Before publishing 1.0:
+
+<StepList steps={[
+  { title: 'README with quickstart', description: '3-5 line install. 10-line "hello world" example. Link to full docs.' },
+  { title: 'CHANGELOG.md', description: 'Every release documented with type (feat / fix / breaking). Use Conventional Commits + git-cliff (Module 13).' },
+  { title: 'LICENSE file', description: 'Apache 2.0 or MIT for most. Add a license header to every source file.' },
+  { title: 'Code of Conduct + CONTRIBUTING', description: 'Even tiny libraries should have these. Use the Contributor Covenant template.' },
+  { title: 'CI runs tests + builds release', description: 'GitHub Actions: lint + test + assemble release on every PR.' },
+  { title: 'Tagged release on GitHub', description: 'Mirror the Maven Central version. Release notes copied from CHANGELOG.' },
+  { title: 'Public Dokka site', description: 'Hosted on GitHub Pages. Linked from README.' },
+  { title: 'Sample app', description: 'Demonstrates the primary usage patterns. Runnable.' },
+  { title: 'API stability tests', description: 'BinaryCompatibilityValidator catches accidental binary breakages.' }
+]} />
+
+### BinaryCompatibilityValidator
+
+```kotlin
+// libs.versions.toml
+bcv = "0.16.3"
+binary-compatibility-validator = { id = "org.jetbrains.kotlinx.binary-compatibility-validator", version.ref = "bcv" }
+
+// build.gradle.kts (root)
+plugins {
+    alias(libs.plugins.binary-compatibility-validator)
+}
+
+apiValidation {
+    nonPublicMarkers += "com.myorg.mylib.InternalApi"
+}
+```
+
+```bash
+./gradlew apiCheck                    # verify no API drift
+./gradlew apiDump                      # update the snapshot after intentional changes
+```
+
+CI fails on any inadvertent public API change. Maintainers explicitly
+update the API dump for intentional breaking changes.
+
+---
+
+## Versioning strategy
+
+### Public version
+
+```kotlin
+version = "1.4.0"
+```
+
+### Snapshots
+
+For trunk-based development between releases:
+
+```kotlin
+version = "1.5.0-SNAPSHOT"
+```
+
+Snapshots go to Sonatype Snapshots repo; consumers can opt in. Useful
+for pre-release testing.
+
+### Beta / RC
+
+```kotlin
+version = "2.0.0-beta01"
+version = "2.0.0-rc1"
+```
+
+Communicate "this is the upcoming major; try it; report bugs."
+
+---
+
+## Deprecation
+
+```kotlin
+@Deprecated(
+    message = "Use `request(url).body()` instead. Will be removed in 2.0.",
+    replaceWith = ReplaceWith("request(url).body()"),
+    level = DeprecationLevel.WARNING
+)
+fun fetchBody(url: String): String = request(url).body()
+```
+
+Lifecycle:
+- 1.5.0 — deprecated WARNING
+- 1.6.0 — still WARNING
+- 1.7.0 — DeprecationLevel.ERROR (breaks compile, easy to ignore is gone)
+- 2.0.0 — removed
+
+Give consumers 2-3 minor releases to migrate.
+
+### `replaceWith` is a superpower
+
+IDE offers "Replace with replaceWith" intention action — automatic
+migration with one click. Use it liberally to make breaking changes
+easier.
+
+---
+
+## ProGuard / R8 consumer rules
+
+For consumers' R8 / ProGuard:
+
+```proguard
+# library/consumer-rules.pro
+-keep class com.myorg.mylib.PublicApi { *; }
+
+# Don't strip @InternalApi-annotated members in obfuscation
+-keepclassmembers class * {
+    @com.myorg.mylib.InternalApi *;
+}
+```
+
+```kotlin
+// library/build.gradle.kts
+android {
+    defaultConfig {
+        consumerProguardFiles("consumer-rules.pro")
+    }
+}
+```
+
+Consumers automatically inherit your keep rules. Saves them from
+"library X works in debug but crashes in release" support tickets.
+
+---
+
+## Marketing
+
+Beyond technical correctness, libraries succeed with attention:
+
+- **Twitter / Bluesky** announcement on release
+- **r/androiddev** post
+- **Android Weekly** newsletter submission
+- **Conference talk** at Droidcon / KotlinConf
+- **Blog post** on the design decisions
+- **OSS Awards** for established libraries
+
+Discoverability matters more than code quality at adoption time. A great
+library nobody uses is just a great library.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Library anti-patterns',
+    title: 'What hurts',
+    variant: 'old',
+    points: [
+      'No semver — breaking changes in PATCH releases',
+      'Everything public by default',
+      'Static singletons that conflict with consumer DI',
+      'No deprecation period — instant removal',
+      'No sample app',
+      'KDoc missing or generated boilerplate'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Loved libraries',
+    variant: 'new',
+    points: [
+      'Strict semver; BCV check in CI',
+      'internal/private by default',
+      'DI-friendly (constructor injection)',
+      '2-3 release deprecation window',
+      'Runnable sample app',
+      'KDoc with @sample for every public API'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Library publishing rules">
+- **Public API is forever** — be deliberate about what's exposed.
+- **Semver strictly**; **BinaryCompatibilityValidator** in CI.
+- **Maven Central** for serious libraries; **JitPack** for fast iteration.
+- **Vanniktech plugin** simplifies Sonatype publishing.
+- **KDoc + Dokka + GitHub Pages** for documentation.
+- **Sample app** demonstrates real-world usage.
+- **Deprecate with `ReplaceWith`** for IDE-driven migrations.
+- **Consumer ProGuard rules** save downstream debugging.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Design a small library', description: 'Pick a problem (retry helper, lifecycle-aware Flow operator, color contrast checker). Sketch the API surface in 50 lines.' },
+  { title: 'Publish to JitPack', description: 'Push your library to GitHub. Tag v0.1.0. Consume it from a sample app via JitPack — verify it works.' },
+  { title: 'Maven Central setup', description: 'Apply for a groupId at Sonatype Central. Configure the vanniktech plugin. Stage a 0.1.0 release.' },
+  { title: 'BinaryCompatibilityValidator', description: 'Enable BCV. Run apiDump. Make a deliberate breaking change to a public method; verify apiCheck fails on PR.' },
+  { title: 'Sample + Dokka', description: 'Write a runnable sample app for your library. Generate Dokka HTML. Publish to GitHub Pages.' }
+]} />
+
+## Next
+
+Continue to **[Open Source Contribution](./open-source-contribution)**
+for AOSP / Jetpack / third-party patterns.

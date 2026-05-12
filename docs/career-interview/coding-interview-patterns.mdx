@@ -1,0 +1,677 @@
+---
+id: coding-interview-patterns
+title: Coding Interview Patterns
+sidebar_label: Coding Patterns
+description: DSA patterns with an Android lens — debounce, LRU cache, BFS on view trees, topological sort, merge intervals, producer/consumer.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Coding Interview Patterns
+
+Most senior Android interviews include a 45-60 minute coding round.
+Don't memorize Leetcode in isolation — practice problems **with an
+Android lens**, the way the patterns actually appear in production
+code. This chapter covers the 8 patterns that come up most often.
+
+## The framework — solve any problem in 5 steps
+
+1. **Clarify** — restate the problem; ask about input size, edge cases, constraints
+2. **Example** — walk through 1-2 inputs by hand
+3. **Approach** — sketch the algorithm verbally
+4. **Code** — write working code; explain as you type
+5. **Test** — walk through your code with the example; consider edge cases
+
+If you skip step 3, you write yourself into a corner. If you skip step 5,
+small bugs go unnoticed. Practice all five for every problem.
+
+---
+
+## Pattern 1 — Debounce / throttle
+
+**Where in Android**: search-as-you-type, autosave, button protection.
+
+### Problem
+
+"Implement a debounced text watcher that fires `onSearch(query)` 300ms
+after the user stops typing."
+
+### Coroutine solution
+
+```kotlin
+class DebouncedSearch(
+    private val scope: CoroutineScope,
+    private val onSearch: suspend (String) -> Unit,
+    private val debounceMs: Long = 300
+) {
+    private val queries = MutableStateFlow("")
+
+    init {
+        scope.launch {
+            queries
+                .debounce(debounceMs)
+                .distinctUntilChanged()
+                .filter { it.isNotBlank() }
+                .collect { onSearch(it) }
+        }
+    }
+
+    fun onTextChanged(text: String) { queries.value = text }
+}
+```
+
+### Pure-Kotlin solution (no Flow)
+
+```kotlin
+class DebouncedSearch(private val onSearch: (String) -> Unit, private val debounceMs: Long = 300) {
+    private val handler = Handler(Looper.getMainLooper())
+    private var lastRunnable: Runnable? = null
+
+    fun onTextChanged(text: String) {
+        lastRunnable?.let { handler.removeCallbacks(it) }
+        val runnable = Runnable { onSearch(text) }
+        lastRunnable = runnable
+        handler.postDelayed(runnable, debounceMs)
+    }
+}
+```
+
+### Throttle (leading edge — fire first, ignore rest)
+
+```kotlin
+class ThrottledClick(private val window: Long = 500) {
+    private var lastClick = 0L
+
+    fun onClick(action: () -> Unit) {
+        val now = System.currentTimeMillis()
+        if (now - lastClick > window) {
+            lastClick = now
+            action()
+        }
+    }
+}
+```
+
+Interview probes: distinguish debounce (last wins, fires after pause)
+from throttle (first wins, ignores until window).
+
+---
+
+## Pattern 2 — LRU cache
+
+**Where in Android**: Coil/Glide bitmap caches, Room query cache, your
+own data layer.
+
+### Problem
+
+"Implement an LRU cache with O(1) `get` and `put`."
+
+### Approach
+
+LinkedHashMap with `accessOrder = true` gives you O(1) reordering on
+access. Override `removeEldestEntry`:
+
+```kotlin
+class LruCache<K, V>(private val capacity: Int) {
+    private val map = object : LinkedHashMap<K, V>(capacity, 0.75f, /* accessOrder */ true) {
+        override fun removeEldestEntry(eldest: Map.Entry<K, V>): Boolean {
+            return size > capacity
+        }
+    }
+
+    @Synchronized fun get(key: K): V? = map[key]
+    @Synchronized fun put(key: K, value: V) { map[key] = value }
+    @Synchronized fun size(): Int = map.size
+}
+```
+
+### Manual implementation (interview-friendly)
+
+```kotlin
+class LruCache<K, V>(private val capacity: Int) {
+    private class Node<K, V>(val key: K, var value: V, var prev: Node<K, V>? = null, var next: Node<K, V>? = null)
+
+    private val map = mutableMapOf<K, Node<K, V>>()
+    private var head: Node<K, V>? = null
+    private var tail: Node<K, V>? = null
+
+    @Synchronized fun get(key: K): V? {
+        val node = map[key] ?: return null
+        moveToFront(node)
+        return node.value
+    }
+
+    @Synchronized fun put(key: K, value: V) {
+        val existing = map[key]
+        if (existing != null) {
+            existing.value = value
+            moveToFront(existing)
+            return
+        }
+
+        val node = Node(key, value)
+        addToFront(node)
+        map[key] = node
+
+        if (map.size > capacity) {
+            tail?.let {
+                map.remove(it.key)
+                removeNode(it)
+            }
+        }
+    }
+
+    private fun moveToFront(node: Node<K, V>) {
+        removeNode(node)
+        addToFront(node)
+    }
+
+    private fun addToFront(node: Node<K, V>) {
+        node.prev = null
+        node.next = head
+        head?.prev = node
+        head = node
+        if (tail == null) tail = node
+    }
+
+    private fun removeNode(node: Node<K, V>) {
+        node.prev?.next = node.next
+        node.next?.prev = node.prev
+        if (head == node) head = node.next
+        if (tail == node) tail = node.prev
+    }
+}
+```
+
+Interview tip: ask "should I use the stdlib LinkedHashMap or hand-roll?"
+The interviewer's answer tells you whether they want to see
+data-structure knowledge or pragmatic engineering.
+
+---
+
+## Pattern 3 — BFS / DFS on view tree
+
+**Where in Android**: finding a View by tag, custom layout measurement,
+Compose semantics tree traversal.
+
+### Problem
+
+"Given a View, find all descendants with `tag == "highlighted"`."
+
+### BFS — queue-based, level-order
+
+```kotlin
+fun findHighlighted(root: View): List<View> {
+    val result = mutableListOf<View>()
+    val queue: ArrayDeque<View> = ArrayDeque<View>().apply { add(root) }
+
+    while (queue.isNotEmpty()) {
+        val view = queue.removeFirst()
+        if (view.tag == "highlighted") result.add(view)
+
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                queue.addLast(view.getChildAt(i))
+            }
+        }
+    }
+    return result
+}
+```
+
+### DFS — recursive
+
+```kotlin
+fun findHighlighted(view: View, out: MutableList<View> = mutableListOf()): List<View> {
+    if (view.tag == "highlighted") out.add(view)
+    if (view is ViewGroup) {
+        for (i in 0 until view.childCount) {
+            findHighlighted(view.getChildAt(i), out)
+        }
+    }
+    return out
+}
+```
+
+### When to pick which
+
+- **BFS** — finds shortest path, layer-by-layer traversal
+- **DFS** — natural recursion; better for "find first that matches" or full traversal
+
+Same patterns apply to:
+- Compose semantics tree (SemanticsNode → children)
+- Fragment hierarchy (FragmentManager.fragments → child FragmentManagers)
+- Navigation graph (NavGraph → destinations)
+
+---
+
+## Pattern 4 — Topological sort
+
+**Where in Android**: WorkManager dependency chains, Gradle task graph,
+KSP processing order.
+
+### Problem
+
+"Given a list of tasks and dependencies (A depends on B), return an
+execution order."
+
+### Kahn's algorithm (BFS-based)
+
+```kotlin
+fun topologicalSort(
+    tasks: List<String>,
+    dependencies: List<Pair<String, String>>     // (a, b) means a depends on b
+): List<String>? {
+    val graph = mutableMapOf<String, MutableList<String>>()
+    val inDegree = mutableMapOf<String, Int>()
+
+    tasks.forEach {
+        graph[it] = mutableListOf()
+        inDegree[it] = 0
+    }
+
+    for ((a, b) in dependencies) {
+        graph[b]!!.add(a)
+        inDegree[a] = inDegree[a]!! + 1
+    }
+
+    val queue: ArrayDeque<String> = ArrayDeque<String>().apply {
+        addAll(inDegree.filterValues { it == 0 }.keys)
+    }
+    val order = mutableListOf<String>()
+
+    while (queue.isNotEmpty()) {
+        val node = queue.removeFirst()
+        order.add(node)
+        for (neighbor in graph[node]!!) {
+            inDegree[neighbor] = inDegree[neighbor]!! - 1
+            if (inDegree[neighbor] == 0) queue.addLast(neighbor)
+        }
+    }
+
+    return if (order.size == tasks.size) order else null  // null = cycle
+}
+
+// Usage
+val order = topologicalSort(
+    tasks = listOf("compile", "test", "lint", "bundle"),
+    dependencies = listOf(
+        "test" to "compile",         // test depends on compile
+        "lint" to "compile",
+        "bundle" to "test",
+        "bundle" to "lint"
+    )
+)
+// → [compile, test, lint, bundle]
+```
+
+Cycles → null. Don't forget to check for cycles!
+
+---
+
+## Pattern 5 — Merge intervals
+
+**Where in Android**: calendar overlap detection, gesture conflict
+resolution, animation timeline merging.
+
+### Problem
+
+"Given a list of intervals `[start, end]`, merge overlapping ones."
+
+```kotlin
+fun mergeIntervals(intervals: List<IntArray>): List<IntArray> {
+    if (intervals.isEmpty()) return emptyList()
+
+    val sorted = intervals.sortedBy { it[0] }
+    val merged = mutableListOf<IntArray>()
+    var current = sorted[0]
+
+    for (i in 1 until sorted.size) {
+        val next = sorted[i]
+        if (next[0] <= current[1]) {
+            // Overlap — extend current
+            current = intArrayOf(current[0], maxOf(current[1], next[1]))
+        } else {
+            merged.add(current)
+            current = next
+        }
+    }
+    merged.add(current)
+    return merged
+}
+
+// mergeIntervals([[1,3], [2,6], [8,10], [15,18]])
+// → [[1,6], [8,10], [15,18]]
+```
+
+Variations:
+- **Insert interval into sorted list** — same logic but stop when no more overlap
+- **Find free slots** — invert: merge busy intervals, return gaps
+- **Maximum concurrent intervals** — sweep line algorithm
+
+---
+
+## Pattern 6 — Producer / Consumer
+
+**Where in Android**: WorkManager outbox queue, image processing
+pipelines, real-time data ingestion.
+
+### Problem
+
+"Implement a thread-safe queue where producers add items and consumers
+process them."
+
+### Channel-based
+
+```kotlin
+class UploadQueue(scope: CoroutineScope, private val uploader: Uploader, workers: Int = 4) {
+    private val channel = Channel<UploadRequest>(capacity = Channel.BUFFERED)
+
+    init {
+        repeat(workers) { workerId ->
+            scope.launch {
+                for (request in channel) {
+                    runCatching { uploader.upload(request) }
+                        .onFailure { Log.e("Upload", "worker $workerId failed", it) }
+                }
+            }
+        }
+    }
+
+    suspend fun enqueue(request: UploadRequest) = channel.send(request)
+
+    fun close() = channel.close()
+}
+```
+
+### Bounded with backpressure
+
+```kotlin
+val channel = Channel<Item>(capacity = 100, onBufferOverflow = BufferOverflow.SUSPEND)
+// Or: BufferOverflow.DROP_OLDEST, DROP_LATEST
+```
+
+Producers suspend when buffer is full → backpressure. Consumers drain
+at their own pace.
+
+### Pure Kotlin (no coroutines, interview-friendly)
+
+```kotlin
+class BlockingQueue<T>(private val capacity: Int) {
+    private val items = ArrayDeque<T>()
+    private val lock = ReentrantLock()
+    private val notFull = lock.newCondition()
+    private val notEmpty = lock.newCondition()
+
+    fun put(item: T) {
+        lock.withLock {
+            while (items.size == capacity) notFull.await()
+            items.addLast(item)
+            notEmpty.signal()
+        }
+    }
+
+    fun take(): T = lock.withLock {
+        while (items.isEmpty()) notEmpty.await()
+        val item = items.removeFirst()
+        notFull.signal()
+        item
+    }
+}
+```
+
+Be ready to discuss concurrency primitives in pure Kotlin / Java if the
+interviewer asks "without coroutines."
+
+---
+
+## Pattern 7 — Two pointers / sliding window
+
+**Where in Android**: ring buffer for sensor data, rate-limit windows,
+pagination with anchors.
+
+### Sliding window — fixed size
+
+```kotlin
+// Maximum heart rate in any 60-second window
+fun maxInWindow(readings: List<Sample>, windowMs: Long = 60_000): List<Float> {
+    val deque: ArrayDeque<Sample> = ArrayDeque()    // monotonic decreasing
+    val maxes = mutableListOf<Float>()
+
+    for (sample in readings) {
+        // Remove out-of-window samples
+        while (deque.isNotEmpty() && sample.timestamp - deque.first().timestamp > windowMs) {
+            deque.removeFirst()
+        }
+        // Maintain monotonic property
+        while (deque.isNotEmpty() && deque.last().value < sample.value) {
+            deque.removeLast()
+        }
+        deque.addLast(sample)
+        maxes.add(deque.first().value)
+    }
+    return maxes
+}
+
+data class Sample(val timestamp: Long, val value: Float)
+```
+
+### Two pointers — sorted array
+
+```kotlin
+// Pair sum — find two numbers summing to target in a sorted array
+fun pairSum(nums: IntArray, target: Int): Pair<Int, Int>? {
+    var left = 0
+    var right = nums.size - 1
+    while (left < right) {
+        val sum = nums[left] + nums[right]
+        when {
+            sum == target -> return left to right
+            sum < target -> left++
+            else -> right--
+        }
+    }
+    return null
+}
+```
+
+Classic. Sliding window for "longest substring without repeats," "max
+sum subarray of size k," etc.
+
+---
+
+## Pattern 8 — State machine
+
+**Where in Android**: ride-hailing FSM, checkout state machine, video
+player states.
+
+### Problem
+
+"Implement a vending machine: insert coin, select item, dispense."
+
+### Sealed-class FSM
+
+```kotlin
+sealed interface VendingState {
+    data object Idle : VendingState
+    data class HasCoin(val cents: Int) : VendingState
+    data class Dispensing(val item: Item) : VendingState
+    data class Error(val reason: String) : VendingState
+}
+
+sealed interface VendingEvent {
+    data class InsertCoin(val cents: Int) : VendingEvent
+    data class SelectItem(val item: Item) : VendingEvent
+    data object DispenseDone : VendingEvent
+    data object Refund : VendingEvent
+}
+
+class VendingMachine(private val inventory: Map<Item, Int>) {
+    private var state: VendingState = VendingState.Idle
+
+    fun handle(event: VendingEvent): VendingState {
+        state = transition(state, event)
+        return state
+    }
+
+    private fun transition(state: VendingState, event: VendingEvent): VendingState = when (state) {
+        VendingState.Idle -> when (event) {
+            is VendingEvent.InsertCoin -> VendingState.HasCoin(event.cents)
+            else -> state
+        }
+        is VendingState.HasCoin -> when (event) {
+            is VendingEvent.InsertCoin -> VendingState.HasCoin(state.cents + event.cents)
+            is VendingEvent.SelectItem -> {
+                val price = inventory[event.item] ?: return VendingState.Error("Item not stocked")
+                when {
+                    state.cents < price -> VendingState.Error("Insufficient ${price - state.cents}¢")
+                    else -> VendingState.Dispensing(event.item)
+                }
+            }
+            VendingEvent.Refund -> VendingState.Idle
+            else -> state
+        }
+        is VendingState.Dispensing -> when (event) {
+            VendingEvent.DispenseDone -> VendingState.Idle
+            else -> state
+        }
+        is VendingState.Error -> when (event) {
+            VendingEvent.Refund -> VendingState.Idle
+            else -> state
+        }
+    }
+}
+```
+
+**Why interviewers love this**:
+- Tests Kotlin sealed-class knowledge
+- Tests exhaustive `when`
+- Mirrors real Android UI state management (MVI)
+- Easy to extend with edge cases
+
+---
+
+## DSA practice plan (4 weeks)
+
+### Week 1 — Foundations
+- Arrays + strings: two pointers, sliding window
+- HashMaps + sets: frequency counting, anagram detection
+- Linked lists: reverse, detect cycle, merge sorted
+- 10 problems
+
+### Week 2 — Search + trees
+- Binary search variations
+- BFS / DFS on trees + graphs
+- Topological sort
+- 10 problems
+
+### Week 3 — Dynamic programming
+- 1D DP: climbing stairs, house robber, longest substring
+- 2D DP: edit distance, LCS, paths in grid
+- 10 problems
+
+### Week 4 — Android-specific
+- Implement LRU cache
+- Implement an Android Handler from scratch
+- Custom ViewGroup measurement
+- Coroutine combinators (zip, merge)
+- 5 mock interviews with peers
+
+---
+
+## How to think out loud
+
+Interviewers can't grade silence. Narrate:
+
+> "I see we have a list of intervals. I'll first sort by start time...
+> wait, let me think — what's the brute force? Compare every pair, O(n²).
+> Sorting + sweep is O(n log n). For interview purposes I'll start with
+> the optimal."
+
+Even when you're confused: "I'm thinking about this — let me sketch on
+the whiteboard." Shows process.
+
+If you hit a wall, ask:
+- "Would you like me to try a different approach?"
+- "Can I assume X about the input?"
+- "Is there a hint you can offer?"
+
+Asking for hints is **not** weakness — strong candidates do it.
+
+---
+
+## Edge cases checklist
+
+For any coding problem:
+- Empty input
+- Single element
+- Maximum input size (overflow?)
+- Duplicates
+- Negative numbers
+- Nulls (if applicable)
+- Sorted vs unsorted assumption
+- Concurrent modification (if relevant)
+
+Walk through 1-2 of these before claiming "done."
+
+---
+
+## Common interview mistakes
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'What loses interviews',
+    variant: 'old',
+    points: [
+      'Jumping to code without verbal plan',
+      'Silent typing for 15 minutes',
+      'Memorized "Leetcode" — fails on variations',
+      'Ignoring constraints (input size, time limit)',
+      'No tests / edge case discussion',
+      'Defensive responses to feedback'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'What wins',
+    variant: 'new',
+    points: [
+      'Clarify → example → approach → code → test',
+      'Continuous narration',
+      'First-principles thinking; can adapt',
+      'Asks: "what\'s the input size?"',
+      'Walks through code with the example',
+      'Treats feedback as a clue, not criticism'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Coding interview rules">
+- **Clarify → Example → Approach → Code → Test** — every problem, every time.
+- Practice **Android-adjacent** problems (debounce, LRU, FSM) — they show up.
+- **Think out loud** continuously; ask for hints when stuck.
+- **Sealed-class state machines** + **coroutine combinators** are signature Kotlin signals.
+- **Edge cases**: empty, single, max, duplicates, nulls.
+- **4-week study plan** beats binge-cramming.
+- Mock interviews with peers — 5 minimum before real ones.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Implement debounce + throttle', description: 'Without using Flow operators. Pure Handler / Timer. Test with 5 rapid calls — verify only 1 fires.' },
+  { title: 'LRU cache from scratch', description: 'Without LinkedHashMap. Use HashMap + doubly-linked list. Time get / put — verify both O(1).' },
+  { title: 'Topological sort with cycles', description: 'Detect a cycle in a dependency graph; return null if cyclic.' },
+  { title: 'Merge intervals + variations', description: 'Solve merge intervals, insert interval, free time slots — three flavors of the same pattern.' },
+  { title: 'Vending machine FSM', description: 'Sealed-class state + sealed-class event + pure transition function. Add edge cases (refund mid-dispense, simultaneous coin + select).' }
+]} />
+
+## Next
+
+Continue to **[Behavioral STAR & Negotiation](./behavioral-negotiation)**
+for non-coding interview rounds.

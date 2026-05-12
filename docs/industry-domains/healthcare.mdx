@@ -1,0 +1,596 @@
+---
+id: healthcare
+title: Healthcare Patterns
+sidebar_label: Healthcare
+description: HIPAA compliance, Health Connect, EHR / FHIR integration, telemedicine, patient privacy, BAAs, FDA considerations.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Healthcare Patterns
+
+Healthcare apps face the strictest privacy regime in mobile: **HIPAA**
+in the US, **GDPR Article 9** in the EU (health is "special category"
+data), country-specific medical device regulations. The patterns are
+specific. Get them wrong → 6-figure fines, lost trust, blocked Play
+listings.
+
+## The compliance landscape
+
+| Regulation | Applies to                                                          |
+|------------|---------------------------------------------------------------------|
+| **HIPAA**  | US: any "covered entity" (hospitals, payers) or "business associate" |
+| **GDPR Art. 9** | EU: any processing of health data                              |
+| **FDA**    | US: medical device classifications (Class I/II/III for software)    |
+| **CE / MDR**| EU: medical device certification                                   |
+| **HITECH** | US: breach notification, audit                                      |
+| **PIPEDA / PHIPA**| Canada: provincial health privacy                            |
+| **DPDP**   | India: digital personal data protection act                         |
+
+If your app handles **Protected Health Information (PHI)** — anything
+that could identify a patient + relate to their health — you fall under
+HIPAA (US users). PHI includes: name + diagnosis, email + appointment,
+even a heart rate tied to a user ID.
+
+---
+
+## The 4 questions to ask first
+
+<StepList steps={[
+  { title: 'Are you a covered entity, business associate, or neither?', description: 'Covered entity: hospitals, doctors, insurance. Business associate: a vendor handling PHI for a covered entity. Neither: consumer wellness app that doesn\'t share data with clinicians (Fitbit pre-medical-claims).' },
+  { title: 'Is what you collect actually PHI?', description: 'Heart rate alone — not PHI. Heart rate + name + clinician sharing — PHI.' },
+  { title: 'Do you have a BAA with your cloud providers?', description: 'Firebase, AWS, Azure, GCP all offer BAAs (Business Associate Agreements). Without one, you can\'t legally store PHI on their infrastructure.' },
+  { title: 'Are you a medical device?', description: 'If you diagnose, treat, or prevent disease, FDA classifies you. \"This pulse oximeter detects hypoxia\" → Class II medical device. \"Track your steps\" → consumer wellness, no FDA.' }
+]} />
+
+A wellness app (steps, sleep, calories) usually escapes HIPAA. A
+telemedicine app, prescription tracker, or anything sharing data with
+clinicians is in scope.
+
+---
+
+## HIPAA technical safeguards (the engineering bits)
+
+```text
+1. Access control
+   - Unique user ID per person
+   - Automatic logoff after inactivity
+   - Encryption / decryption (technical safeguard category)
+
+2. Audit controls
+   - Log every access of PHI
+   - Tamper-evident logs
+
+3. Integrity controls
+   - Detect / prevent improper alteration of PHI
+
+4. Transmission security
+   - TLS 1.2+ in transit
+   - End-to-end where feasible
+```
+
+Your Android app must implement these. Let's walk through.
+
+---
+
+## Encrypted local storage — mandatory
+
+**Every byte of PHI on disk must be encrypted.** Three layers:
+
+### Layer 1 — Disk-level encryption
+
+Modern Android (6.0+) encrypts user data partition. **Don't rely on
+this alone** — it protects against device theft + factory reset but
+not against app-level extraction.
+
+### Layer 2 — App-level encryption
+
+```kotlin
+// Encrypted Room via SQLCipher
+val factory = SupportFactory(SQLiteDatabase.getBytes(passphrase.toCharArray()))
+
+Room.databaseBuilder(context, AppDatabase::class.java, "health.db")
+    .openHelperFactory(factory)
+    .build()
+```
+
+```kotlin
+// Encrypted SharedPreferences
+val masterKey = MasterKey.Builder(context)
+    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+    .setUserAuthenticationRequired(true)        // require biometric for high-PHI prefs
+    .build()
+
+val prefs = EncryptedSharedPreferences.create(
+    context, "health_prefs", masterKey,
+    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+)
+```
+
+See [Cryptography & Keystore](/docs/security-compliance/cryptography-keystore).
+
+### Layer 3 — Sensitive fields encrypted in transit + at rest
+
+Even within encrypted storage, especially sensitive fields (SSN,
+condition codes) use field-level encryption with a separate key:
+
+```kotlin
+@Entity(tableName = "patients")
+data class PatientEntity(
+    @PrimaryKey val id: String,
+    val name: String,                                          // SQLCipher protects
+    @ColumnInfo(typeAffinity = ColumnInfo.BLOB)
+    val encryptedDiagnosis: ByteArray,                          // additional layer
+    val encryptedDiagnosisIv: ByteArray
+)
+```
+
+Defense in depth. A compromise of the database key doesn't expose
+diagnoses.
+
+---
+
+## Authentication for healthcare apps
+
+Stricter than consumer apps:
+
+```kotlin
+// 1. Strong password requirements
+fun validatePassword(pw: String): PasswordValidation {
+    return when {
+        pw.length < 12 -> PasswordValidation.TooShort
+        !pw.any(Char::isDigit) -> PasswordValidation.MissingDigit
+        !pw.any(Char::isUpperCase) -> PasswordValidation.MissingUppercase
+        !pw.any { !it.isLetterOrDigit() } -> PasswordValidation.MissingSymbol
+        pw in commonPasswords -> PasswordValidation.TooCommon
+        else -> PasswordValidation.OK
+    }
+}
+
+// 2. Forced re-auth after inactivity
+class AutoLogoutObserver @Inject constructor(
+    private val sessionStore: SessionStore,
+    private val authRepo: AuthRepository
+) : DefaultLifecycleObserver {
+
+    private var lastInteraction: Long = System.currentTimeMillis()
+
+    override fun onResume(owner: LifecycleOwner) {
+        val timeout = 10.minutes.inWholeMilliseconds
+        if (System.currentTimeMillis() - lastInteraction > timeout) {
+            sessionStore.clear()
+            authRepo.requireReAuth()
+        }
+        lastInteraction = System.currentTimeMillis()
+    }
+}
+
+// 3. Multi-factor required
+class HealthcareAuth {
+    suspend fun signIn(email: String, password: String): Outcome<Session, AuthError> {
+        val firstFactor = authApi.signIn(email, password)
+        if (firstFactor is Outcome.Err) return firstFactor
+
+        // Second factor — SMS / TOTP / biometric
+        val secondFactor = challengeSecondFactor(firstFactor.value.userId)
+        return secondFactor
+    }
+}
+```
+
+After 10-15 minutes of inactivity, force re-auth. Long sessions are a
+HIPAA violation risk if the device is stolen.
+
+---
+
+## Audit logs — every PHI access
+
+```kotlin
+data class PhiAccessLog(
+    val id: String,
+    val userId: UserId,
+    val timestamp: Instant,
+    val accessType: AccessType,                                // READ, WRITE, EXPORT
+    val resourceType: String,                                  // "Patient", "Observation"
+    val resourceId: String,
+    val purpose: AccessPurpose,                                // CLINICAL_CARE, BILLING, USER_REQUEST
+    val deviceId: String,
+    val ipAddress: String?,
+    val outcome: AccessOutcome                                 // SUCCESS, DENIED
+)
+
+class PhiAccessLogger @Inject constructor(
+    private val backend: HealthcareApi
+) {
+    suspend fun log(entry: PhiAccessLog) {
+        // Local for offline robustness
+        localLog.insert(entry)
+
+        // Backend is authoritative
+        runCatching { backend.audit(entry) }
+            .onFailure { /* WorkManager retry */ }
+    }
+}
+
+class AuditingRepository(
+    private val delegate: PatientRepository,
+    private val logger: PhiAccessLogger,
+    private val session: SessionStore
+) : PatientRepository {
+    override suspend fun fetch(id: PatientId): Patient {
+        val patient = delegate.fetch(id)
+        logger.log(PhiAccessLog(
+            userId = session.currentUserId(),
+            timestamp = Instant.now(),
+            accessType = AccessType.READ,
+            resourceType = "Patient",
+            resourceId = id.raw,
+            purpose = AccessPurpose.CLINICAL_CARE,
+            outcome = AccessOutcome.SUCCESS,
+            /* ... */
+        ))
+        return patient
+    }
+}
+```
+
+Decorator pattern (Module 04 patterns) — wrap every PHI-accessing
+repository with logging.
+
+Server-side: **immutable audit log**, 6-year retention (HIPAA), encrypted,
+queryable by patient + date.
+
+---
+
+## Health Connect — the unified API
+
+Android's Health Connect (mandatory since Android 14) is the API for
+sharing health data **across apps**. Replace direct sensor reads with
+Health Connect:
+
+```kotlin
+// libs.versions.toml
+health-connect = { module = "androidx.health.connect:connect-client", version = "1.1.0-alpha11" }
+```
+
+```kotlin
+class HealthConnectManager @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    val client: HealthConnectClient? by lazy {
+        if (HealthConnectClient.getSdkStatus(context) == HealthConnectClient.SDK_AVAILABLE) {
+            HealthConnectClient.getOrCreate(context)
+        } else null
+    }
+
+    suspend fun writeWorkout(workout: Workout) {
+        client?.insertRecords(listOf(
+            ExerciseSessionRecord(
+                startTime = workout.startTime,
+                endTime = workout.endTime,
+                exerciseType = ExerciseSessionRecord.EXERCISE_TYPE_RUNNING,
+                /* ... */
+            )
+        ))
+    }
+
+    suspend fun readSteps(start: Instant, end: Instant): Long {
+        val response = client?.aggregate(
+            AggregateRequest(
+                metrics = setOf(StepsRecord.COUNT_TOTAL),
+                timeRangeFilter = TimeRangeFilter.between(start, end)
+            )
+        )
+        return response?.get(StepsRecord.COUNT_TOTAL) ?: 0
+    }
+}
+```
+
+Permissions per record type:
+
+```xml
+<uses-permission android:name="android.permission.health.READ_STEPS"/>
+<uses-permission android:name="android.permission.health.WRITE_STEPS"/>
+<uses-permission android:name="android.permission.health.READ_HEART_RATE"/>
+<uses-permission android:name="android.permission.health.WRITE_EXERCISE"/>
+```
+
+Users grant granular access via the Health Connect app. Your app stays
+on the user-friendly side of the privacy line.
+
+See [Wear OS & Health Connect](/docs/advanced-trending/wear-health) for
+full Health Connect coverage.
+
+---
+
+## EHR integration via FHIR
+
+Hospitals use **Electronic Health Records** (EHRs) — Epic, Cerner,
+Allscripts. The interop standard is **FHIR** (Fast Healthcare
+Interoperability Resources).
+
+```kotlin
+// libs.versions.toml
+fhir-engine = { module = "com.google.android.fhir:engine", version = "1.1.0" }
+fhir-data-capture = { module = "com.google.android.fhir:data-capture", version = "1.1.0" }
+```
+
+```kotlin
+class PatientRepository @Inject constructor(
+    private val fhirEngine: FhirEngine,
+    private val ehrApi: FhirApi
+) {
+    suspend fun fetchPatient(id: String): Patient {
+        val cached = fhirEngine.get<Patient>(id) as? Patient
+        if (cached != null && !cached.isStale()) return cached.toDomain()
+
+        val remote: Patient = ehrApi.read("Patient/$id")
+        fhirEngine.update(remote)
+        return remote.toDomain()
+    }
+
+    suspend fun searchPatients(query: String): List<Patient> {
+        val results = fhirEngine.search<Patient> {
+            filter(Patient.NAME, { value = query })
+        }
+        return results.map { it.resource.toDomain() }
+    }
+}
+```
+
+Google's FHIR SDK handles syncing, search, and structured data capture
+(forms generated from FHIR Questionnaires).
+
+### SMART on FHIR launch
+
+For patient-facing apps that integrate into hospital EHRs:
+
+```kotlin
+class SmartLaunch @Inject constructor(
+    private val authStateManager: AuthStateManager,
+    private val authService: AuthorizationService
+) {
+    suspend fun launch(iss: String, launch: String): Outcome<FhirContext, LaunchError> {
+        // 1. Discover the EHR's OAuth + FHIR endpoints
+        val capabilityStatement = fhirClient.get("$iss/metadata") as CapabilityStatement
+        val authUri = extractAuthEndpoint(capabilityStatement)
+        val tokenUri = extractTokenEndpoint(capabilityStatement)
+
+        // 2. Authorize
+        val request = AuthorizationRequest.Builder(
+            AuthorizationServiceConfiguration(authUri.toUri(), tokenUri.toUri()),
+            CLIENT_ID,
+            ResponseTypeValues.CODE,
+            REDIRECT_URI.toUri()
+        )
+            .setScope("launch openid fhirUser patient/*.read")
+            .setAdditionalParameters(mapOf(
+                "aud" to iss,
+                "launch" to launch
+            ))
+            .build()
+
+        authService.performAuthorizationRequest(request, /* result intent */)
+
+        // 3. Once authorized, you have a token to call iss/Patient/[id] etc.
+        return ...
+    }
+}
+```
+
+SMART on FHIR is how a third-party app launches inside an EHR's webview
+or as a deep link from the clinician's UI. Standard across vendors.
+
+---
+
+## Telemedicine — video calls
+
+```kotlin
+// Stripe / Twilio / Daily.co / Vonage for video
+class VideoCallService @Inject constructor() {
+    suspend fun startCall(roomToken: String, activity: FragmentActivity): Outcome<Unit, CallError> {
+        // Telemedicine apps must support PSTN fallback (phone audio)
+        // Network: WebRTC over TLS
+        // No screen recording without consent
+
+        return TwilioVideoSdk.connect(activity, roomToken)
+    }
+}
+```
+
+Considerations:
+- **Privacy**: no screen recording without consent. Detect and warn.
+- **Network**: poor connections → audio-only fallback
+- **Recording**: separate consent flow; encrypted at rest; audit-logged
+- **Pre-call check**: bandwidth + camera + microphone test
+- **No PHI in call URLs** — room tokens are random UUIDs, not patient IDs
+
+---
+
+## FDA Software as a Medical Device (SaMD)
+
+If your app makes clinical claims, you may be a medical device:
+
+| Class | Risk | Examples |
+|-------|------|----------|
+| Class I | Lowest | Wellness apps, fitness, general info |
+| Class II | Moderate | Diagnostic algorithms, decision support |
+| Class III | Highest | Life-supporting / sustaining, implantable |
+
+Class II+ requires FDA clearance (510(k) or De Novo) before US sale.
+Process takes 3-12 months + significant documentation.
+
+### "Wellness exemption"
+
+Apps that explicitly don't diagnose / treat / prevent disease escape FDA.
+The line is the **labeling**:
+
+```text
+✓ "Track your daily activity for fitness goals"          → Wellness
+✗ "Detect signs of cardiovascular disease"                → SaMD Class II
+```
+
+Marketing language matters as much as features. Have legal review every
+claim.
+
+### FDA-cleared apps
+
+Once cleared, you must:
+- Document changes via FDA's modification framework
+- Maintain quality management system (ISO 13485)
+- Report adverse events
+- Update clearance for substantial modifications
+
+This is a multi-quarter effort + a dedicated regulatory team. Don't
+underestimate.
+
+---
+
+## GDPR Article 9 — health is special
+
+In the EU, processing health data requires:
+- **Explicit consent** (more than opt-in)
+- **Specific purpose** documented
+- **Right to deletion** honored end-to-end (including backups)
+- **Data Protection Impact Assessment** (DPIA) before launch
+
+Patient deletion flow:
+
+```kotlin
+suspend fun deletePatientData(userId: UserId): Outcome<Unit, DeletionError> {
+    // 1. Verify identity
+    val authed = biometricVerify(activity)
+    if (!authed) return Outcome.Err(DeletionError.AuthFailed)
+
+    // 2. Confirm with user (irrevocable warning)
+    val confirmed = showConfirmDialog()
+    if (!confirmed) return Outcome.Err(DeletionError.UserCancelled)
+
+    // 3. Server-side cascade
+    val request = api.requestAccountDeletion(userId)
+    // Server: deletes Patient + Observations + Audit (anonymized retention) + Backups
+
+    // 4. Sign out and clear local
+    localCleaner.purge()
+
+    return Outcome.Ok(Unit)
+}
+```
+
+GDPR mandates 30-day deletion across backups. Coordinate with your data
+team.
+
+---
+
+## Common healthcare architecture
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│  UI (Compose)                                               │
+│    Patient list · Vitals · Appointments · Messages         │
+├────────────────────────────────────────────────────────────┤
+│  ViewModels (heavy state machines)                          │
+│    Auto-logout · Step-up auth · Consent prompts             │
+├────────────────────────────────────────────────────────────┤
+│  AuditingRepository (decorator wraps each domain repo)     │
+│  ├─ PatientRepository (FHIR cache + EHR sync)              │
+│  ├─ ObservationRepository (vitals, labs)                   │
+│  ├─ AppointmentRepository                                   │
+│  └─ MessageRepository (E2E encrypted patient messaging)    │
+├────────────────────────────────────────────────────────────┤
+│  Health Connect ←→ Sensors + Wear OS                       │
+│  EHR Gateway (SMART on FHIR + OAuth)                       │
+├────────────────────────────────────────────────────────────┤
+│  Encrypted SQLite (Room + SQLCipher)                       │
+│  Keystore-backed keys                                       │
+│  Encrypted audit log queue                                  │
+├────────────────────────────────────────────────────────────┤
+│  Network (TLS 1.3, cert pinning, mTLS for EHR)             │
+│  Play Integrity on sensitive requests                       │
+└────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Privacy by design
+
+Beyond technical safeguards:
+
+- **Minimize collection**: only ask for data you actually use
+- **Anonymize where possible**: aggregate stats don't need patient ID
+- **Just-in-time consent**: explain purpose at the moment of collection
+- **Transparency**: show users what data exists about them
+- **No third-party analytics on PHI** — never send to Firebase Analytics
+
+```kotlin
+// ❌ Logs PHI to analytics
+firebaseAnalytics.logEvent("medication_viewed", bundleOf("med_name" to medication.name))
+
+// ✓ Anonymized event
+firebaseAnalytics.logEvent("medication_viewed", bundleOf("category" to medication.category))
+```
+
+---
+
+## Common healthcare anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Healthcare anti-patterns',
+    title: 'Compliance hazards',
+    variant: 'old',
+    points: [
+      'Storing PHI without app-level encryption',
+      'No audit log for PHI access',
+      'Sending PHI to Firebase Analytics / Crashlytics',
+      'No session timeout',
+      'Marketing as \"diagnostic\" without FDA clearance',
+      'No BAA with cloud providers'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'HIPAA-ready',
+    variant: 'new',
+    points: [
+      'SQLCipher Room + EncryptedSharedPrefs',
+      'AuditingRepository decorator on every PHI access',
+      'PII / PHI scrubbed before any analytics call',
+      '10-15 minute auto-logout',
+      '\"Wellness\" labeling unless cleared by FDA',
+      'BAA on file with every PHI-touching vendor'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Healthcare rules">
+- **HIPAA, GDPR Article 9, FDA** — know which apply to you.
+- **Encrypt all PHI at rest** (SQLCipher + EncryptedSharedPrefs + field-level for sensitive).
+- **Audit log every PHI access** — decorator pattern around every PHI repository.
+- **Short session timeout** + step-up auth for clinical actions.
+- **Health Connect** for cross-app health data — replaces direct sensor reads.
+- **FHIR + SMART on FHIR** for EHR integration.
+- **No PHI in analytics / Crashlytics** — separate observability for healthcare.
+- **BAAs with every cloud provider** that touches PHI.
+- **FDA SaMD classification** depends on labeling — get legal review.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Audit a sample app', description: 'Take a fitness app design. Identify every place PHI flows. Add app-level encryption, audit logging, and session timeout.' },
+  { title: 'AuditingRepository pattern', description: 'Wrap a sample PatientRepository with an audit-logging decorator. Verify every fetch produces a log entry.' },
+  { title: 'Health Connect integration', description: 'Migrate one screen from direct sensor reads to Health Connect. Request permissions properly; handle the user denying.' },
+  { title: 'FHIR experiment', description: 'Use Google\'s FHIR SDK to fetch a Patient resource from a test server (Open EHR sandbox). Render basic demographics.' },
+  { title: 'GDPR deletion flow', description: 'Implement a complete \"delete my data\" flow: confirm identity → backend cascade → local wipe → sign out.' }
+]} />
+
+## Next
+
+Continue to **[E-Commerce & Gaming Patterns](./ecommerce-gaming)** or
+return to **[Industry Domains](/docs/industry-domains)**.

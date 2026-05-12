@@ -1,0 +1,699 @@
+---
+id: android-studio-mastery
+title: Android Studio Mastery
+sidebar_label: Android Studio Mastery
+description: Power-user shortcuts, debugging tricks, profilers, ADB, custom live templates, plugin ecosystem, and the meta-skills that 10× your speed.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Android Studio Mastery
+
+Most engineers use Android Studio at 20% of its capability. Investing a
+week to master the IDE pays back forever. This chapter covers the
+shortcuts, debugging tricks, profilers, and plugins that separate
+"types code" from "lives in the IDE."
+
+## The 12 keyboard shortcuts to master first
+
+| Shortcut (macOS / Win) | What |
+|------------------------|------|
+| `⇧⇧` / `Shift+Shift` | Search Everywhere — files, classes, actions |
+| `⌘E` / `Ctrl+E` | Recent files popup |
+| `⌘N` / `Alt+Insert` | Generate (constructors, getters, overrides) |
+| `⌥↩` / `Alt+Enter` | Quick fix / show intentions |
+| `⌘B` / `Ctrl+B` | Go to declaration |
+| `⌘⌥B` / `Ctrl+Alt+B` | Go to implementation |
+| `⌘F12` / `Ctrl+F12` | File structure (functions / classes outline) |
+| `⌘R` / `Ctrl+R` | Replace in file |
+| `⌘⇧R` / `Ctrl+Shift+R` | Replace in project |
+| `⌘D` / `Ctrl+D` | Duplicate line |
+| `⌘W` / `Ctrl+W` | Extend selection |
+| `⌘⌥L` / `Ctrl+Alt+L` | Reformat code |
+
+Drill these for a week until they're muscle memory. Then learn the next
+10.
+
+### Navigation
+
+```text
+⌘O / Ctrl+N           Go to class
+⌘⇧O / Ctrl+Shift+N    Go to file
+⌘⌥O / Ctrl+Alt+Shift+N Go to symbol
+⌘G / Ctrl+G           Go to line
+⌘← / Ctrl+Alt+←       Navigate back (after jump)
+⌘→ / Ctrl+Alt+→       Navigate forward
+```
+
+`Cmd+B` on a function name jumps to definition. `Cmd+Alt+B` jumps to the
+implementation (for interfaces). `Cmd+U` jumps to the super.
+
+### Refactoring
+
+```text
+⌘⌥M / Ctrl+Alt+M      Extract method
+⌘⌥V / Ctrl+Alt+V      Extract variable
+⌘⌥C / Ctrl+Alt+C      Extract constant
+⌘⌥P / Ctrl+Alt+P      Extract parameter
+⌘⌥N / Ctrl+Alt+N      Inline
+⌘F6 / Ctrl+F6         Change signature
+⇧F6 / Shift+F6        Rename
+F6                     Move (file / class / method)
+```
+
+Refactor via menu, not search-replace. The IDE updates every reference
+correctly — typed renames are safe.
+
+### Multi-cursor
+
+`⌥⌥↓` (macOS) / `Alt+Alt+↓` — add cursor below. Edit multiple lines
+simultaneously. Saves enormous time when refactoring tables or repetitive
+code.
+
+`⌘⇧A` / `Ctrl+Shift+A` opens **Find Action** — search any IDE action by
+name. `"toggle case"` finds the case-toggle action. Discovery shortcut
+for everything.
+
+---
+
+## Code completion
+
+### Smart completion — type-aware
+
+`⌃⇧Space` / `Ctrl+Shift+Space` — completes with **only type-compatible**
+options. Way more useful than basic completion in long lists.
+
+```kotlin
+val user: User = userRepo.<caret>
+// Basic completion: shows everything on userRepo
+// Smart completion: shows only methods returning User
+```
+
+### Postfix completion
+
+Type `expression.if<Tab>` to wrap in an `if`. Many postfix templates:
+
+```kotlin
+list.notNull              // becomes: if (list != null) { list }
+str.let                    // becomes: str?.let { }
+condition.if               // becomes: if (condition) { }
+value.var                  // becomes: var x = value
+```
+
+Discover them all: Preferences → Editor → General → Postfix Completion.
+
+### Live templates
+
+`logd<Tab>` → `Log.d("TAG", "$0")`. Set up a few personal templates:
+
+```text
+fun<Tab>           fun NAME(): TYPE { }
+suspend<Tab>       suspend fun NAME(): TYPE { }
+view<Tab>          @Composable fun NAME() { }
+test<Tab>          @Test fun NAME() = runTest { }
+```
+
+Preferences → Editor → Live Templates. Custom abbreviations save thousands
+of keystrokes per week.
+
+---
+
+## Search — past Cmd+F
+
+### Structural search
+
+Find `if (x != null) { x.method() }` across the codebase:
+
+Edit → Find → Search Structurally:
+
+```text
+Search template:
+if ($X$ != null) {
+    $X$.$METHOD$()
+}
+```
+
+Replace with `$X$?.${METHOD}()`. Bulk migrations to safe-call operator
+across hundreds of files. Same idea for migrating coroutine builders,
+deprecated APIs, etc.
+
+### Find usages
+
+`⌥F7` / `Alt+F7` — find every call site of the symbol under cursor.
+Critical before changing public API.
+
+`⌘⇧F` / `Ctrl+Shift+F` — find in path, scoped to directory / module.
+
+### Recent searches
+
+`⌥⌘↓` / `Ctrl+Shift+↓` shows recent locations history — every place
+you've visited recently. Faster than re-searching.
+
+---
+
+## Debugging
+
+### Conditional breakpoints
+
+Right-click a breakpoint → Condition:
+
+```kotlin
+user.id == "u_42"
+```
+
+Only breaks when the condition is true. Saves hundreds of "continue"
+clicks during multi-user debugging.
+
+### Logging breakpoint
+
+Right-click → "Suspend: No" + "Evaluate and log" → `"Step $step: $value"`.
+
+Logs without stopping execution. Better than adding `Log.d()` calls
+during debugging (no recompile, no leftover logs).
+
+### Field watchpoint
+
+Right-click in margin next to a field → Add field watchpoint. Breaks
+when **any code** reads or writes the field. Diagnoses "who's modifying
+this?" mysteries.
+
+### Method breakpoint
+
+Set a breakpoint on a method name (not a line) → breaks on every call.
+Useful when many call sites lead to the same method.
+
+### Evaluate expression
+
+`⌥F8` / `Alt+F8` at any breakpoint. Run arbitrary Kotlin in the current
+scope:
+
+```kotlin
+users.filter { it.age > 30 }.map { it.name }
+// Shows the result in real time
+```
+
+Faster than adding more print statements. Test hypothesis on the spot.
+
+### Step actions
+
+```text
+F8                Step over
+F7                Step into
+⌥F7 / Alt+F7      Force step into (Kotlin / library code)
+⇧F8 / Shift+F8    Step out
+⌥F9 / Alt+F9      Run to cursor
+F9                Resume
+```
+
+### Drop frame
+
+While paused → Frames panel → right-click frame → Drop Frame. Restarts
+the current method. Lets you re-trigger a method without restarting the
+whole app.
+
+### Coroutine debugger
+
+Run → Debug → Coroutines tab shows all running coroutines with their
+state, scope, and current suspend point. Indispensable for diagnosing
+"why is this coroutine stuck?"
+
+```kotlin
+viewModelScope.launch(CoroutineName("profile-loader")) {
+    /* ... */
+}
+```
+
+Named coroutines show up in the debugger by name.
+
+---
+
+## Profilers
+
+### CPU Profiler
+
+Run → Profile → CPU tab. Three modes:
+
+- **Sample Java Methods** — low overhead, good for general profiling
+- **Trace Java Methods** — high overhead, exact timing
+- **System Trace (Perfetto)** — most detail, includes kernel + GPU
+- **Sample C/C++ Functions** — for NDK code
+
+For Compose perf debugging, use **System Trace** — it shows Choreographer
+frames, recomposition pulses, layout / measure / draw timing.
+
+### Memory Profiler
+
+Tools → Memory tab. Real-time heap usage; capture heap dumps; track
+allocations.
+
+Use for:
+- Diagnosing memory leaks (in conjunction with LeakCanary — Module 10)
+- Finding allocation hotspots
+- Measuring before/after of optimizations
+
+### Network Profiler
+
+Tools → Inspector → Network. Shows every HTTP request / response with
+headers, body, timing. Works with OkHttp / HttpURLConnection out of the
+box.
+
+For deeper inspection, use Charles / Proxyman as a proxy — see Network
+Security Config testing in Module 16.
+
+### Energy Profiler
+
+Tools → Energy tab. Estimates battery cost per app component (network,
+CPU, location, sensors). Less precise than Battery Historian on a real
+device, but in-IDE.
+
+---
+
+## ADB tricks every Android dev should know
+
+```bash
+# List devices
+adb devices
+
+# Install / uninstall
+adb install app.apk
+adb uninstall com.myapp
+
+# Push / pull files
+adb push local.txt /sdcard/
+adb pull /sdcard/local.txt
+
+# Logcat
+adb logcat                                       # all
+adb logcat | grep "MyTag"                         # filter
+adb logcat *:E                                    # errors only
+adb logcat --pid=$(adb shell pidof com.myapp)    # one app only
+
+# Force-stop / clear data
+adb shell am force-stop com.myapp
+adb shell pm clear com.myapp
+
+# Launch activity
+adb shell am start -n com.myapp/.MainActivity
+adb shell am start -W -a android.intent.action.VIEW -d "https://myapp.com/path"
+
+# Doze testing
+adb shell dumpsys deviceidle force-idle
+adb shell dumpsys deviceidle unforce
+
+# Network conditions
+adb shell svc data disable / enable
+adb shell svc wifi disable / enable
+
+# Permissions
+adb shell pm grant com.myapp android.permission.CAMERA
+adb shell pm revoke com.myapp android.permission.CAMERA
+
+# Take screenshot
+adb shell screencap -p /sdcard/screen.png && adb pull /sdcard/screen.png
+
+# Record screen
+adb shell screenrecord /sdcard/demo.mp4
+# ... Ctrl+C to stop
+adb pull /sdcard/demo.mp4
+
+# Inspect databases / preferences
+adb shell run-as com.myapp ls -la /data/data/com.myapp/databases/
+adb shell run-as com.myapp cat /data/data/com.myapp/shared_prefs/...xml
+
+# Memory pressure
+adb shell am send-trim-memory com.myapp RUNNING_LOW
+
+# Battery state
+adb shell dumpsys battery set level 15
+adb shell dumpsys battery set status 3              # 1=unknown, 2=charging, 3=discharging
+adb shell dumpsys battery reset                      # restore real values
+
+# Locale / timezone
+adb shell setprop persist.sys.locale ar-EG && adb shell stop && adb shell start
+adb shell settings put global development_settings_enabled 1
+```
+
+Build a `.scripts/` folder with these as named shell scripts. Power user
+move.
+
+### ADB shortcuts in Android Studio
+
+Tools → SDK Manager → ADB Logcat (within Studio). Or:
+
+- `⌃⇧F10` / `Ctrl+Shift+F10` runs current file
+- `⌃⌥R` / `Alt+Shift+F10` shows run configurations menu
+- `⌃R` / `Shift+F10` runs the last config
+- `⌃D` / `Shift+F9` debugs the last config
+
+---
+
+## Compose-specific tools
+
+### Compose Layout Inspector
+
+Tools → Layout Inspector. Shows the live composable tree of the running
+app:
+- Inspect parameters of each composable
+- See recomposition counts (essential for perf — Module 03)
+- Verify state values
+- Force a redraw
+
+### Compose Preview
+
+Studio's preview pane is hugely accelerated by:
+- **Live Edit** — code changes appear in preview instantly
+- **Interactive mode** — click / scroll in the preview without running
+- **Multi-preview annotations** — `@PreviewParameter` for varied data
+
+```kotlin
+@Preview(name = "Light")
+@Preview(name = "Dark", uiMode = Configuration.UI_MODE_NIGHT_YES)
+@Preview(name = "Large font", fontScale = 2f)
+annotation class ThemePreviews
+
+@ThemePreviews
+@Composable
+fun ButtonPreview() {
+    AppTheme { Button(onClick = {}) { Text("OK") } }
+}
+```
+
+3 previews from one function. Reduces "run app to check style" loops.
+
+---
+
+## Custom inspections
+
+Preferences → Editor → Inspections → Create.
+
+Example: warn when `runBlocking` appears outside test code:
+
+```text
+Severity: Warning
+Pattern: runBlocking
+Apply to: *.kt
+Exclude: test/, androidTest/
+Message: "runBlocking is not allowed in production code"
+```
+
+Build org-specific inspections for your codebase's conventions.
+Codebase-aware linting beyond detekt.
+
+---
+
+## Plugins worth installing
+
+| Plugin | What |
+|--------|------|
+| **Key Promoter X** | Shows the shortcut for every action you do by mouse. Trains you fast. |
+| **String Manipulation** | Case conversion, sorting, escape / unescape |
+| **Rainbow Brackets** | Color-paired brackets — invaluable for deep nesting |
+| **GitToolBox** | Git integration extras (auto-fetch, blame inline) |
+| **MetricsReloaded** | Compute code metrics (complexity, dependencies) |
+| **Detekt** | Run Detekt in-IDE with inline highlights |
+| **Save Actions** | Auto-format / optimize imports on save |
+| **CodeGlance Pro** | Mini-map of the file like VSCode |
+| **GitHub Copilot** | AI completion (controversial; opinionated) |
+
+Install incrementally. Each plugin slows IDE startup; don't add 30 that
+you don't use.
+
+---
+
+## Editor configuration
+
+### `.editorconfig` shared across team
+
+```ini
+# .editorconfig
+root = true
+
+[*]
+charset = utf-8
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.{kt,kts}]
+ktlint_code_style = ktlint_official
+ij_kotlin_imports_layout = *,java.**,javax.**,kotlin.**,^
+ij_continuation_indent_size = 4
+
+[*.{json,yml,yaml,xml,toml}]
+indent_size = 2
+```
+
+Every IDE on the team picks it up. No more "your file has tabs, mine has
+spaces" PR fights.
+
+### File templates
+
+Preferences → Editor → File and Code Templates. Customize the default
+content of new Kotlin files:
+
+```kotlin
+package $PACKAGE_NAME$
+
+#parse("File Header.java")
+
+/**
+ * $DESCRIPTION$
+ */
+class ${NAME} {
+}
+```
+
+Set "File Header" to include the author + copyright; new files get
+boilerplate filled.
+
+---
+
+## Bookmarks
+
+`F11` (macOS) / `F11` (Win) — toggle a bookmark on the current line.
+`⌘F11` / `Shift+F11` — show bookmarks list.
+
+Useful when working across 5 files for a feature; jump back instantly.
+Mnemonic bookmarks: `⌥F11<digit>` / `Ctrl+F11 + digit` to set
+numbered bookmark; recall with `⌃<digit>`.
+
+---
+
+## Git integration
+
+### Annotate / Blame
+
+Right-click in margin → Annotate. Inline `git blame` showing who last
+touched each line + when. Fast way to find "why does this code exist."
+
+### Local history
+
+Even without commits, Android Studio keeps a local history of every
+file. File → Local History → Show History. Recover code from 3 hours
+ago without git.
+
+### Stash + shelve
+
+`⌘⌥Z` / `Ctrl+Alt+Z` — Git → Stash Changes. Stash a WIP set; restore
+later. Better than `git stash` from the command line for the UI
+feedback.
+
+Shelve (the IDE's own mechanism) is similar but doesn't touch git. Use
+for "I want to experimentally apply these changes without committing."
+
+---
+
+## Build optimizations
+
+### Gradle daemon
+
+Preferences → Build → Build Tools → Gradle:
+- Use Gradle from `gradle-wrapper.properties` (consistent versions)
+- Build and run using: Gradle (not "IDE builder")
+- Run tests using: Gradle
+- Daemon: enabled
+
+### Incremental builds
+
+Modern Gradle + Android Studio handles this; just don't override:
+- Don't disable Gradle's configuration cache
+- Don't manually clean unless required
+- Use `./gradlew assembleDebug --scan` to debug long builds
+
+### Heap
+
+Edit `gradle.properties`:
+
+```properties
+org.gradle.jvmargs=-Xmx6g -XX:+UseG1GC -XX:MaxMetaspaceSize=1g \
+    -Dfile.encoding=UTF-8 \
+    -Dkotlin.daemon.jvm.options="-Xmx4g"
+```
+
+6g+ for medium-large projects. Studio's `Help → Edit Custom VM Options`
+configures Studio's own heap:
+
+```text
+-Xms2g
+-Xmx8g
+-XX:ReservedCodeCacheSize=512m
+```
+
+8g+ for Studio itself if you have a 16GB+ machine.
+
+---
+
+## Run configurations
+
+For repetitive runs — specific test, specific deep link, specific flavor:
+
+Run → Edit Configurations. Save:
+- "Run main with debug args"
+- "Run :feature:checkout tests only"
+- "Open deep link to product detail"
+- "Run instrumented tests on Pixel 7"
+
+`⌃⌥R` / `Alt+Shift+F10` switches between configs. Faster than retyping
+test patterns.
+
+---
+
+## Working from terminal
+
+`⌥F12` / `Alt+F12` opens the terminal in the project root. Quick Gradle
+runs, git commands, ADB without leaving the IDE.
+
+Configure shell: Preferences → Tools → Terminal → Shell path
+(e.g., `/bin/zsh`).
+
+---
+
+## Common time-saving workflows
+
+### Workflow 1: Refactor an API across the codebase
+
+```text
+1. Position cursor on the function name
+2. Shift+F6 → Rename → preview
+3. Review affected files
+4. Confirm — IDE updates every call site safely
+```
+
+vs sed-replace: typed renames are guaranteed safe.
+
+### Workflow 2: Add a parameter to an existing function
+
+```text
+1. Cursor on function → Ctrl+F6 → Change Signature
+2. Add parameter; provide default value
+3. Refactor → all call sites updated
+```
+
+No breaking changes. No editing 20 files manually.
+
+### Workflow 3: Generate equals/hashCode/toString
+
+```text
+1. Add fields to a regular class
+2. Alt+Insert → Generate → equals + hashCode (or toString)
+3. Pick fields to include
+```
+
+Faster than typing. Or just use `data class` — Kotlin generates them
+all automatically.
+
+### Workflow 4: Convert a function to a property
+
+```text
+1. Cursor on `fun isReady(): Boolean = ...`
+2. Alt+Enter → Convert function to property
+3. Now it's `val isReady: Boolean = ...`
+```
+
+Mechanical refactors at one keystroke.
+
+### Workflow 5: Generate Compose Preview
+
+```text
+1. Cursor on @Composable function
+2. Alt+Insert → Generate → Compose Preview
+3. Preview function appears below; live in IDE pane
+```
+
+---
+
+## Studio Bot / Gemini integration
+
+Studio's built-in AI (2024+) does code completion, Q&A about your
+codebase, and refactor suggestions. Customize behavior:
+
+- Tools → Studio Bot → Settings → Custom rules
+- Add "always use kotlinx.coroutines, never RxJava"
+- Add "prefer Compose to XML"
+
+Adjust the AI to your codebase's conventions. Less editing of its
+suggestions.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Productivity anti-patterns',
+    title: 'Slow workflows',
+    variant: 'old',
+    points: [
+      'Click menus instead of shortcuts',
+      'Manual rename via Find/Replace',
+      'Add Log.d() then compile + run',
+      'No IDE plugins',
+      'Default Studio memory (1.5GB)',
+      'Custom inspections nobody enabled'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Fast workflows',
+    variant: 'new',
+    points: [
+      'Shift+Shift everything; 12 core shortcuts in muscle memory',
+      'Shift+F6 (Rename refactor)',
+      'Logging breakpoint instead of Log.d()',
+      'Curated plugin set; Key Promoter X teaches more',
+      'Studio heap = 8g+',
+      '.editorconfig + Save Actions enforce on save'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Android Studio mastery rules">
+- **Master 12 shortcuts** to start; `⌘⇧A` / `Ctrl+Shift+A` discovers everything else.
+- **Refactor via Studio**, not search-replace.
+- **Conditional + logging breakpoints** beat `Log.d()` for debugging.
+- **Layout Inspector + Compose Preview** for UI iteration speed.
+- **ADB scripts** for common test scenarios (deep links, Doze, locale switches).
+- **Custom inspections** enforce codebase-specific conventions.
+- **Studio heap 8g+** + **Gradle 6g+** for modern Android projects.
+- **`.editorconfig` + Save Actions** kill format-related PR comments.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Drill 12 shortcuts', description: 'Spend 1 hour each day for a week practicing the 12 core shortcuts. Note when you reach for the mouse — that\'s the next shortcut to learn.' },
+  { title: 'Install Key Promoter X', description: 'Every menu click triggers a popup with the shortcut. Trains you within days.' },
+  { title: 'Conditional breakpoint', description: 'Find a bug that only happens for specific data. Set a conditional breakpoint. Diagnose without restarting the app 20 times.' },
+  { title: 'Build ADB scripts folder', description: 'Create ~/scripts/ with: doze.sh, throttle-network.sh, slow-cpu.sh, etc. Add to your PATH.' },
+  { title: 'Custom live template', description: 'Create a `viewmodel` template that scaffolds: class declaration + StateFlow + collect helper. Use it on a new screen.' }
+]} />
+
+## Next
+
+Continue to **[A/B Testing & Experimentation](./ab-testing-experimentation)**
+for shipping with confidence.

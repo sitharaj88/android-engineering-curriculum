@@ -1,0 +1,559 @@
+---
+id: fintech
+title: Fintech Patterns
+sidebar_label: Fintech
+description: Building Android apps for fintech — PCI DSS, payment integration (Stripe, Adyen, PayPal), fraud detection, transaction integrity, multi-factor auth, regulatory compliance.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Fintech Patterns
+
+Fintech apps face requirements consumer apps don't: regulatory
+compliance, irrevocable transactions, fraud detection, financial-grade
+authentication, and audit logs. The patterns are specific. This chapter
+covers what's different — and what makes engineers in this space
+valuable.
+
+## The compliance landscape
+
+| Regulation | Applies to                                               |
+|------------|---------------------------------------------------------|
+| **PCI DSS**| Anyone storing / processing / transmitting card data    |
+| **PSD2 / SCA** | European payments — Strong Customer Authentication   |
+| **KYC / AML**| Account opening, money transfer                       |
+| **GDPR / CCPA** | All apps with EU / California users                |
+| **SOC 2** | Service organizations handling financial data            |
+| **BSA / FinCEN** | US money services businesses                       |
+| **SEBI / RBI**| India financial services                              |
+
+You don't typically implement these alone — you partner with platforms
+(Stripe, Plaid, Visa) that abstract most of it. But you must
+**understand** what they require and how the architecture must reflect it.
+
+---
+
+## Don't store card data — ever
+
+The single biggest PCI DSS exemption: if you **never touch the raw card
+data**, your PCI scope shrinks dramatically. Strategy:
+
+```text
+1. User taps "Pay"
+2. Your app shows the payment provider's UI (Stripe Elements,
+   Google Pay, Apple Pay, etc.)
+3. Provider tokenizes the card on their servers; returns a token
+4. Your app sends the token to your backend
+5. Your backend charges via the provider's API using the token
+```
+
+You never see the PAN (card number), CVV, or expiry. Your PCI scope is
+limited to the integration paths.
+
+### Stripe SDK example
+
+```kotlin
+// libs.versions.toml
+stripe-android = { module = "com.stripe:stripe-android", version = "21.0.0" }
+```
+
+```kotlin
+class PaymentService @Inject constructor(
+    private val stripe: Stripe
+) {
+    suspend fun createPayment(activity: Activity, amount: Long): Outcome<PaymentResult, PaymentError> {
+        return try {
+            // 1. Backend creates a PaymentIntent
+            val clientSecret = backendApi.createPaymentIntent(amount).clientSecret
+
+            // 2. Open Stripe's PaymentSheet
+            val sheet = PaymentSheet(activity, ::onResult)
+            sheet.presentWithPaymentIntent(
+                clientSecret,
+                PaymentSheet.Configuration(merchantDisplayName = "My App")
+            )
+
+            // 3. Wait for callback
+            val result = paymentResultFlow.first()
+            when (result) {
+                is PaymentSheetResult.Completed -> Outcome.Ok(PaymentResult.Success(result.intent))
+                is PaymentSheetResult.Canceled -> Outcome.Err(PaymentError.UserCancelled)
+                is PaymentSheetResult.Failed -> Outcome.Err(PaymentError.Failed(result.error))
+            }
+        } catch (e: Exception) {
+            Outcome.Err(PaymentError.Unknown(e))
+        }
+    }
+}
+```
+
+The `PaymentSheet` runs in Stripe's process; card data never enters
+your code. Stripe handles 3DS / SCA / receipt generation.
+
+### Google Pay alternative
+
+```kotlin
+implementation("com.google.android.gms:play-services-wallet:19.4.0")
+implementation("com.stripe:stripe-android:21.0.0")
+```
+
+```kotlin
+fun createGooglePayRequest(): PaymentDataRequest {
+    val paymentMethod = JSONObject().apply {
+        put("type", "CARD")
+        put("parameters", JSONObject().apply {
+            put("allowedAuthMethods", JSONArray(listOf("PAN_ONLY", "CRYPTOGRAM_3DS")))
+            put("allowedCardNetworks", JSONArray(listOf("AMEX", "VISA", "MASTERCARD", "DISCOVER")))
+        })
+        put("tokenizationSpecification", JSONObject().apply {
+            put("type", "PAYMENT_GATEWAY")
+            put("parameters", JSONObject().apply {
+                put("gateway", "stripe")
+                put("stripe:publishableKey", BuildConfig.STRIPE_PUBLISHABLE_KEY)
+                put("stripe:version", "2024-04-10")
+            })
+        })
+    }
+
+    return PaymentDataRequest.fromJson(/* request JSON */)
+}
+```
+
+Google Pay handles the auth on-device (biometric / device PIN); returns a
+tokenized payment method to send to Stripe. Lowest friction for users
+with Google Pay set up.
+
+---
+
+## Strong Customer Authentication (SCA / PSD2)
+
+European regulation requires SCA on most online payments:
+- Two of: something you know (password), something you have (phone),
+  something you are (biometric)
+
+Stripe / Adyen / your payment gateway handles this via 3DS 2.0. Your job
+is to **not break the flow** — don't dismiss webviews, don't auto-submit
+forms.
+
+```kotlin
+// Stripe 3DS flow
+val confirmParams = ConfirmPaymentIntentParams.createWithPaymentMethodId(
+    paymentMethodId = "pm_card_visa",
+    clientSecret = paymentIntentClientSecret,
+    returnUrl = "myapp://stripe/redirect"
+)
+
+stripe.confirmPayment(activity, confirmParams)
+
+// Add a redirect handler to MainActivity manifest
+<intent-filter>
+    <action android:name="android.intent.action.VIEW"/>
+    <data android:scheme="myapp" android:host="stripe"/>
+</intent-filter>
+```
+
+If 3DS is required, the SDK opens the bank's auth page. After auth,
+deep link returns to your app.
+
+---
+
+## Idempotency — the financial superpower
+
+**The rule**: every mutation (charge, refund, transfer) must be safe to
+retry. The client generates a UUID; the server dedupes:
+
+```kotlin
+class PaymentService {
+    suspend fun charge(amount: Cents, methodId: String): Outcome<Receipt, PaymentError> {
+        val idempotencyKey = UUID.randomUUID().toString()
+        return withRetry(maxAttempts = 3) {
+            apiCall {
+                api.charge(
+                    amount = amount.value,
+                    methodId = methodId,
+                    idempotencyKey = idempotencyKey         // same on every retry
+                )
+            }
+        }
+    }
+}
+```
+
+Backend:
+
+```javascript
+// Pseudocode
+app.post('/charge', async (req, res) => {
+  const idempotencyKey = req.body.idempotencyKey;
+
+  const existing = await db.query('SELECT * FROM charges WHERE idempotency_key = $1', [idempotencyKey]);
+  if (existing) return res.json(existing);     // dedupe — return previous result
+
+  const charge = await stripe.charges.create({
+    amount: req.body.amount,
+    source: req.body.token
+  }, { idempotencyKey });
+
+  await db.insert('charges', { ...charge, idempotency_key: idempotencyKey });
+  res.json(charge);
+});
+```
+
+Network blip → client retries with same key → server returns previous
+result without double-charging. **This is non-negotiable.** A duplicate
+$1000 charge is a customer service nightmare and a regulatory issue.
+
+---
+
+## Transaction integrity
+
+### Optimistic UI with rollback
+
+```kotlin
+class TransferService {
+    suspend fun transfer(from: AccountId, to: AccountId, amount: Cents): Outcome<TransferId, TransferError> {
+        // 1. Show optimistic update locally
+        val pendingId = TransferId.local()
+        ledger.insert(LedgerEntry(
+            id = pendingId,
+            from = from,
+            to = to,
+            amount = amount,
+            status = TransferStatus.Pending
+        ))
+
+        // 2. Server call (idempotent)
+        return try {
+            val result = api.transfer(from, to, amount, idempotencyKey = pendingId.value)
+            ledger.update(pendingId, status = TransferStatus.Completed, serverId = result.id)
+            Outcome.Ok(result.id)
+        } catch (e: Exception) {
+            ledger.update(pendingId, status = TransferStatus.Failed)
+            Outcome.Err(TransferError.fromException(e))
+        }
+    }
+}
+```
+
+The UI shows the transfer immediately with a "pending" indicator. On
+success it becomes "completed"; on failure it reverts. Users see fast
+feedback; the audit trail is preserved.
+
+### Two-phase commit isn't a thing on Android
+
+Forget about distributed transactions across phone + server. Instead:
+- **Local Ledger** records the user's intent
+- **Server** is the source of truth for actual money movement
+- **Reconciliation jobs** detect disagreements and surface them
+
+### Real-time balance display
+
+```kotlin
+class BalanceRepository @Inject constructor(
+    private val api: BankingApi,
+    private val ledger: LedgerDao
+) {
+    fun observeBalance(accountId: AccountId): Flow<Money> = flow {
+        emit(computeLocalBalance(accountId))                // immediate from cache
+
+        emitAll(merge(
+            api.subscribeBalanceWS(accountId),               // server push
+            timer(refreshInterval = 30.seconds)
+                .flatMapLatest { flowOf(api.fetchBalance(accountId)) }
+        ))
+    }
+}
+```
+
+Combine WebSocket push + periodic poll fallback. Real-time when
+possible; eventually-consistent otherwise.
+
+---
+
+## Multi-factor authentication
+
+Banking apps require **layered auth**:
+- Device unlock (biometric / PIN)
+- Account password (set on web)
+- Step-up auth for sensitive actions (large transfers, change password)
+
+```kotlin
+class TransferConfirmation @Inject constructor(
+    private val biometricCrypto: BiometricCrypto,
+    private val transferService: TransferService
+) {
+    suspend fun confirmTransfer(activity: FragmentActivity, transfer: Transfer): Outcome<TransferId, TransferError> {
+        // Step-up: require biometric for transfers > $1000
+        if (transfer.amount > Money(100_000)) {        // $1000 in cents
+            val authed = biometricCrypto.authorizeWithBiometric(
+                activity = activity,
+                title = "Authorize transfer",
+                subtitle = "${transfer.amount.format()} to ${transfer.to.name}",
+                payload = transfer.toBytes()
+            )
+            if (!authed) return Outcome.Err(TransferError.AuthorizationFailed)
+        }
+
+        return transferService.transfer(transfer.from, transfer.to.id, transfer.amount)
+    }
+}
+```
+
+The biometric prompt is **bound** to the specific transfer payload — see
+[Cryptography & Keystore](/docs/security-compliance/cryptography-keystore).
+Can't be replayed.
+
+---
+
+## Fraud detection signals
+
+The client collects (and sends server-side):
+
+```kotlin
+class FraudSignals @Inject constructor(@ApplicationContext context: Context) {
+    val deviceId: String                                       // stable device identifier
+    val playIntegrityToken: String?                            // see Module 16
+    val networkInfo: NetworkInfo                                // wifi vs cell, carrier, IP
+    val locale: Locale
+    val timezone: TimeZone
+    val installSource: String?                                  // Play Store or sideload
+    val accelerometerVariance: Float                            // active vs stationary
+    val locationFuzzy: LocationGrid?                            // 1km grid, not exact
+    val biometricAuthAvailable: Boolean
+}
+```
+
+These signals feed your fraud system. Anomalies (login from new device +
+new country + large transfer) trigger:
+- Step-up auth
+- Manual review
+- Block
+
+**Don't roll your own fraud system.** Use Sift, Castle.io, or your
+payment platform's built-in fraud (Stripe Radar). Your role is collecting
+signals + acting on the platform's risk score.
+
+---
+
+## Audit logs
+
+Every state-changing action logged:
+
+```kotlin
+data class AuditEntry(
+    val id: String,
+    val userId: UserId,
+    val timestamp: Instant,
+    val action: AuditAction,
+    val targetType: String,
+    val targetId: String,
+    val before: String?,                                       // serialized state
+    val after: String?,
+    val ipAddress: String?,                                     // server-side
+    val deviceId: String,
+    val outcome: AuditOutcome
+)
+
+sealed interface AuditAction {
+    data object Login : AuditAction
+    data object Logout : AuditAction
+    data class Transfer(val amountCents: Long) : AuditAction
+    data class CardAdded(val last4: String) : AuditAction
+    data class CardRemoved(val last4: String) : AuditAction
+    data class TwoFAEnabled(val method: String) : AuditAction
+}
+
+interface AuditLogger {
+    suspend fun log(entry: AuditEntry)
+}
+```
+
+Logged client-side (for context) but **authoritative on the server**.
+Required for:
+- Regulatory audits (SOX, PCI, SOC 2)
+- Customer dispute resolution
+- Fraud investigation
+- Compliance reports
+
+Retention: 7+ years typically. Encrypted at rest. Immutable (append-only,
+no edits).
+
+---
+
+## Common fintech architecture
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  UI (Compose)                                                │
+│    Accounts · Transfers · Cards · Statements                 │
+├─────────────────────────────────────────────────────────────┤
+│  ViewModels                                                  │
+│    OptimisticUI + step-up auth + fraud signal collection     │
+├─────────────────────────────────────────────────────────────┤
+│  Repositories                                                │
+│    Local ledger (Room+SQLCipher) + Server API                │
+│    Real-time via WebSocket + periodic poll                   │
+├─────────────────────────────────────────────────────────────┤
+│  Network                                                     │
+│    OkHttp + cert pinning + Play Integrity tokens             │
+│    Idempotency keys on every mutation                        │
+├─────────────────────────────────────────────────────────────┤
+│  Crypto                                                      │
+│    Encrypted Room (SQLCipher) for local data                 │
+│    Keystore-backed biometric keys for transaction signing    │
+│    Tokenized payment methods (never raw PAN)                 │
+├─────────────────────────────────────────────────────────────┤
+│  Telemetry                                                   │
+│    Audit log to backend + Crashlytics + custom KPIs          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Open banking / Plaid integration
+
+```kotlin
+// libs.versions.toml
+plaid = "5.4.0"
+
+plaid-link = { module = "com.plaid.link:sdk-core", version.ref = "plaid" }
+```
+
+```kotlin
+class PlaidService @Inject constructor(@ApplicationContext context: Context) {
+    suspend fun linkBank(activity: Activity): Outcome<PlaidAccount, PlaidError> {
+        // 1. Backend creates a link token
+        val linkToken = backendApi.createLinkToken().linkToken
+
+        // 2. Open Plaid Link
+        val configuration = LinkTokenConfiguration.Builder()
+            .token(linkToken)
+            .build()
+
+        return suspendCoroutine { cont ->
+            Plaid.create(application, configuration).open(activity) { result ->
+                when (result) {
+                    is LinkSuccess -> {
+                        // 3. Send public token to backend; backend exchanges for access token
+                        cont.resume(Outcome.Ok(PlaidAccount(result.publicToken)))
+                    }
+                    is LinkExit -> {
+                        cont.resume(Outcome.Err(PlaidError.UserCancelled))
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Plaid handles bank credential entry; your backend uses access tokens to
+fetch balances + transactions via Plaid's API. You never touch
+credentials.
+
+---
+
+## App Attest / Play Integrity for transactions
+
+Every high-value mutation includes a Play Integrity token (Module 16):
+
+```kotlin
+suspend fun submitTransaction(transaction: Transaction): Outcome<TransactionId, TransactionError> {
+    val nonce = sha256(transaction.toBytes())
+    val integrityToken = playIntegrity.getStandardToken(requestHash = nonce)
+
+    return apiCall {
+        api.submitTransaction(
+            transaction = transaction,
+            integrityToken = integrityToken,
+            requestHash = nonce
+        )
+    }
+}
+```
+
+Backend verifies the token + hash before processing. Stops scripted /
+emulator-based fraud automation.
+
+---
+
+## Compliance certifications
+
+If your app handles real money, your company likely pursues:
+
+- **SOC 2 Type II** — annual audit of controls
+- **PCI DSS** — if any card data flows
+- **ISO 27001** — security management system
+- **GDPR / CCPA** — privacy
+- **State licenses** (US money transmitter licenses per state)
+
+You as an engineer don't manage these directly, but your code must
+satisfy specific controls:
+- Encrypted at rest + in transit
+- Access logs for all data reads
+- Production access requires approval + audit log
+- Vulnerability scanning on every release
+- Incident response plan
+
+---
+
+## Common fintech anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Fintech anti-patterns',
+    title: 'Regulatory + customer hazards',
+    variant: 'old',
+    points: [
+      'Storing raw PAN locally for "convenience"',
+      'No idempotency keys (double-charges)',
+      'No biometric step-up for large transfers',
+      'Logging PII in Crashlytics',
+      'Client-side fraud rules (bypassable)',
+      'No audit log for state changes'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Compliance-ready',
+    variant: 'new',
+    points: [
+      'Tokenized payment (Stripe / Adyen / Google Pay)',
+      'Idempotency on every charge / transfer / refund',
+      'Step-up biometric for sensitive actions',
+      'PII scrubbed before Crashlytics; encrypted local storage',
+      'Server-side fraud rules; client signals only',
+      'Immutable audit log; 7+ year retention'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Fintech rules">
+- **Never store raw card data** — tokenize via Stripe / Google Pay.
+- **Idempotency keys** on every mutation — duplicate charge = lawsuit.
+- **Multi-factor auth** layered: device + account + step-up for high-value actions.
+- **Optimistic UI with local ledger** + server reconciliation.
+- **Fraud signals collected client-side; rules evaluated server-side.**
+- **Play Integrity** on high-value transactions.
+- **Audit log** every state change; immutable, encrypted, long retention.
+- **Compliance is the product** — every line of code must satisfy a control.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Stripe integration', description: 'Add Stripe PaymentSheet for a simple checkout. Verify no card data enters your app\'s code.' },
+  { title: 'Idempotency keys', description: 'Generate a UUID per transaction; pass on every retry. Backend dedupes — write a test that simulates 3 retries and asserts only one charge.' },
+  { title: 'Biometric step-up', description: 'For transfers > $1000, require BiometricPrompt. Bind the auth to a specific transfer payload (Module 16).' },
+  { title: 'Audit log', description: 'Define AuditEntry + AuditAction. Log every login, transfer, and card change. Ship to backend; never to Crashlytics.' },
+  { title: 'Play Integrity', description: 'Wrap your high-value endpoint with a Play Integrity check. Pass request hash; backend validates.' }
+]} />
+
+## Next
+
+Continue to **[Healthcare Patterns](./healthcare)** or **[E-Commerce &
+Gaming](./ecommerce-gaming)**.

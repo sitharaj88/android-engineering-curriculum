@@ -1,0 +1,654 @@
+---
+id: paging-3
+title: Paging 3 Deep Dive
+sidebar_label: Paging 3
+description: Paging 3 architecture — PagingSource, RemoteMediator, transforms, headers/footers, refresh keys, error handling, and Compose LazyColumn integration.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Paging 3 Deep Dive
+
+Paging 3 is the official solution for paginated lists. It handles
+loading state, retries, cache, prefetching, and Compose integration — but
+its three-layer architecture (PagingSource → Pager → PagingData) takes
+a moment to internalize. This chapter walks the full surface.
+
+## The architecture
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  UI (LazyColumn)                                              │
+│    collectAsLazyPagingItems() → LazyPagingItems<T>            │
+├──────────────────────────────────────────────────────────────┤
+│  ViewModel                                                    │
+│    Pager.flow → Flow<PagingData<T>>.cachedIn(viewModelScope) │
+├──────────────────────────────────────────────────────────────┤
+│  Pager (configuration)                                        │
+│    pageSize, prefetchDistance, RemoteMediator                │
+├──────────────────────────────────────────────────────────────┤
+│  PagingSource<Key, Value>                                     │
+│    load(LoadParams<Key>) → LoadResult<Key, Value>            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Three layers, three responsibilities:
+1. **PagingSource** — "load one page from this key"
+2. **Pager** — "load with this config; expose as Flow"
+3. **UI** — "render with this Flow"
+
+---
+
+## Setup
+
+```kotlin
+// libs.versions.toml
+paging = "3.3.4"
+
+paging-runtime = { module = "androidx.paging:paging-runtime", version.ref = "paging" }
+paging-compose = { module = "androidx.paging:paging-compose", version.ref = "paging" }
+paging-testing = { module = "androidx.paging:paging-testing", version.ref = "paging" }
+room-paging    = { module = "androidx.room:room-paging", version = "2.6.1" }
+```
+
+---
+
+## Network-only paging
+
+Simplest case — paginated REST endpoint, no local cache:
+
+```kotlin
+class UserPagingSource @Inject constructor(
+    private val api: UserApi,
+    private val query: String
+) : PagingSource<Int, User>() {
+
+    override suspend fun load(params: LoadParams<Int>): LoadResult<Int, User> {
+        val page = params.key ?: 1
+        return try {
+            val response = api.searchUsers(query, page = page, pageSize = params.loadSize)
+            LoadResult.Page(
+                data = response.users,
+                prevKey = if (page > 1) page - 1 else null,
+                nextKey = if (response.hasMore) page + 1 else null
+            )
+        } catch (e: IOException) {
+            LoadResult.Error(e)
+        } catch (e: HttpException) {
+            LoadResult.Error(e)
+        }
+    }
+
+    override fun getRefreshKey(state: PagingState<Int, User>): Int? =
+        state.anchorPosition?.let { anchor ->
+            state.closestPageToPosition(anchor)?.prevKey?.plus(1)
+                ?: state.closestPageToPosition(anchor)?.nextKey?.minus(1)
+        }
+}
+```
+
+```kotlin
+@HiltViewModel
+class UserSearchViewModel @Inject constructor(
+    private val api: UserApi
+) : ViewModel() {
+    private val _query = MutableStateFlow("")
+
+    val users: Flow<PagingData<User>> = _query
+        .debounce(300)
+        .distinctUntilChanged()
+        .flatMapLatest { query ->
+            Pager(
+                config = PagingConfig(
+                    pageSize = 20,
+                    prefetchDistance = 5,
+                    enablePlaceholders = false,
+                    initialLoadSize = 40
+                ),
+                pagingSourceFactory = { UserPagingSource(api, query) }
+            ).flow
+        }
+        .cachedIn(viewModelScope)
+
+    fun onQueryChanged(query: String) { _query.value = query }
+}
+```
+
+`.cachedIn(viewModelScope)` is **mandatory** — it survives Compose
+recomposition and config changes. Without it, scrolling resets on every
+recomposition.
+
+---
+
+## Compose integration
+
+```kotlin
+@Composable
+fun UserSearchScreen(viewModel: UserSearchViewModel = hiltViewModel()) {
+    val users = viewModel.users.collectAsLazyPagingItems()
+
+    LazyColumn {
+        items(
+            count = users.itemCount,
+            key = users.itemKey { it.id },
+            contentType = users.itemContentType { "user" }
+        ) { index ->
+            val user = users[index]
+            if (user != null) {
+                UserRow(user)
+            } else {
+                UserPlaceholder()
+            }
+        }
+
+        // Loading states for append/refresh
+        when (val append = users.loadState.append) {
+            is LoadState.Loading -> item { LoadingIndicator() }
+            is LoadState.Error -> item { ErrorItem(append.error) { users.retry() } }
+            else -> Unit
+        }
+
+        when (val refresh = users.loadState.refresh) {
+            is LoadState.Loading -> {
+                if (users.itemCount == 0) item { FullScreenLoader() }
+            }
+            is LoadState.Error -> {
+                if (users.itemCount == 0) item { FullScreenError(refresh.error) { users.retry() } }
+            }
+            else -> Unit
+        }
+    }
+}
+```
+
+### Load states
+
+| LoadState           | When                                                     |
+|---------------------|----------------------------------------------------------|
+| `Refresh`           | Initial load or pull-to-refresh                          |
+| `Prepend`           | Loading items before the current view                    |
+| `Append`            | Loading items after the current view                     |
+| `Loading`           | Network in flight                                         |
+| `NotLoading`        | Idle                                                      |
+| `Error`             | Last attempt failed; `error: Throwable`                  |
+
+Render each meaningfully — full-screen state if no items, inline footer
+if items exist.
+
+---
+
+## Local-first paging (Paging + Room)
+
+For offline-first apps, Room is the source of truth and the network
+refreshes via `RemoteMediator`:
+
+```kotlin
+@Dao
+interface ProductDao {
+    @Query("SELECT * FROM products ORDER BY rank ASC")
+    fun pagingSource(): PagingSource<Int, ProductEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(items: List<ProductEntity>)
+
+    @Query("DELETE FROM products")
+    suspend fun clear()
+}
+```
+
+Room generates a `PagingSource<Int, ProductEntity>` automatically. UI
+observes it; Room re-emits when the table changes.
+
+### RemoteMediator — refresh from network
+
+```kotlin
+@OptIn(ExperimentalPagingApi::class)
+class ProductRemoteMediator @Inject constructor(
+    private val api: ProductApi,
+    private val db: AppDatabase
+) : RemoteMediator<Int, ProductEntity>() {
+
+    override suspend fun initialize(): InitializeAction {
+        val lastFetch = db.remoteKeyDao().getLastFetchTime() ?: 0
+        val cacheTimeout = TimeUnit.HOURS.toMillis(1)
+        return if (System.currentTimeMillis() - lastFetch < cacheTimeout) {
+            InitializeAction.SKIP_INITIAL_REFRESH
+        } else {
+            InitializeAction.LAUNCH_INITIAL_REFRESH
+        }
+    }
+
+    override suspend fun load(
+        loadType: LoadType,
+        state: PagingState<Int, ProductEntity>
+    ): MediatorResult {
+        val nextKey: Int = when (loadType) {
+            LoadType.REFRESH -> 1
+            LoadType.PREPEND -> return MediatorResult.Success(endOfPaginationReached = true)
+            LoadType.APPEND -> {
+                val lastKey = db.remoteKeyDao().getLast() ?: return MediatorResult.Success(true)
+                lastKey.nextPage ?: return MediatorResult.Success(true)
+            }
+        }
+
+        return try {
+            val response = api.products(page = nextKey, pageSize = state.config.pageSize)
+
+            db.withTransaction {
+                if (loadType == LoadType.REFRESH) {
+                    db.remoteKeyDao().clear()
+                    db.productDao().clear()
+                }
+                db.productDao().insertAll(response.items.map(ProductDto::toEntity))
+                db.remoteKeyDao().insert(RemoteKey(
+                    nextPage = if (response.hasMore) nextKey + 1 else null,
+                    fetchedAt = System.currentTimeMillis()
+                ))
+            }
+
+            MediatorResult.Success(endOfPaginationReached = !response.hasMore)
+        } catch (e: IOException) {
+            MediatorResult.Error(e)
+        } catch (e: HttpException) {
+            MediatorResult.Error(e)
+        }
+    }
+}
+```
+
+```kotlin
+@OptIn(ExperimentalPagingApi::class)
+@Singleton
+class ProductRepository @Inject constructor(
+    private val db: AppDatabase,
+    private val mediator: ProductRemoteMediator
+) {
+    fun pager(): Flow<PagingData<Product>> = Pager(
+        config = PagingConfig(pageSize = 20, prefetchDistance = 5),
+        remoteMediator = mediator,
+        pagingSourceFactory = { db.productDao().pagingSource() }
+    ).flow.map { paging -> paging.map { it.toDomain() } }
+}
+```
+
+Now the UI sees a continuous Flow — cached items first, then network
+refresh updates Room, which re-emits to the UI. Offline-tolerant.
+
+### RemoteKey table
+
+```kotlin
+@Entity
+data class RemoteKey(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val nextPage: Int?,
+    val fetchedAt: Long
+)
+```
+
+Tracks where to load from next. For cursor-based APIs, store the
+`nextCursor` string instead.
+
+---
+
+## Transforms
+
+`PagingData<T>` supports transforms — apply between source and UI:
+
+```kotlin
+val users: Flow<PagingData<UserUiModel>> = repository.pager()
+    .map { paging ->
+        paging
+            .map { user -> user.toUiModel() }                        // T → R
+            .filter { user -> !user.isBlocked }                       // filter items
+            .insertSeparators { before, after ->                      // headers
+                if (before == null || before.firstLetter != after?.firstLetter) {
+                    HeaderUiModel(letter = after?.firstLetter ?: '?')
+                } else null
+            }
+    }
+    .cachedIn(viewModelScope)
+```
+
+```kotlin
+sealed interface UiModel {
+    data class UserItem(val user: User) : UiModel
+    data class Header(val letter: Char) : UiModel
+}
+```
+
+In Compose:
+
+```kotlin
+items(count = users.itemCount, key = users.itemKey {
+    when (it) {
+        is UserItem -> "user-${it.user.id}"
+        is Header -> "header-${it.letter}"
+    }
+}) { index ->
+    when (val item = users[index]) {
+        is UserItem -> UserRow(item.user)
+        is Header -> HeaderRow(item.letter)
+        null -> ItemPlaceholder()
+    }
+}
+```
+
+`insertSeparators` is how to group lists alphabetically, by date, or any
+separator logic.
+
+---
+
+## Refresh and retry
+
+```kotlin
+@Composable
+fun PagedList(viewModel: SearchViewModel = hiltViewModel()) {
+    val items = viewModel.items.collectAsLazyPagingItems()
+
+    val refreshing = items.loadState.refresh is LoadState.Loading
+
+    PullToRefreshBox(
+        isRefreshing = refreshing,
+        onRefresh = { items.refresh() }
+    ) {
+        LazyColumn { /* ... */ }
+    }
+
+    // Programmatic retry
+    Button(onClick = { items.retry() }) { Text("Retry") }
+}
+```
+
+- `items.refresh()` — reload from the top
+- `items.retry()` — re-attempt the last failed load
+
+---
+
+## Headers, footers, separators
+
+```kotlin
+LazyColumn {
+    // Static header above all items
+    item { ListHeader() }
+
+    items(count = items.itemCount, key = items.itemKey { it.id }) { index ->
+        items[index]?.let { ProductRow(it) }
+    }
+
+    // Footer based on append state
+    when (items.loadState.append) {
+        is LoadState.Loading -> item { LoadingFooter() }
+        is LoadState.Error -> item { ErrorFooter { items.retry() } }
+        else -> if (items.loadState.append.endOfPaginationReached && items.itemCount > 0) {
+            item { EndOfListFooter() }
+        }
+    }
+}
+```
+
+---
+
+## Placeholders — show item count before loading
+
+```kotlin
+PagingConfig(
+    pageSize = 20,
+    enablePlaceholders = true,        // requires PagingSource to return itemsBefore / itemsAfter
+    initialLoadSize = 40
+)
+```
+
+With placeholders enabled, `items[index]` returns `null` for not-yet-
+loaded items, and the list shows the correct total size from the start.
+Useful for jump-to-index UX (scrollbar, search-result counts).
+
+Requires the API to return total count:
+
+```kotlin
+override suspend fun load(params: LoadParams<Int>): LoadResult<Int, User> {
+    val response = api.search(query, page, pageSize = params.loadSize)
+    return LoadResult.Page(
+        data = response.users,
+        prevKey = ...,
+        nextKey = ...,
+        itemsBefore = (page - 1) * params.loadSize,
+        itemsAfter = response.totalCount - (page * params.loadSize)
+    )
+}
+```
+
+---
+
+## getRefreshKey — restore scroll position
+
+```kotlin
+override fun getRefreshKey(state: PagingState<Int, User>): Int? =
+    state.anchorPosition?.let { anchor ->
+        val closestPage = state.closestPageToPosition(anchor)
+        closestPage?.prevKey?.plus(1) ?: closestPage?.nextKey?.minus(1)
+    }
+```
+
+On invalidation (e.g., user pulls to refresh), Paging calls
+`getRefreshKey` to find which page to start from. Implementing this lets
+users keep their scroll position across refresh.
+
+---
+
+## Search and filtering
+
+```kotlin
+@HiltViewModel
+class SearchViewModel @Inject constructor(
+    private val api: SearchApi
+) : ViewModel() {
+    private val _query = MutableStateFlow("")
+
+    @OptIn(FlowPreview::class)
+    val results: Flow<PagingData<SearchResult>> = _query
+        .debounce(300)
+        .distinctUntilChanged()
+        .flatMapLatest { query ->
+            if (query.length < 2) flowOf(PagingData.empty())
+            else Pager(
+                config = PagingConfig(pageSize = 20),
+                pagingSourceFactory = { SearchPagingSource(api, query) }
+            ).flow
+        }
+        .cachedIn(viewModelScope)
+
+    fun onQueryChanged(query: String) { _query.value = query }
+}
+```
+
+`flatMapLatest` cancels the previous Pager when the query changes —
+no leftover requests from "pix" once the user types "pixel".
+
+---
+
+## Filter without invalidating
+
+For filters that don't change the data source, use `filter`:
+
+```kotlin
+val filtered: Flow<PagingData<Product>> = repository.pager()
+    .map { paging ->
+        paging.filter { product -> product.category in selectedCategories }
+    }
+    .cachedIn(viewModelScope)
+```
+
+If `selectedCategories` changes, `cachedIn` invalidates the chain and
+re-applies the filter — no network refetch.
+
+---
+
+## Invalidating
+
+```kotlin
+class UserRepository @Inject constructor(
+    private val db: AppDatabase
+) {
+    private val _refreshSignal = MutableSharedFlow<Unit>(replay = 0)
+
+    fun invalidate() = scope.launch { _refreshSignal.emit(Unit) }
+
+    fun pager(): Flow<PagingData<User>> = _refreshSignal
+        .onStart { emit(Unit) }
+        .flatMapLatest {
+            Pager(
+                config = PagingConfig(pageSize = 20),
+                pagingSourceFactory = { db.userDao().pagingSource() }
+            ).flow
+        }
+        .cachedIn(scope)
+}
+
+// Trigger from any write
+suspend fun blockUser(id: String) {
+    db.userDao().setBlocked(id, true)
+    // Room auto-invalidates the PagingSource attached to the query
+}
+```
+
+Room's `pagingSource()` auto-invalidates when the underlying table
+changes — your writes propagate to the UI automatically.
+
+For network-only PagingSource, call `invalidate()` manually or expose a
+refresh signal as above.
+
+---
+
+## Testing
+
+```kotlin
+@Test
+fun `loads first page`() = runTest {
+    val source = TestSource()
+    val pager = TestPager(PagingConfig(pageSize = 3), source)
+    val result = pager.refresh() as LoadResult.Page<Int, String>
+    assertEquals(listOf("a", "b", "c"), result.data)
+}
+
+@Test
+fun `flow emits paged data`() = runTest {
+    val items = (1..20).map { TestItem("id-$it") }
+    val pager = Pager(PagingConfig(pageSize = 5)) {
+        InMemoryPagingSource(items)
+    }
+    pager.flow
+        .asSnapshot { scrollTo(index = 10) }
+        .let { snapshot ->
+            assertEquals(11, snapshot.size)
+        }
+}
+```
+
+`paging-testing` provides:
+- `TestPager` — drive load operations manually
+- `asSnapshot { }` — collect current paging state from a Flow
+
+---
+
+## Performance tips
+
+### `pageSize` and `prefetchDistance`
+
+```kotlin
+PagingConfig(
+    pageSize = 20,                        // items per page
+    prefetchDistance = 5,                 // start loading next page when 5 items from end
+    initialLoadSize = 40,                 // first load — usually 2x pageSize
+    maxSize = 200,                        // optional cap on in-memory items
+    enablePlaceholders = false
+)
+```
+
+- Small `pageSize` (10-20) = more frequent loads, lower memory
+- Large `prefetchDistance` = smoother scrolling but more memory
+- `maxSize` = drop old pages when scrolling forward; prevents OOM
+
+### Compose `key` is critical
+
+```kotlin
+items(
+    count = items.itemCount,
+    key = items.itemKey { it.id },                  // ← stable identity
+    contentType = items.itemContentType { "product" }
+) { index -> /* ... */ }
+```
+
+Without `key`, every reorder / insert recomposes the entire visible
+range. With `key`, only the affected items re-render.
+
+### `@Immutable` data classes
+
+```kotlin
+@Immutable
+data class Product(val id: String, val name: String, val price: Money)
+```
+
+Compose skips composables whose stable inputs haven't changed. Mark
+your paged item types `@Immutable` for free skip-recomposition wins.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Paging mistakes',
+    variant: 'old',
+    points: [
+      'Forgetting .cachedIn(viewModelScope) — scroll resets',
+      'No key in items() — recomposes everything on update',
+      'PagingSource per Composable (rebuilt on every recomp)',
+      'flatMapLatest without debounce on text input',
+      'enablePlaceholders without itemsBefore / itemsAfter',
+      'Catching exceptions outside load() — Paging needs LoadResult.Error'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production paging',
+    variant: 'new',
+    points: [
+      'Always cachedIn at the ViewModel boundary',
+      'itemKey for stable identity',
+      'pagingSourceFactory creates source; Pager stays stable',
+      'debounce + distinctUntilChanged before flatMapLatest',
+      'Placeholders only if API returns total count',
+      'Return LoadResult.Error(e); Paging handles retry'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Paging 3 rules">
+- **Three layers**: PagingSource (one page), Pager (config), Flow (UI).
+- **`cachedIn(viewModelScope)`** is mandatory — survives config changes.
+- **Room generates PagingSource** automatically + auto-invalidates on writes.
+- **RemoteMediator** for cache + refresh; survives offline.
+- **Transforms** (`map`, `filter`, `insertSeparators`) at the PagingData layer.
+- **`itemKey` + `contentType`** in Compose — non-negotiable for list perf.
+- **`paging-testing`** for `TestPager` + `asSnapshot` to test exhaustively.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Network-only paging', description: 'Build a UserPagingSource that hits a paginated REST endpoint. Wire to a Compose LazyColumn with loading + error footers.' },
+  { title: 'Local-first with RemoteMediator', description: 'Add RemoteMediator backed by Room. Show cached items while network refreshes. Test offline (airplane mode).' },
+  { title: 'insertSeparators headers', description: 'Group items alphabetically with insertSeparators. Verify smooth scroll across letter boundaries.' },
+  { title: 'Debounced search', description: 'Build a search ViewModel with debounce(300) + distinctUntilChanged + flatMapLatest. Confirm typing fast doesn\'t spam the API.' },
+  { title: 'Pull-to-refresh', description: 'Add PullToRefreshBox + items.refresh(). Test that scroll position restores via getRefreshKey().' }
+]} />
+
+## Next
+
+Continue to **[Image Loading (Coil + Glide)](./image-loading)** for media
+patterns or return to **[Module 06 Overview](./overview)**.

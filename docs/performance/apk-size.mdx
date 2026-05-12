@@ -1,0 +1,536 @@
+---
+id: apk-size
+title: APK Size Optimization
+sidebar_label: APK Size
+description: R8 deep dive, resource shrinking, App Bundle splits, dependency audit, native library handling — the playbook to ship smaller binaries.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# APK Size Optimization
+
+Every megabyte of APK size hurts: Play Store install conversion drops
+~1% per MB above 30 MB; users on slow networks abandon downloads;
+emerging-market storage is precious. This chapter covers the full
+playbook — R8 minification, resource shrinking, App Bundle splits,
+dependency analysis, and native library tricks.
+
+## Measuring — the APK Analyzer
+
+`Build → Analyze APK` (or click an APK in Android Studio's Project view).
+
+```text
+classes.dex          12.8 MB    34%      ← Kotlin / Java code
+res/                  9.2 MB    24%      ← drawables, layouts, strings
+resources.arsc        4.1 MB    11%      ← compiled resources
+lib/                  6.4 MB    17%      ← native libraries (.so)
+META-INF/             0.8 MB     2%      ← signing
+assets/               4.5 MB    12%      ← bundled assets
+```
+
+Click into each to drill down. `classes.dex` showing huge methods often
+points to a dependency you can replace; large `res/` usually means
+oversized PNGs.
+
+### Compare two APKs
+
+Build → Compare with previous APK. See which file grew between releases.
+Catch the surprise +5MB from a casually-added dependency.
+
+---
+
+## R8 — the shrinker
+
+R8 is the official replacement for ProGuard. It does:
+- **Shrinking** — remove unreachable code
+- **Optimization** — inline, fold constants
+- **Obfuscation** — rename classes / methods to short names
+- **Desugaring** — backport Java 8+ APIs
+
+```kotlin
+// app/build.gradle.kts
+android {
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+}
+
+// gradle.properties — opt into full mode (more aggressive)
+android.enableR8.fullMode=true
+```
+
+Full mode strips more aggressively but exposes any keep-rule gaps.
+Start without it, get a clean build, then opt in.
+
+### Typical reductions
+
+| Without R8 | With R8 (default) | With R8 full mode |
+|------------|-------------------|-------------------|
+| 30 MB APK  | 12 MB             | 9 MB              |
+| 60 MB APK  | 25 MB             | 18 MB              |
+
+Most apps save 50-70% by enabling R8 alone.
+
+### Keep rules
+
+R8 needs hints about reflection-based code. Common patterns:
+
+```proguard
+# Keep models used with Moshi reflection
+-keep @com.squareup.moshi.JsonClass class * { *; }
+-keep class * implements com.squareup.moshi.JsonAdapter { *; }
+
+# Keep models used with Gson
+-keepclassmembers,allowobfuscation class * {
+    @com.google.gson.annotations.SerializedName <fields>;
+}
+
+# Retrofit
+-keepattributes Signature, InnerClasses, EnclosingMethod
+-keepclassmembers,allowshrinking,allowobfuscation interface * {
+    @retrofit2.http.* <methods>;
+}
+-keepclassmembers,allowshrinking,allowobfuscation class * {
+    @retrofit2.http.Body <fields>;
+}
+
+# Hilt / Dagger
+-keep,allowobfuscation class dagger.hilt.android.internal.managers.* { *; }
+-keep,allowobfuscation @dagger.hilt.android.AndroidEntryPoint class *
+
+# Kotlin coroutines
+-keepclassmembers class kotlinx.coroutines.** { volatile <fields>; }
+-keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
+
+# Crashlytics — keep stack frames readable
+-keepattributes SourceFile, LineNumberTable
+-renamesourcefileattribute SourceFile
+
+# Compose runtime
+-keep,allowobfuscation class androidx.compose.runtime.** { *; }
+```
+
+Most libraries ship `consumer-rules.pro` files with their own keep
+rules. You just need rules for your **own** reflection-based code (rare
+in modern Kotlin apps).
+
+### Verifying R8 worked
+
+```bash
+./gradlew :app:assembleRelease
+ls -lh app/build/outputs/apk/release/
+# unsigned-app-release.apk should be << debug build
+```
+
+Generate the R8 mapping file for Crashlytics — it un-obfuscates stack
+traces:
+
+```kotlin
+android {
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            // Mapping uploaded automatically by Crashlytics Gradle plugin
+        }
+    }
+}
+```
+
+---
+
+## Resource shrinking
+
+```kotlin
+buildTypes {
+    release {
+        isMinifyEnabled = true
+        isShrinkResources = true       // requires isMinifyEnabled = true
+    }
+}
+```
+
+R8 tracks resource usage. Unused drawables, layouts, strings are
+stripped. Typical savings: 20-30% of the `res/` folder.
+
+### Reporting unused resources
+
+Android Studio → Refactor → **Remove Unused Resources**. Shows
+candidates; you confirm before deletion. Run periodically.
+
+Watch out for:
+- Resources referenced dynamically by name (`getIdentifier("ic_..."))`
+- Resources for unused locales (use `resourceConfigurations`)
+- Densities you don't need
+
+### Locale stripping
+
+```kotlin
+defaultConfig {
+    resourceConfigurations += listOf("en", "es", "fr", "hi", "ar")
+}
+```
+
+Drops all other locales. Material library ships translations for 80+
+languages; if you only support 5, that's 75 worth of strings deleted.
+
+### Density stripping
+
+```kotlin
+defaultConfig {
+    resourceConfigurations += listOf("xhdpi", "xxhdpi", "xxxhdpi")    // skip ldpi/mdpi/hdpi
+}
+```
+
+Older phones with low DPI scale up larger densities. Most apps don't
+need `mdpi`/`hdpi` resources after Android 8+.
+
+**Better**: use the App Bundle, which auto-splits per device. Don't
+hand-prune unless you have a specific reason.
+
+---
+
+## App Bundle splits
+
+Already covered in [App Bundles](/docs/publishing/app-bundles). Quick
+recap — your `.aab` includes everything; Play generates per-device
+splits at install:
+
+```kotlin
+android {
+    bundle {
+        language { enableSplit = true }
+        density { enableSplit = true }
+        abi { enableSplit = true }
+    }
+}
+```
+
+Same APK is delivered as a 8-15 MB install instead of 35 MB.
+
+---
+
+## Dependency audit
+
+```kotlin
+// Add the dependency-analysis plugin
+plugins {
+    id("com.autonomousapps.dependency-analysis") version "2.1.4"
+}
+```
+
+```bash
+./gradlew buildHealth
+```
+
+Reports:
+- **Unused dependencies** — remove
+- **api → implementation downgrade** — reduces transitive exposure
+- **Duplicate classes** — version conflicts
+
+Run quarterly. A 5MB unused dependency is real money.
+
+### Replacing heavy libraries
+
+| Heavy                    | Lighter                              | Saves    |
+|--------------------------|--------------------------------------|----------|
+| Gson (full)              | Moshi (with KSP)                     | ~600 KB  |
+| Guava (full)             | Just the part you use                | 1-2 MB   |
+| Apache Commons           | Kotlin stdlib                        | 500 KB   |
+| RxJava                   | Coroutines + Flow                    | 1-1.5 MB |
+| Picasso / Fresco         | Coil                                 | 200 KB   |
+| Joda-Time                | java.time + ThreeTenABP backport     | 1 MB     |
+| AndroidX Legacy support  | None                                 | varies   |
+
+### Tree-shaking with R8
+
+Even if a dependency is large, R8 strips unused classes. **Pulling in
+Google Play Services**: don't add `play-services` (umbrella); add only
+the sub-modules you need (`play-services-auth`, `play-services-maps`).
+
+```kotlin
+// ❌ 80 MB worth of services pulled in
+implementation("com.google.android.gms:play-services:18.0.0")
+
+// ✅ Just what you need
+implementation("com.google.android.gms:play-services-auth:21.3.0")
+implementation("com.google.android.gms:play-services-maps:19.0.0")
+```
+
+---
+
+## Native libraries
+
+Native `.so` files (JNI, codecs) usually ship per ABI:
+
+```text
+lib/arm64-v8a/libnative.so      ~3 MB
+lib/armeabi-v7a/libnative.so    ~3 MB
+lib/x86/libnative.so            ~3 MB
+lib/x86_64/libnative.so         ~3 MB
+```
+
+Without ABI splits: 12 MB of `lib/`. With App Bundle: user downloads
+only their device's ABI (3 MB).
+
+### Drop x86 if you don't need it
+
+```kotlin
+defaultConfig {
+    ndk {
+        abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+    }
+}
+```
+
+x86 / x86_64 are Chromebooks + emulators. For phone-only apps, skip
+them. (Caveat: tablet users may have x86 Chromebooks.)
+
+### Compress shared libraries
+
+```xml
+<application android:extractNativeLibs="false">
+```
+
+Default on Android 6+. Libraries stay compressed in the APK and load
+directly without extraction. Saves disk space; slightly slower first
+launch (negligible).
+
+---
+
+## kotlin-stdlib vs Kotlin K2
+
+Kotlin 2.0+ (K2 compiler) inlines more aggressively. After migrating
+from K1 to K2, you'll typically see a 2-5% size reduction with no
+changes — the compiler does the work.
+
+### KSP over kapt
+
+```kotlin
+plugins {
+    alias(libs.plugins.ksp)
+}
+
+dependencies {
+    ksp(libs.hilt.compiler)
+    ksp(libs.room.compiler)
+    ksp(libs.moshi.codegen)
+}
+```
+
+KSP-generated code is leaner than kapt's. 5-15% dex size reduction
+typically, plus 2× faster builds.
+
+---
+
+## Bitmap and asset optimization
+
+### Vector drawables
+
+Replace PNG icons with `<vector>`:
+
+```xml
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#FFF" android:pathData="..."/>
+</vector>
+```
+
+One vector replaces 5 PNG density buckets. Each PNG family is 5-20 KB; a
+vector is ~1 KB. For 50 icons, that's a ~3 MB saving.
+
+### WebP for photos
+
+WebP compresses 25-35% better than PNG with no quality loss; 50-80%
+better than JPEG. Android Studio → right-click PNG → Convert to WebP.
+
+### Compress / strip metadata
+
+```bash
+# pngquant — quantize PNGs to fewer colors
+pngquant --quality 65-90 my-image.png
+
+# guetzli — better JPEG (very slow)
+guetzli --quality 85 in.jpg out.jpg
+
+# Strip EXIF / color profiles
+exiftool -all= image.png
+```
+
+For app icons / hero images, run before checking in.
+
+### Animated GIF → animated WebP
+
+GIFs are huge. Convert to animated WebP:
+
+```bash
+img2webp -loop 0 -mixed -d 100 frame*.png -o animation.webp
+```
+
+10× smaller for the same quality.
+
+### Lottie
+
+For complex animations, Lottie (JSON + vector) is tiny vs a video file
+or GIF. A 30-second animated hero scene is ~50-200 KB.
+
+---
+
+## Multiple APKs vs App Bundle
+
+You can ship multiple APKs (one per ABI / density), but **AAB makes this
+obsolete**. AAB:
+- Single upload to Play Console
+- Play generates per-device APKs
+- Smaller install sizes
+- Conditional / on-demand feature delivery
+
+Multiple APKs only persist for non-Play distribution (Amazon Appstore,
+Galaxy Store, direct sideload).
+
+---
+
+## Splash / launch tradeoffs
+
+Large fonts / hero images can push initial layout off the critical
+path:
+
+```xml
+<!-- res/font/Inter.xml — downloadable font -->
+<font-family xmlns:android="http://schemas.android.com/apk/res/android"
+    android:fontProviderAuthority="com.google.android.gms.fonts"
+    android:fontProviderPackage="com.google.android.gms"
+    android:fontProviderQuery="name=Inter&amp;weight=400"
+    android:fontProviderCerts="@array/com_google_android_gms_fonts_certs"/>
+```
+
+Downloadable fonts ship a 200-byte XML pointer instead of bundling
+50 KB / weight. Cached across apps too.
+
+---
+
+## Per-feature opt-in
+
+Heavy features delivered on demand via dynamic modules:
+
+```xml
+<!-- feature/video-editor/AndroidManifest.xml -->
+<dist:module dist:title="@string/title_video_editor">
+    <dist:delivery><dist:on-demand/></dist:delivery>
+</dist:module>
+```
+
+Users who don't use video editing never download the 8 MB module. See
+[App Bundles](/docs/publishing/app-bundles).
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Size bloat',
+    variant: 'old',
+    points: [
+      'Multi-resolution PNG icons (5 densities × 50 icons)',
+      'Adding play-services umbrella instead of submodules',
+      'isMinifyEnabled = false in release (huge)',
+      'No ABI filters (4× native lib size)',
+      'kapt for annotation processing (larger dex)',
+      'GIF for animated content (10× larger than WebP)'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Lean APKs',
+    variant: 'new',
+    points: [
+      'Vector drawables; WebP for photos',
+      'Per-feature Play Services modules',
+      'R8 full-mode + isShrinkResources',
+      'App Bundle splits handle ABI automatically',
+      'KSP replaces kapt',
+      'WebP or Lottie for animation'
+    ]
+  }}
+/>
+
+---
+
+## Size targets by app type
+
+| App type                       | Reasonable target | Stretch target |
+|--------------------------------|-------------------|----------------|
+| Utility / single-feature       | < 5 MB            | < 3 MB         |
+| News / content                 | < 15 MB           | < 10 MB        |
+| Social / chat                  | < 20 MB           | < 15 MB        |
+| E-commerce                     | < 25 MB           | < 18 MB        |
+| Productivity / B2B             | < 30 MB           | < 20 MB        |
+| Game                           | varies            | < 50 MB        |
+
+Anything over 50 MB in 2025 needs justification.
+
+---
+
+## Continuous monitoring
+
+```yaml
+# .github/workflows/size-check.yml
+on: pull_request
+
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew :app:bundleRelease
+      - run: |
+          SIZE=$(stat -c%s app/build/outputs/bundle/release/app-release.aab)
+          BASELINE=12000000   # 12 MB
+          if [ $SIZE -gt $((BASELINE + 500000)) ]; then
+            echo "::error::AAB grew by >500KB"
+            exit 1
+          fi
+```
+
+Block merges that grow the AAB significantly without explanation.
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="APK size rules">
+- **R8 minification + resource shrinking** — 50-70% savings; always on for release.
+- **App Bundle** (mandatory on Play) — per-device APKs, smaller installs.
+- **Vector drawables + WebP** for graphics; Lottie for animation.
+- **Per-submodule Play Services** instead of umbrella.
+- **KSP over kapt** — leaner dex, faster builds.
+- **Dependency audit** quarterly via `buildHealth`.
+- **Drop x86 ABIs** unless you support Chromebooks.
+- **Locale + density filters** to strip unused resources.
+- **CI size check** prevents silent bloat.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Enable R8 full mode', description: 'Set android.enableR8.fullMode=true. Build release. Fix any keep-rule gaps. Compare AAB size before/after.' },
+  { title: 'APK Analyzer audit', description: 'Open APK Analyzer on your release build. List the top 5 files by size. Investigate the biggest.' },
+  { title: 'Dependency analysis', description: 'Run ./gradlew buildHealth. Remove 3 unused deps. Convert 2 api dependencies to implementation.' },
+  { title: 'Locale and density', description: 'Add resourceConfigurations to your defaultConfig with only the locales you support. Measure size reduction.' },
+  { title: 'Size CI check', description: 'Add a GitHub Action that fails PR if AAB grows > 500KB. Establish a baseline; iterate.' }
+]} />
+
+## Next
+
+Return to **[Module 10 Overview](./overview)** or continue to
+**[Module 11 — Publishing](/docs/publishing/overview)**.

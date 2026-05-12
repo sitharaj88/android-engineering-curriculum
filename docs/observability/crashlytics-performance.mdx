@@ -1,0 +1,580 @@
+---
+id: crashlytics-performance
+title: Crashlytics & Firebase Performance Deep Dive
+sidebar_label: Crashlytics & Performance
+description: Crashlytics deep dive — custom keys, breadcrumbs, NDK crashes, ANR tracking, attribution. Firebase Performance — auto traces, custom traces, network monitoring.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Crashlytics & Firebase Performance Deep Dive
+
+Crashlytics and Firebase Performance are the two halves of "see what
+your app does in production." Crashes + ANRs + slow renders + business
+KPIs — all attributed per user, version, device, and SDK level. This
+chapter covers the patterns that turn raw events into actionable
+diagnostics.
+
+## Crashlytics — beyond stack traces
+
+### Bootstrap pattern
+
+```kotlin
+@Singleton
+class CrashReportingBootstrap @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val authSession: AuthSession,
+    private val deviceInfo: DeviceInfo,
+    private val scope: CoroutineScope
+) {
+    fun install() {
+        val crashlytics = Firebase.crashlytics
+
+        // Collection on/off
+        crashlytics.setCrashlyticsCollectionEnabled(!BuildConfig.DEBUG)
+
+        // App-version-level custom keys
+        crashlytics.setCustomKeys {
+            key("app.flavor", BuildConfig.FLAVOR)
+            key("app.build_type", BuildConfig.BUILD_TYPE)
+            key("device.abi", Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown")
+            key("device.api_level", Build.VERSION.SDK_INT)
+            key("device.locale", Locale.getDefault().toLanguageTag())
+            key("device.timezone", TimeZone.getDefault().id)
+        }
+
+        // Live user attribution
+        scope.launch {
+            authSession.userFlow.collect { user ->
+                if (user != null) {
+                    crashlytics.setUserId(user.id)
+                    crashlytics.setCustomKey("user.tier", user.tier.name)
+                    crashlytics.setCustomKey("user.signup_days", daysSince(user.createdAt))
+                } else {
+                    crashlytics.setUserId("")
+                }
+            }
+        }
+    }
+}
+```
+
+Call `install()` from `Application.onCreate` after Hilt is ready.
+
+### Custom keys — the three non-negotiables
+
+Every crash should answer "who, where, what was happening":
+
+```kotlin
+crashlytics.setCustomKeys {
+    key("user.id", user.id)                       // who (also setUserId)
+    key("last.screen", currentScreen)             // where
+    key("session.duration_s", sessionLengthSec)   // how long
+}
+```
+
+In the Crashlytics console, you can filter by these keys — "show me all
+crashes from premium users on Pixel 7 during checkout." Without keys,
+you debug from generic stack traces.
+
+### Track screen navigation
+
+```kotlin
+@Singleton
+class ScreenAttributionTracker @Inject constructor(
+    private val crashlytics: FirebaseCrashlytics
+) {
+    fun onScreen(screenName: String) {
+        crashlytics.setCustomKey("last.screen", screenName)
+        crashlytics.log("Screen → $screenName")    // also appears in crash logs as breadcrumb
+    }
+}
+
+// Hook into Compose navigation
+@Composable
+fun TrackScreen(name: String, tracker: ScreenAttributionTracker) {
+    LaunchedEffect(name) { tracker.onScreen(name) }
+}
+```
+
+Or hook into `navController` once:
+
+```kotlin
+navController.addOnDestinationChangedListener { _, destination, _ ->
+    crashlytics.setCustomKey("last.screen", destination.route ?: "unknown")
+}
+```
+
+When a crash happens, you see exactly where the user was.
+
+### Breadcrumbs — `log()`
+
+```kotlin
+crashlytics.log("Started checkout flow with ${cart.items.size} items")
+crashlytics.log("Payment method = ${paymentMethod.type}")
+crashlytics.log("Server returned 402")
+```
+
+Logs accumulate per session; up to ~64KB are attached to the next
+crash. Crashlytics console shows them as breadcrumbs leading up to the
+crash:
+
+```text
+17:32:01  Started checkout flow with 3 items
+17:32:04  Payment method = card
+17:32:05  Server returned 402
+17:32:05  → CRASH
+```
+
+Distinguishes a "random" crash from a "user did X then Y then it died"
+crash.
+
+### Non-fatal exceptions
+
+```kotlin
+try {
+    parseDeepLink(uri)
+} catch (e: MalformedUrlException) {
+    crashlytics.recordException(e)
+    fallbackToHome()
+}
+```
+
+`recordException` reports an error without crashing. Appears in the
+console as a separate event grouped by stack trace. Useful for:
+- Recoverable errors (parse failures, transient network)
+- Code paths that "shouldn't happen" but you want to know if they do
+- Cancellation of expensive operations
+
+Don't over-record — Crashlytics has a 64 non-fatals/session limit.
+
+### Logging tree integration
+
+```kotlin
+class CrashlyticsTimberTree @Inject constructor(
+    private val crashlytics: FirebaseCrashlytics
+) : Timber.Tree() {
+    override fun log(priority: Int, tag: String?, message: String, t: Throwable?) {
+        if (priority < Log.WARN) return
+
+        crashlytics.log("${priorityLetter(priority)}/$tag: $message")
+
+        if (t != null && priority >= Log.ERROR) {
+            crashlytics.recordException(t)
+        }
+    }
+
+    private fun priorityLetter(p: Int) = when (p) {
+        Log.ERROR -> "E"
+        Log.WARN -> "W"
+        else -> "?"
+    }
+}
+
+// In Application
+Timber.plant(CrashlyticsTimberTree(crashlytics))
+```
+
+Every `Timber.e(...)` becomes a breadcrumb + recorded exception
+automatically. No per-call ceremony.
+
+### ANR tracking
+
+Crashlytics catches ANRs automatically on modern Firebase versions. To
+go deeper, use `ApplicationExitInfo`:
+
+```kotlin
+@Singleton
+class AnrTracker @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val crashlytics: FirebaseCrashlytics,
+    private val dataStore: DataStore<Preferences>
+) {
+    private val lastCheckKey = longPreferencesKey("anr_last_check")
+
+    suspend fun reportRecentAnrs() = withContext(Dispatchers.IO) {
+        val am = context.getSystemService(ActivityManager::class.java)
+        val lastCheck = dataStore.data.first()[lastCheckKey] ?: 0
+
+        val reasons = am.getHistoricalProcessExitReasons(null, 0, 20)
+            .filter { it.reason == ApplicationExitInfo.REASON_ANR }
+            .filter { it.timestamp > lastCheck }
+
+        reasons.forEach { info ->
+            crashlytics.log("ANR at ${info.timestamp}: ${info.description}")
+            info.traceInputStream?.use { stream ->
+                val trace = stream.readBytes().toString(Charsets.UTF_8)
+                crashlytics.recordException(AnrException(trace))
+            }
+        }
+
+        if (reasons.isNotEmpty()) {
+            dataStore.edit { it[lastCheckKey] = System.currentTimeMillis() }
+        }
+    }
+}
+
+class AnrException(traceLog: String) : Exception(traceLog.take(2000))
+```
+
+Run on app start. Recently-recorded ANRs (the system stores them for ~7
+days) are pulled and reported with their main-thread stack trace.
+
+### NDK crashes
+
+For apps using native code (NDK / JNI):
+
+```kotlin
+// build.gradle
+plugins {
+    id("com.google.firebase.crashlytics") version "3.0.2"
+}
+
+android {
+    buildTypes {
+        release {
+            firebaseCrashlytics {
+                nativeSymbolUploadEnabled = true
+                unstrippedNativeLibsDir = file("$buildDir/intermediates/merged_native_libs/release/out/lib")
+            }
+        }
+    }
+}
+```
+
+Native crashes are now captured + symbolicated automatically (Crashlytics
+uses the unstripped `.so` files to recover function names).
+
+### Crashlytics + Compose
+
+For Compose-specific exceptions:
+
+```kotlin
+@Composable
+fun ErrorBoundary(
+    content: @Composable () -> Unit
+) {
+    val crashlytics = LocalCrashlytics.current
+    val state = remember { mutableStateOf<Throwable?>(null) }
+
+    if (state.value != null) {
+        FallbackUI(state.value!!) { state.value = null }
+        return
+    }
+
+    try {
+        content()
+    } catch (t: Throwable) {
+        crashlytics.recordException(t)
+        state.value = t
+    }
+}
+```
+
+Wraps risky composables; reports crashes; shows a fallback. See
+[Error Handling](/docs/architecture/error-handling).
+
+---
+
+## De-duping and grouping
+
+Crashlytics auto-groups crashes by stack trace fingerprint. If two
+crashes share a top frame, they merge into one "issue."
+
+### When the auto-grouping is wrong
+
+If unrelated crashes share a frame (e.g., a top-level dispatcher throws
+both for network errors AND for database failures), they merge
+incorrectly.
+
+Fix at source: wrap each call site so the stack trace differs:
+
+```kotlin
+// ❌ Same top-level wrapper
+class GenericErrorWrapper {
+    inline fun <T> wrap(block: () -> T): T = try { block() }
+    catch (e: Throwable) { throw WrappedException(e) }
+}
+
+// ✅ Specific wrappers per failure mode
+class NetworkErrorWrapper {
+    inline fun <T> wrap(block: () -> T): T = try { block() }
+    catch (e: IOException) { throw NetworkException(e) }
+}
+
+class DatabaseErrorWrapper {
+    inline fun <T> wrap(block: () -> T): T = try { block() }
+    catch (e: SQLException) { throw DatabaseException(e) }
+}
+```
+
+Different exception types → different Crashlytics issues → distinct
+triage.
+
+---
+
+## Velocity alerts
+
+Configure in the Crashlytics console:
+
+- **Crash-free users below 99.5%** → page on-call
+- **New issue affecting > 1% of users** → Slack `#android-incidents`
+- **Issue retention rate > 50%** → flag for triage
+
+Velocity alerts catch regressions in 15-30 minutes — much faster than
+manually monitoring graphs.
+
+---
+
+## Triage workflow
+
+1. **Daily**: 15-min Crashlytics review. New issues + spikes in known issues.
+2. **Per crash, ask:**
+   - Frequency: how many users? How many sessions per user?
+   - Attribution: which version, device, locale, build?
+   - Reproducibility: can I reproduce on a similar device?
+3. **Fix or defer**:
+   - **Fix**: ticket + assignee + estimated complexity
+   - **Defer**: link to existing ticket OR mark as "won't fix" with reason
+4. **Verify**: after fix ships, the issue's "crash-free in version X" metric should drop.
+
+For a team of 5 engineers shipping weekly, expect 5-15 new issues per
+week. Most are minor / one-off; 2-3 need real attention.
+
+---
+
+## Firebase Performance Monitoring
+
+### What it tracks automatically
+
+Out of the box:
+- **App start** — cold, warm, hot
+- **Screen rendering** — slow frames, frozen frames per Activity / Fragment
+- **HTTP requests** — duration, payload size, error rate
+
+Per the breakdown:
+- Slow rendering = > 16ms (60 Hz)
+- Frozen rendering = > 700ms (catastrophic)
+
+### Custom traces
+
+```kotlin
+val trace = Firebase.performance.newTrace("checkout_flow")
+trace.start()
+try {
+    val cart = cartRepo.current()
+    trace.putMetric("items_count", cart.items.size.toLong())
+
+    val receipt = paymentApi.charge(cart.total, method)
+
+    val order = ordersRepo.create(cart, receipt)
+    trace.putAttribute("order_id", order.id)
+} finally {
+    trace.stop()
+}
+```
+
+Custom traces report duration + metrics per call. Use for:
+- Business flows (checkout, sign-up, search)
+- Long-running operations
+- Anything spanning multiple HTTP calls
+
+### Coroutine-friendly extension
+
+```kotlin
+suspend inline fun <T> measureTrace(name: String, crossinline block: suspend () -> T): T {
+    val trace = Firebase.performance.newTrace(name)
+    trace.start()
+    return try {
+        block()
+    } finally {
+        trace.stop()
+    }
+}
+
+// Usage
+val result = measureTrace("load_user_profile") {
+    userRepo.fetch(id)
+}
+```
+
+### Network monitoring
+
+Auto-traces every HttpURLConnection / OkHttp request. Includes:
+- Request size, response size
+- Duration P50/P90/P99
+- Error rate
+- Per-domain breakdown
+
+Custom URL traces if you want fine-grained:
+
+```kotlin
+val request = chain.request()
+val metric = HttpMetric(request.url.toString(), FirebasePerformance.HttpMethod.GET)
+metric.start()
+
+val response = chain.proceed(request)
+metric.setHttpResponseCode(response.code)
+metric.setResponseContentType(response.body?.contentType()?.toString())
+metric.setResponsePayloadSize(response.body?.contentLength() ?: 0)
+metric.stop()
+```
+
+Not usually necessary — auto-instrumentation covers most cases.
+
+### Custom screens
+
+Compose screens aren't auto-tracked. Manual:
+
+```kotlin
+@Composable
+fun TrackedScreen(name: String, content: @Composable () -> Unit) {
+    val trace = remember(name) { Firebase.performance.newTrace("screen.$name") }
+    DisposableEffect(name) {
+        trace.start()
+        onDispose { trace.stop() }
+    }
+    content()
+}
+```
+
+Wrap each top-level screen. Now Firebase Performance shows per-screen
+load times.
+
+---
+
+## Putting them together
+
+```kotlin
+@Composable
+fun CheckoutRoute(viewModel: CheckoutViewModel = hiltViewModel()) {
+    TrackedScreen("checkout") {
+        val state by viewModel.state.collectAsStateWithLifecycle()
+        val crashlytics = LocalCrashlytics.current
+
+        LaunchedEffect(state) {
+            crashlytics.setCustomKey("checkout.phase", state.phase.name)
+        }
+
+        ErrorBoundary {
+            when (state.phase) {
+                CheckoutPhase.Cart -> CartContent(state, viewModel::onIntent)
+                CheckoutPhase.Payment -> PaymentContent(state, viewModel::onIntent)
+                CheckoutPhase.Review -> ReviewContent(state, viewModel::onIntent)
+                CheckoutPhase.Submitting -> SubmittingContent()
+                CheckoutPhase.Done -> DoneContent(state)
+            }
+        }
+    }
+}
+```
+
+Crash → known last screen + checkout phase + user ID. Performance →
+per-screen + per-phase timing. Diagnoses are 5-minute jobs.
+
+---
+
+## DebugView (test before shipping)
+
+```bash
+adb shell setprop debug.firebase.analytics.app com.myapp
+adb shell setprop log.tag.FirebaseCrashlytics DEBUG
+```
+
+Firebase console → DebugView. Events stream in real time from your test
+device. Verify your custom keys / logs / non-fatals before shipping.
+
+---
+
+## SLO definitions
+
+```yaml
+slos:
+  - name: crash_free_sessions
+    target: 99.5%
+    window: 30d
+
+  - name: anr_free_sessions
+    target: 99.8%
+    window: 30d
+
+  - name: cold_start_p95
+    target_ms: 1500
+    window: 30d
+
+  - name: screen_load_p75
+    target_ms: 1200
+    window: 30d
+    applies_to: critical_screens
+
+  - name: checkout_success
+    target: 99.0%
+    window: 7d
+```
+
+Track these in your observability backend (Crashlytics dashboards +
+Firebase Performance + a custom analytics layer). Alert when error
+budget burns too fast — see [Observability overview](./overview).
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Diagnosability problems',
+    variant: 'old',
+    points: [
+      'No custom keys (every crash looks the same)',
+      'No setUserId (can\'t reach affected users)',
+      'recordException in tight loops (quota exceeded)',
+      'PII in custom keys (privacy issue)',
+      'Logging tree disabled in release (no breadcrumbs)',
+      'Auto-grouping wrong because of generic wrappers'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Diagnosable apps',
+    variant: 'new',
+    points: [
+      'user.id + last.screen + key business-state on every crash',
+      'setUserId tied to authSession Flow',
+      'Reserve recordException for genuinely exceptional paths',
+      'Hashed / bucketed user identifiers; never raw PII',
+      'Crashlytics-aware Timber tree active in release',
+      'Per-failure-mode exception types — distinct grouping'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Crashlytics & Performance rules">
+- **Custom keys** (`user.id`, `last.screen`, business state) turn generic crashes into actionable bug reports.
+- **`crashlytics.log()`** = breadcrumbs auto-attached to next crash.
+- **`recordException`** for recoverable / "shouldn't happen" paths — sparingly.
+- **Timber tree integration** captures warnings + errors automatically.
+- **ANR tracking** via `ApplicationExitInfo` enriches Crashlytics's auto-detect.
+- **Firebase Performance** auto-traces start + screen + network; add custom traces for business flows.
+- **Velocity alerts** + **SLOs** drive fast incident response.
+- **DebugView** validates events before shipping.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Bootstrap with custom keys', description: 'Add CrashReportingBootstrap setting user.id, last.screen, app.flavor. Force a crash and verify keys appear in Crashlytics.' },
+  { title: 'Timber → Crashlytics', description: 'Plant a CrashlyticsTimberTree. Make 5 Timber.e calls; verify they appear as recorded exceptions + breadcrumbs.' },
+  { title: 'Custom Performance trace', description: 'Wrap your checkout flow in a Firebase Performance trace with attributes for cart size + payment method. Verify in Performance console.' },
+  { title: 'ANR investigation', description: 'Cause an intentional 6-second main-thread sleep in debug. Verify the ANR appears + the ANR tracker reports the trace.' },
+  { title: 'Velocity alert', description: 'Configure a Crashlytics alert for crash-free below 99.5% over 24h. Test the alert pipeline (Slack / email).' }
+]} />
+
+## Next
+
+Return to **[Module 18 Overview](./overview)** or continue to
+**[Module 19 — Enterprise UX](/docs/enterprise-ux/overview)**.

@@ -1,0 +1,492 @@
+---
+id: behavioral-negotiation
+title: Behavioral Interviews & Negotiation
+sidebar_label: Behavioral & Negotiation
+description: STAR story preparation, common behavioral prompts, anti-patterns, and salary negotiation tactics for Android engineers at every level.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Behavioral Interviews & Negotiation
+
+The technical rounds get you to the offer table. The **behavioral round
+and negotiation** determine the offer level and compensation. Most
+candidates underprepare for both — and leave $20k-$100k on the table.
+This chapter covers preparation, delivery, and the four negotiation
+moves.
+
+## Behavioral interview structure
+
+Most companies run one 45-60 minute behavioral round. Typical questions:
+
+- "Tell me about a time you disagreed with a teammate."
+- "Tell me about a project you owned end-to-end."
+- "Tell me about a time you missed a deadline."
+- "Tell me about a technical decision you made that turned out wrong."
+- "Tell me about a time you mentored someone."
+- "Tell me about a time you influenced without authority."
+- "Tell me about a system you designed."
+
+Different from "what's your favorite Kotlin feature?" — these probe
+how you actually **work** with people, ambiguity, and failure.
+
+---
+
+## STAR — Situation, Task, Action, Result
+
+Structure every answer:
+
+```text
+SITUATION (15-20 seconds)
+  Set the scene. Where, when, who, scale.
+
+TASK (10 seconds)
+  Your specific responsibility.
+
+ACTION (60-90 seconds — the meat)
+  What YOU did. Specifically. Avoid "we did" — interviewer wants YOUR
+  contribution.
+
+RESULT (15-20 seconds)
+  Measurable outcome. Lesson learned.
+```
+
+Total: ~2-3 minutes per story. Practice timing.
+
+### Example — disagreement
+
+> **S**: At my previous role, I was leading the Android team at X. We
+> were 3 weeks out from a major launch, and the iOS lead proposed
+> changing the auth response shape for parity with their app. It would
+> have required us to rewrite our session-management code.
+>
+> **T**: I had to decide whether to absorb the breaking change late, or
+> push back.
+>
+> **A**: I scheduled a 30-minute meeting with the iOS lead + the backend
+> lead. I came with three options written up: keep both shapes (cost: $X
+> backend), Android adapts (cost: 5 dev-days + risk to launch), iOS
+> adapts (cost: 3 dev-days, no risk). We talked through each. I argued
+> for option 3 based on the timeline + the fact that our session code
+> had been audited just a month earlier. The iOS lead agreed once they
+> saw the timeline math.
+>
+> **R**: We shipped on time. The iOS rewrite happened in the following
+> sprint with no incidents. I added "schedule cross-team alignment for
+> any auth schema changes" to our team's checklist — never had this
+> debate again.
+
+Specific, measurable, you-driven, with a lesson.
+
+---
+
+## Build a story bank — 8 to 10 stories
+
+You won't get asked all of these, but you should have one prepared
+for each:
+
+<StepList steps={[
+  { title: 'Technical disagreement resolved', description: 'You + colleague disagreed on architecture / library / approach. How resolved.' },
+  { title: 'Owned a project end-to-end', description: 'Scoped, designed, implemented, shipped, measured. Multi-month timeline.' },
+  { title: 'Missed a deadline', description: 'Why missed. What you communicated. How you recovered. Lesson.' },
+  { title: 'Bug you caused / shipped', description: 'Production impact. Your response. Post-mortem learnings.' },
+  { title: 'Mentored / onboarded someone', description: 'Specific actions. How you measured their growth.' },
+  { title: 'Influenced without authority', description: 'Cross-team initiative; got buy-in from people who don\'t report to you.' },
+  { title: 'Difficult feedback received', description: 'Hard feedback. Initial reaction. How you grew from it.' },
+  { title: 'Changed your mind', description: 'You held an opinion. New info or argument changed it. How.' },
+  { title: 'Most complex thing you built', description: 'Scope, your role, technical challenges, outcome.' },
+  { title: 'Failure / setback', description: 'Something that didn\'t work out. How you handled it. What you learned.' }
+]} />
+
+Each story should be **2-3 minutes** told. Write them out, then practice
+out loud.
+
+### Story coverage matrix
+
+Map your stories to likely questions:
+
+| Story                | Leadership | Tech | Conflict | Failure | Influence |
+|----------------------|-----------|------|----------|---------|-----------|
+| Auth schema fight    | ✓         | ✓    | ✓        |         | ✓         |
+| Crashlytics rollout  | ✓         | ✓    |          |         |           |
+| Missed Q3 deadline   |           |      |          | ✓       |           |
+| Mentor onboarding    | ✓         |      |          |         | ✓         |
+| Bad rollback         |           | ✓    |          | ✓       |           |
+
+8-10 stories cover ~20-25 question variations.
+
+---
+
+## Common pitfalls
+
+### "We" instead of "I"
+
+> "We decided to refactor the architecture..."
+
+Interviewer can't tell what **you** specifically did. Use "I" liberally
+— with attribution where appropriate ("I worked with the backend team
+on this, but I owned the Android side").
+
+### Story that's actually about something else
+
+Interviewer asks about disagreement. You answer with a story about a
+deadline. **Listen carefully** — answer the question asked. If your
+story doesn't fit, pick a different one.
+
+### Too long / no result
+
+A 6-minute story bores the interviewer. The **Result** is what makes the
+story memorable. End strong.
+
+### No lesson
+
+The follow-up question after every story: "What would you do
+differently?" Have an answer. Even great outcomes have improvement
+opportunities.
+
+### Negative about previous employer / coworker
+
+Even when justified, don't. Interviewers note candidates who blame
+others. Frame challenges neutrally:
+
+> ❌ "My old manager was a micromanager who didn't trust me."
+>
+> ✓ "I had ambitious goals on the Android side that required more
+> autonomy than my team had been given. I worked with my manager to
+> earn that trust by..."
+
+---
+
+## Leveling-specific signals
+
+Interviewers grade against the level you're being considered for. Hit
+the **scope signals** the level expects.
+
+### L4 → L5 (Senior)
+
+- Owns a **feature or subsystem** end-to-end
+- Influences **the team's** technical direction
+- Mentors juniors
+- Resolves disagreements **within the team**
+
+Stories should show team-level scope. "I designed the auth subsystem
+that the team uses for all flows."
+
+### L5 → L6 (Staff)
+
+- Owns a **cross-team initiative or platform**
+- Influences **the org's** technical direction
+- Mentors seniors across teams
+- Resolves disagreements **between teams**
+- Identifies what should be built (not just executes)
+
+Stories should show cross-team / cross-org scope. "I noticed every team
+was rebuilding their own auth caching layer. I proposed a shared library,
+got buy-in from 4 teams, drove the rollout over 6 months."
+
+### L6 → L7 (Principal)
+
+- Owns **multi-org or company-level** technical strategy
+- Influences hiring, organizational structure
+- Speaks externally (conferences, blog, OSS)
+- Resolves ambiguity at the **company level**
+
+Stories should show strategic / external impact. "I wrote the company's
+mobile architecture vision document, which became the basis for the
+2024 platform strategy across 12 teams."
+
+If you're interviewing for L6 with L5-scope stories, the interviewer
+codes you as "not yet ready." Match scope deliberately.
+
+---
+
+## Reverse questions — the underrated half
+
+The interviewer always asks: "any questions for me?"
+
+**Good questions** signal seriousness and discernment. Have 3-5 prepared
+per interview round, tailored to the role.
+
+### Strong questions
+
+- "What's the most ambiguous decision the team is wrestling with right now?"
+- "How does the team handle disagreement about technical direction?"
+- "What did the last person who left this role do well? What was missing?"
+- "How does the team measure success for an engineer at L6?"
+- "What's the current crash-free rate? ANR rate? How are you trying to improve?"
+- "How does the team balance shipping features vs paying down tech debt?"
+- "Who would I work with most closely?"
+- "What's your favorite thing about the team? Most frustrating thing?"
+
+### Avoid
+
+- "What's the company's mission?" (read the website)
+- "What's the salary range?" (save for recruiter)
+- "Do you offer remote work?" (research first, ask if unclear)
+- Anything that suggests you didn't prepare
+
+---
+
+## Salary negotiation
+
+Most engineers leave **$10k-$100k on the table** by accepting the first
+offer. The hiring process is heavily weighted toward the company; the
+negotiation is your only leverage moment.
+
+### The four moves
+
+#### 1. Never give a number first
+
+When a recruiter asks "what are your expectations?":
+
+> "I'd like to find a role that's a great fit; I'm sure we can align on
+> compensation once we know it's a match. Can you share the band for
+> this level?"
+
+Or if pressed:
+
+> "I'm targeting competitive senior compensation for the New York market.
+> Happy to align on specifics once I see the components."
+
+If you state a number, it caps the offer. Companies have ranges; let
+them anchor.
+
+#### 2. Get competing offers
+
+The single biggest leverage move. Two real offers = 15-30% upside.
+
+If you have an active interview at Company A and want to use it as
+leverage:
+
+> "I should mention I'm in final rounds at Company X — they've
+> indicated they'd like to move quickly. Would it be possible to align
+> on timeline?"
+
+Don't lie. Recruiters check. But genuine competing offers reset
+negotiation entirely.
+
+#### 3. Negotiate components separately
+
+Compensation isn't one number — it's:
+- **Base salary**
+- **Sign-on bonus** (1-time)
+- **Annual bonus** (target %)
+- **Equity** (RSUs / stock options / amount + vesting + cliff)
+- **Equity refreshers** (annual additional grant)
+- **Benefits** (401k match, healthcare, learning budget)
+
+Each is independently negotiable. If they won't budge on base, push
+sign-on or refreshers. Sign-on bonuses are easier to grant — they're
+1-time and don't compound.
+
+#### 4. Take 24 hours before signing
+
+"This is exciting. Let me discuss with my family. I'll get back to you
+tomorrow."
+
+24-hour pause does three things:
+- Lets you sleep on it (clarity)
+- Signals you're considering options
+- Gives time for a competing offer to materialize
+
+Recruiters won't withdraw an offer over 24 hours. Anyone who would is
+not a company you want to work for.
+
+---
+
+## What to actually say
+
+### After verbal offer
+
+> "Thank you, that's exciting. Before we go further, can you walk me
+> through the components — base, bonus, equity, refresh policy?"
+
+Get the full picture in writing or at least verbally complete.
+
+### Counter-offer
+
+> "I appreciate the offer. Based on my research and the level of role,
+> I was hoping for [number] on base. Is there flexibility there?"
+
+Be specific. Vague counters get vague responses. Anchor with research
+(levels.fyi, glassdoor, your network).
+
+### If they say no on base
+
+> "I understand. Could we look at a higher sign-on bonus and/or
+> additional RSU refresh to bridge the gap?"
+
+Components matter. Sign-on doesn't constrain future raises. RSU refresh
+compounds.
+
+### If they say yes
+
+> "That works. Could you send me an updated offer in writing? I'll
+> have a decision within 24 hours."
+
+Get it in writing before celebrating. Verbal offers are non-binding.
+
+### If they push back on the 24 hours
+
+> "I take all offers seriously, and I want to ensure I'm making a
+> decision I can fully commit to. 24 hours lets me review carefully and
+> come back with a confident yes."
+
+Hold firm. Reputable recruiters respect this.
+
+---
+
+## Compensation expectations (2025)
+
+Approximate ranges (USD, US-coastal markets — Bay, NY, Seattle):
+
+| Level | Big tech (FAANG-ish) | Unicorn / pre-IPO | Startup / SMB |
+|-------|----------------------|-------------------|---------------|
+| L3 (Junior) | $200-260k TC | $160-220k TC | $130-180k TC |
+| L4 (Mid) | $290-400k TC | $230-340k TC | $180-260k TC |
+| L5 (Senior) | $400-600k TC | $310-500k TC | $250-380k TC |
+| L6 (Staff) | $580-900k TC | $440-720k TC | $370-580k TC |
+| L7+ (Principal) | $750k-1.5M+ TC | varies | varies |
+
+Total comp = base + bonus + RSUs/4. Equity often vests over 4 years.
+
+Smaller markets (Austin, Denver, Boston, Pittsburgh, Toronto): typically
+10-25% lower. Remote-friendly companies pay closer to the high tier in
+all locations.
+
+International (India / Europe): wildly different. Bangalore senior IC
+~₹50-90 LPA TC (~$60-110k USD), London £80-130k base + equity. Adjust by
+local market, not US dollars.
+
+### Where to research
+
+- **levels.fyi** — most comprehensive
+- **glassdoor.com** — older but useful
+- **blind** (TeamBlind) — anonymous tea
+- **Your network** — most accurate, hardest to access
+
+---
+
+## Compensation evaluation framework
+
+Don't optimize purely for total comp. Score offers on:
+
+| Factor                       | Weight |
+|------------------------------|--------|
+| Total comp (1st year)        | 30%    |
+| Total comp (4-year vest)     | 25%    |
+| Role / scope / growth        | 20%    |
+| Team / manager               | 10%    |
+| Company stability + trajectory | 10%   |
+| Location / lifestyle         | 5%     |
+
+A 20% higher comp at a company you'll quit in 8 months is worse than a
+slightly lower offer with multi-year upside.
+
+### Risk-adjusted equity
+
+Private company equity is **lottery tickets** — value depends on the
+liquidity event. Risk-adjust by company stage:
+
+- **Pre-Series A** — assume zero. Salary must justify.
+- **Series B-C** — 30-50% expected realization.
+- **Series D+ / pre-IPO** — 60-90%.
+- **Public** — face value.
+
+A 1-year offer of $300k base + $500k pre-IPO RSU might be worse than
+$280k base + $300k public RSU, depending on the company.
+
+---
+
+## Edge cases
+
+### Lowball offer
+
+Sometimes the first offer is far below market. Two options:
+- Counter aggressively (e.g., +25-40%). They expected to negotiate.
+- Walk away if the gap is too large; they don't value your level.
+
+### "Best and final"
+
+Companies sometimes claim no more flexibility. Sometimes true; often
+not. Counter once more, gently:
+
+> "I appreciate the offer being your best. To make this decisive for me,
+> would it be possible to add [specific item]?"
+
+If they hold firm, you decide whether to accept or decline. They've
+shown their hand.
+
+### Resignation conversation
+
+After accepting, you resign at your current job. Expect a counter-offer
+50%+ of the time. **Don't accept** — research shows engineers who
+counter-accept leave within a year anyway, and your manager will
+remember you almost left.
+
+> "I appreciate the counter, but my decision is made. Happy to discuss a
+> handover plan."
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Negotiation mistakes',
+    title: 'Leaving money',
+    variant: 'old',
+    points: [
+      'Accepting the first offer immediately',
+      'Saying "yes" verbally before getting it in writing',
+      'Naming a number first to "save time"',
+      'Negotiating only on base salary',
+      'Not asking for an equity refresh policy',
+      'Lying about competing offers'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Strong negotiator',
+    variant: 'new',
+    points: [
+      '"Let me think it over for 24 hours"',
+      'Always get a written offer first',
+      'Make them anchor; counter with research',
+      'Negotiate base + bonus + equity + refreshers',
+      'Ask: "what is your annual refresh policy?"',
+      'Genuine competing offers only'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Behavioral & negotiation rules">
+- **STAR structure** — Situation, Task, Action, Result. 2-3 min per story.
+- **8-10 stories prepared** — disagreement, ownership, failure, mentor, influence, etc.
+- **Use "I" not "we"** — interviewer wants your contribution.
+- **Match scope** to the level you're interviewing for.
+- **Prepare reverse questions** — they signal seriousness.
+- **Never give a number first** — let them anchor.
+- **Negotiate components separately** — base + sign-on + equity + refreshers.
+- **Take 24 hours** before signing. Always.
+- **Research with levels.fyi + network** — not glassdoor alone.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Build your story bank', description: 'Write out 8 STAR stories — disagreement, ownership, failure, mentor, influence, complex build, feedback received, changed mind. 2-3 minutes each.' },
+  { title: 'Mock behavioral', description: 'Have a peer ask you 5 random behavioral prompts back-to-back. Time yourself. Review which stories felt rushed or unclear.' },
+  { title: 'Prep reverse questions', description: 'Draft 5 questions per round (recruiter, manager, technical, behavioral, cross-functional). Tailor to the company.' },
+  { title: 'Negotiation roleplay', description: 'Roleplay receiving an offer with a friend. Practice "never give a number first" responses and the 24-hour pause.' },
+  { title: 'Comp research', description: 'For your target level + market, gather 10+ data points from levels.fyi. Establish realistic base + total comp ranges.' }
+]} />
+
+## Next
+
+Return to **[Module 20 Overview](./overview)** or
+**[System Design Walkthroughs](./system-design-walkthroughs)**.

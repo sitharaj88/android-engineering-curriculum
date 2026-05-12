@@ -1,0 +1,556 @@
+---
+id: image-loading
+title: Image Loading (Coil + Glide)
+sidebar_label: Image Loading
+description: Coil for Compose-first image loading, Glide for legacy View systems. Caching, transformations, custom fetchers, and performance tuning.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Image Loading — Coil + Glide
+
+Loading images on Android is not "set `bitmap` on `ImageView`." A
+production-grade image stack handles caching (memory + disk), placeholders,
+transformations, error handling, dynamic resizing, animated GIF/WebP,
+prefetching, and recycler-view-style reuse. **Coil** is the modern
+Compose-first choice; **Glide** remains common in View-based code.
+
+## Coil vs Glide
+
+<ComparisonCard
+  left={{
+    label: 'Coil',
+    title: 'Modern; Compose-first',
+    variant: 'new',
+    points: [
+      'Kotlin-first, coroutines + Flow native',
+      'AsyncImage composable — one-line Compose usage',
+      '~700 KB; smaller than Glide',
+      'Multiplatform — also runs on iOS via Coil 3',
+      'First-class GIF + WebP + video frame extraction',
+      'Cleaner cache API'
+    ]
+  }}
+  right={{
+    label: 'Glide',
+    title: 'Battle-tested; legacy-friendly',
+    variant: 'old',
+    points: [
+      'Java-based; works seamlessly with View / RecyclerView',
+      'Mature for over a decade',
+      'GIF, WebP, MP4 thumbnail support',
+      'Per-request lifecycle binding',
+      'Custom ModelLoaders for any data type',
+      'Better fits XML / Fragment migration paths'
+    ]
+  }}
+/>
+
+**For Compose-only apps**: use Coil. For mixed Compose + Views or
+existing Glide codebases: Glide is fine.
+
+---
+
+## Coil setup
+
+```kotlin
+// libs.versions.toml
+coil = "3.0.4"
+
+coil-compose         = { module = "io.coil-kt.coil3:coil-compose", version.ref = "coil" }
+coil-network-okhttp  = { module = "io.coil-kt.coil3:coil-network-okhttp", version.ref = "coil" }
+coil-gif             = { module = "io.coil-kt.coil3:coil-gif", version.ref = "coil" }
+coil-video           = { module = "io.coil-kt.coil3:coil-video", version.ref = "coil" }
+```
+
+```kotlin
+@Singleton
+class AppImageLoaderProvider @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val okHttpClient: OkHttpClient
+) {
+    val imageLoader: ImageLoader = ImageLoader.Builder(context)
+        .components {
+            add(OkHttpNetworkFetcherFactory(okHttpClient))    // share OkHttp with API calls
+            add(GifDecoder.Factory())
+            add(VideoFrameDecoder.Factory())
+        }
+        .memoryCache {
+            MemoryCache.Builder()
+                .maxSizePercent(context, 0.15)                  // 15% of heap
+                .build()
+        }
+        .diskCache {
+            DiskCache.Builder()
+                .directory(File(context.cacheDir, "image_cache"))
+                .maxSizeBytes(150L * 1024 * 1024)                // 150 MB
+                .build()
+        }
+        .crossfade(durationMillis = 300)
+        .build()
+
+    fun install() {
+        SingletonImageLoader.setSafe { imageLoader }
+    }
+}
+
+// Call install() from your Application.onCreate
+```
+
+Sharing the OkHttp client means image requests benefit from your auth
+interceptor, cache, certificate pinning. No duplicate connection pools.
+
+---
+
+## Coil — basic Compose usage
+
+```kotlin
+AsyncImage(
+    model = product.imageUrl,
+    contentDescription = product.name,
+    modifier = Modifier
+        .size(80.dp)
+        .clip(MaterialTheme.shapes.medium),
+    contentScale = ContentScale.Crop,
+    placeholder = painterResource(R.drawable.placeholder),
+    error = painterResource(R.drawable.error_image)
+)
+```
+
+### Loading state composables
+
+```kotlin
+SubcomposeAsyncImage(
+    model = product.imageUrl,
+    contentDescription = product.name,
+    modifier = Modifier.size(80.dp).clip(RoundedCornerShape(8.dp))
+) {
+    val state = painter.state
+    when (state) {
+        is AsyncImagePainter.State.Loading -> Box(Modifier.fillMaxSize()) {
+            CircularProgressIndicator(Modifier.align(Alignment.Center).size(24.dp))
+        }
+        is AsyncImagePainter.State.Error -> Icon(Icons.Default.BrokenImage, null)
+        is AsyncImagePainter.State.Success -> SubcomposeAsyncImageContent()
+        else -> Unit
+    }
+}
+```
+
+`SubcomposeAsyncImage` is more expensive per-item than `AsyncImage`. Use
+plain `AsyncImage` + `placeholder` / `error` painters in lists; reserve
+SubcomposeAsyncImage for hero images.
+
+### Request builder for advanced cases
+
+```kotlin
+val request = ImageRequest.Builder(LocalContext.current)
+    .data(product.imageUrl)
+    .size(80, 80)                              // exact decode size — saves memory
+    .crossfade(true)
+    .placeholder(R.drawable.placeholder)
+    .error(R.drawable.error)
+    .listener(
+        onSuccess = { _, result -> analytics.log("image_loaded", result.dataSource) },
+        onError = { _, error -> Log.e("Image", "failed", error.throwable) }
+    )
+    .build()
+
+AsyncImage(
+    model = request,
+    contentDescription = null,
+    modifier = Modifier.size(80.dp)
+)
+```
+
+---
+
+## Transformations
+
+```kotlin
+implementation("io.coil-kt.coil3:coil-svg:3.0.4")           // SVG support
+
+AsyncImage(
+    model = ImageRequest.Builder(LocalContext.current)
+        .data(avatarUrl)
+        .transformations(
+            CircleCropTransformation(),
+            BlurTransformation(radius = 4f, sampling = 1f)
+        )
+        .build(),
+    contentDescription = null,
+    modifier = Modifier.size(48.dp)
+)
+```
+
+Built-in transformations:
+- `CircleCropTransformation` — round avatars
+- `RoundedCornersTransformation(radius)` — rounded corners (alternative: `Modifier.clip`)
+- `BlurTransformation(radius, sampling)` — Gaussian blur
+- `GrayscaleTransformation` — desaturate
+
+Custom transformation:
+
+```kotlin
+class ColorMatrixTransformation(private val matrix: ColorMatrix) : Transformation {
+    override val cacheKey = "color-matrix-${matrix.hashCode()}"
+
+    override suspend fun transform(input: Bitmap, size: Size): Bitmap {
+        val output = Bitmap.createBitmap(input.width, input.height, input.config!!)
+        Canvas(output).drawBitmap(input, 0f, 0f, Paint().apply {
+            colorFilter = ColorMatrixColorFilter(matrix)
+        })
+        return output
+    }
+}
+```
+
+---
+
+## Memory + disk cache management
+
+### Manual cache control
+
+```kotlin
+val request = ImageRequest.Builder(context)
+    .data(url)
+    .memoryCachePolicy(CachePolicy.ENABLED)
+    .diskCachePolicy(CachePolicy.ENABLED)
+    .networkCachePolicy(CachePolicy.ENABLED)
+    .build()
+```
+
+Policies:
+- `ENABLED` — read + write
+- `READ_ONLY` — only read; don't write
+- `WRITE_ONLY` — write but skip read (force network)
+- `DISABLED` — neither
+
+For "user pulled-to-refresh," skip cache:
+
+```kotlin
+.memoryCachePolicy(CachePolicy.DISABLED)
+.networkCachePolicy(CachePolicy.WRITE_ONLY)
+```
+
+### Clearing cache
+
+```kotlin
+fun clearImageCache() {
+    val loader = SingletonImageLoader.get(context)
+    loader.memoryCache?.clear()
+    loader.diskCache?.clear()
+}
+```
+
+Run on sign-out (clear other users' avatars), low-memory callbacks, or
+debug menu.
+
+### Cache key
+
+By default, the URL is the cache key. Override for custom logic:
+
+```kotlin
+.memoryCacheKey("product-${id}-${size}")
+.diskCacheKey("product-${id}-${size}")
+```
+
+Useful when the same image is loaded at multiple sizes and you don't
+want re-downloads.
+
+---
+
+## Prefetching
+
+```kotlin
+// In a ViewModel, prefetch the next page of images
+val loader = SingletonImageLoader.get(context)
+val urls = nextPageProducts.map { it.imageUrl }
+urls.forEach { url ->
+    loader.enqueue(
+        ImageRequest.Builder(context)
+            .data(url)
+            .memoryCachePolicy(CachePolicy.WRITE_ONLY)
+            .build()
+    )
+}
+```
+
+Prefetch images for the next page before the user scrolls — feels
+instant.
+
+---
+
+## Custom fetcher / Mapper
+
+For non-URL sources (Firebase Storage references, base64 strings, your
+own binary protocol), implement `Fetcher` and `Mapper`:
+
+```kotlin
+class FirebaseStorageFetcher(
+    private val ref: StorageReference,
+    private val options: Options
+) : Fetcher {
+    override suspend fun fetch(): FetchResult {
+        val bytes = ref.getBytes(MAX_BYTES).await()
+        return SourceFetchResult(
+            source = ImageSource(source = ByteBuffer.wrap(bytes).asSource(), context = options.context),
+            mimeType = "image/jpeg",
+            dataSource = DataSource.NETWORK
+        )
+    }
+
+    class Factory : Fetcher.Factory<StorageReference> {
+        override fun create(data: StorageReference, options: Options, imageLoader: ImageLoader) =
+            FirebaseStorageFetcher(data, options)
+    }
+}
+
+// Register in ImageLoader
+ImageLoader.Builder(context)
+    .components {
+        add(FirebaseStorageFetcher.Factory())
+    }
+    .build()
+```
+
+Now you can pass a `StorageReference` directly to `AsyncImage(model = storageRef)`.
+
+---
+
+## Animated content
+
+```kotlin
+implementation("io.coil-kt.coil3:coil-gif:3.0.4")
+implementation("io.coil-kt.coil3:coil-video:3.0.4")
+
+// Add to ImageLoader
+.components {
+    add(GifDecoder.Factory())
+    add(VideoFrameDecoder.Factory())
+}
+```
+
+GIF / animated WebP: just point `AsyncImage(model = gifUrl)`. Decoder
+auto-detected; animation plays.
+
+Video frame extraction:
+
+```kotlin
+AsyncImage(
+    model = ImageRequest.Builder(context)
+        .data(videoUri)
+        .videoFrameMillis(2_000L)                  // frame at 2 seconds
+        .build(),
+    contentDescription = null
+)
+```
+
+Extract a thumbnail from a video file. Saves storage vs pre-generating
+thumbnails.
+
+---
+
+## Lifecycle management
+
+```kotlin
+@Composable
+fun ProductImage(product: Product) {
+    AsyncImage(
+        model = product.imageUrl,
+        contentDescription = product.name,
+        modifier = Modifier.size(80.dp)
+    )
+    // Coil disposes the request automatically when this composable leaves composition
+}
+```
+
+Coil auto-cancels in-flight requests when the composable leaves the
+composition. No manual cleanup needed.
+
+For long-lived loads (background processing):
+
+```kotlin
+val loader = SingletonImageLoader.get(context)
+val deferred = loader.enqueue(request)        // returns Disposable
+// ... later
+deferred.dispose()
+```
+
+---
+
+## Performance tips
+
+### Always set `size`
+
+```kotlin
+// ❌ Decodes at full resolution — wasteful
+AsyncImage(model = url, contentDescription = null)
+
+// ✅ Decodes at display size
+AsyncImage(
+    model = url,
+    contentDescription = null,
+    modifier = Modifier.size(80.dp)
+)
+```
+
+Coil auto-detects the target size from `Modifier.size()`. Without size
+hints, it decodes at original resolution — a 4MB photo becomes 50MB in
+memory. Always constrain.
+
+### Use `ContentScale.Crop` with explicit size
+
+```kotlin
+AsyncImage(
+    model = url,
+    contentDescription = null,
+    modifier = Modifier.fillMaxWidth().aspectRatio(16f/9f),
+    contentScale = ContentScale.Crop
+)
+```
+
+Cropping at decode time is way cheaper than rendering a giant image and
+clipping.
+
+### Disable crossfade in dense lists
+
+```kotlin
+val itemRequest = ImageRequest.Builder(context)
+    .data(url)
+    .size(80, 80)
+    .crossfade(false)         // crossfade in a scroll list looks bad anyway
+    .build()
+```
+
+Saves a few ms per item.
+
+### Color filter — avoid GPU shader for tints
+
+```kotlin
+// Cheaper than ColorFilter.tint on the Image composable
+.transformations(ColorFilterTransformation(MaterialTheme.colorScheme.primary))
+```
+
+Pre-tinted bitmaps in cache vs per-frame tinting.
+
+---
+
+## Glide quickstart (legacy View / mixed)
+
+```kotlin
+// libs.versions.toml
+glide = { module = "com.github.bumptech.glide:glide", version = "4.16.0" }
+glide-compiler = { module = "com.github.bumptech.glide:ksp", version = "4.16.0" }
+```
+
+```kotlin
+// In a Fragment / Activity
+Glide.with(this)
+    .load(product.imageUrl)
+    .placeholder(R.drawable.placeholder)
+    .error(R.drawable.error)
+    .centerCrop()
+    .into(imageView)
+```
+
+For RecyclerView ViewHolders:
+
+```kotlin
+override fun onBindViewHolder(holder: ViewHolder, position: Int) {
+    Glide.with(holder.itemView.context)
+        .load(items[position].imageUrl)
+        .into(holder.imageView)
+}
+
+override fun onViewRecycled(holder: ViewHolder) {
+    Glide.with(holder.itemView.context).clear(holder.imageView)
+    super.onViewRecycled(holder)
+}
+```
+
+`Glide.with(context).clear(view)` is critical in RecyclerView — prevents
+mismatched images on scroll.
+
+### Glide custom config
+
+```kotlin
+@GlideModule
+class AppGlideModule : AppGlideModule() {
+    override fun applyOptions(context: Context, builder: GlideBuilder) {
+        builder.setDefaultRequestOptions(
+            RequestOptions()
+                .format(DecodeFormat.PREFER_RGB_565)        // 50% memory vs ARGB_8888
+                .diskCacheStrategy(DiskCacheStrategy.AUTOMATIC)
+        )
+        builder.setMemoryCache(LruResourceCache(20 * 1024 * 1024))
+        builder.setDiskCache(DiskLruCacheFactory(File(context.cacheDir, "glide"), 100L * 1024 * 1024))
+    }
+
+    override fun registerComponents(context: Context, glide: Glide, registry: Registry) {
+        registry.replace(GlideUrl::class.java, InputStream::class.java, OkHttpUrlLoader.Factory(okHttpClient))
+    }
+}
+```
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Image loading mistakes',
+    variant: 'old',
+    points: [
+      'AsyncImage without size hints (OOM)',
+      'Loading raw bytes into ImageView.setImageBitmap (no cache)',
+      'Per-request OkHttpClient (no connection reuse)',
+      'Decoding to ARGB_8888 when RGB_565 suffices',
+      'Crossfade in long lists (visual mess)',
+      'No clear(view) in RecyclerView onViewRecycled'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production images',
+    variant: 'new',
+    points: [
+      'Explicit Modifier.size + ContentScale.Crop',
+      'Coil/Glide with shared cache + OkHttp',
+      'Single shared OkHttp + ImageLoader',
+      'RGB_565 for solid photos; ARGB_8888 for transparency',
+      'crossfade(false) in scroll lists',
+      'Glide.clear(view) on recycle in RecyclerView'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Image loading rules">
+- **Coil** for Compose-first; **Glide** for legacy View systems. One is enough.
+- **Share OkHttp** with your API client — connection pooling, single auth, single cache.
+- **Always set size** (`Modifier.size` or explicit `size()` in request).
+- **Memory + disk cache** sized per app (15% heap, ~150 MB disk).
+- **Custom fetchers** for Firebase Storage, base64, proprietary sources.
+- **Prefetch** next-page images for instant scroll.
+- **Coil 3 is multiplatform** — same image code on iOS via KMP.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Share OkHttp with Coil', description: 'Wire your auth-interceptor OkHttp client into Coil\'s ImageLoader. Verify auth headers appear on image requests.' },
+  { title: 'Sized AsyncImage', description: 'Audit a screen with AsyncImage. Add explicit Modifier.size where missing. Measure memory before/after.' },
+  { title: 'Custom transformation', description: 'Write a SepiaTransformation that applies a color matrix. Use it in a photo viewer.' },
+  { title: 'Prefetch next page', description: 'In a Paging-driven list, enqueue ImageRequests for the next page when the user is 5 items from the end.' },
+  { title: 'Firebase Storage fetcher', description: 'Implement FirebaseStorageFetcher so AsyncImage(model = storageRef) works directly with Firebase References.' }
+]} />
+
+## Next
+
+Return to **[Module 06 Overview](./overview)** or continue to
+**[Module 07 — Firebase & Cloud](/docs/firebase-cloud/overview)**.

@@ -1,0 +1,545 @@
+---
+id: git-workflows
+title: Git Workflows & Branching
+sidebar_label: Git Workflows
+description: Git branching strategies for Android teams — GitFlow, GitHub Flow, trunk-based development, release branches, hotfixes, and feature flags.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# Git Workflows & Branching
+
+A team's Git workflow shapes its release cadence, defect rate, and
+coordination overhead. The wrong workflow makes shipping painful even
+with great code. This chapter compares the three dominant models and
+recommends what to use for Android teams of various sizes.
+
+## The three dominant workflows
+
+<ComparisonCard
+  left={{
+    label: 'GitFlow (heavyweight)',
+    title: 'Long-lived branches',
+    variant: 'old',
+    points: [
+      'develop, release/*, hotfix/*, feature/* branches',
+      'Designed for shipping multiple versions in parallel',
+      'Heavy ceremony — release branches, merge commits, tags',
+      'Best for: enterprise apps with quarterly releases',
+      'Slows down teams that ship weekly'
+    ]
+  }}
+  right={{
+    label: 'Trunk-based (lightweight)',
+    title: 'One main branch',
+    variant: 'new',
+    points: [
+      'Everyone merges to main multiple times per day',
+      'Short-lived feature branches (< 1 day) or feature flags',
+      'Releases cut from main; bug fixes cherry-picked',
+      'Best for: continuous delivery, weekly releases',
+      'Requires strong CI + feature flags'
+    ]
+  }}
+/>
+
+**GitHub Flow** sits in the middle — one `main` branch, feature
+branches up to a week, PR-based merge.
+
+For modern Android teams shipping every 1-4 weeks: **trunk-based or
+GitHub Flow**. GitFlow is overkill for most apps.
+
+---
+
+## Trunk-based development
+
+```text
+main:    ●─────●─────●─────●─────●─────●─────●─────● →
+          ↑     ↑     ↑           ↑     ↑     ↑
+          │     │     │           │     │     │
+        commit commit  feature/x  cut   commit hotfix
+                       merged     v1.0
+```
+
+### Rules
+
+1. Every commit on `main` is **shippable** (passes CI, no broken
+   features).
+2. **Feature branches** are short-lived (< 1 day, ideally hours).
+3. **Incomplete features** ship behind feature flags, not in long-lived
+   branches.
+4. **Releases** are tags on `main`, not separate branches (except for
+   hotfix backports).
+5. **CI must be fast** (< 10 min) and reliable (> 99% pass rate on
+   green commits).
+
+### Daily flow
+
+```bash
+# Morning
+git checkout main
+git pull origin main
+
+# Start work
+git checkout -b alex/add-search-box
+
+# Code, commit, push
+git push origin alex/add-search-box
+
+# Open PR
+gh pr create --title "Add search box to home" --reviewer @teammate
+
+# After review + CI green
+gh pr merge --squash --delete-branch
+```
+
+PR closed; branch deleted; back on `main`. Repeat 3-5 times per day.
+
+### Squash vs merge vs rebase
+
+- **Squash merge** — recommended. Each PR becomes one commit on main.
+  Clean history; easy to revert; rich PR descriptions become commit
+  messages.
+- **Rebase merge** — preserves individual commits but linearly. Good if
+  PR commits are meaningful.
+- **Standard merge commit** — adds a merge commit; visualizes branch
+  topology. Slows down some operations on large repos.
+
+Pick one team-wide; enforce in GitHub branch protection.
+
+---
+
+## Release branches (for staged rollouts)
+
+Even on trunk-based, cut a release branch when you start shipping a
+specific version:
+
+```bash
+# At feature freeze
+git checkout -b release/v2.5 main
+git push origin release/v2.5
+```
+
+- Bug fixes during the rollout land on `release/v2.5` and cherry-pick to
+  `main`.
+- New features continue on `main` (will be in v2.6).
+- The release branch is destroyed once the rollout is 100% complete.
+
+```bash
+# Hotfix workflow
+git checkout release/v2.5
+git checkout -b fix/checkout-crash
+# fix + commit
+git push origin fix/checkout-crash
+# PR into release/v2.5
+# After merge, cherry-pick to main
+git checkout main
+git cherry-pick <commit-sha>
+```
+
+For weekly releases with quick rollbacks, you may not even need release
+branches — just tag commits on `main` and re-tag if needed.
+
+---
+
+## GitHub Flow — the simpler middle
+
+For solo / small teams:
+
+```text
+main:    ●────●────●────●────●────● →
+              │              │
+              ↓              ↓
+        feature/login   feature/checkout
+```
+
+1. Branch from `main`
+2. Open PR early (even before complete — mark as draft)
+3. Review + CI
+4. Merge (squash)
+5. Deploy from main
+
+Same as trunk-based but with looser feature-branch lifetime (up to a
+week). Simpler — no release branches typically; the latest `main` is
+what's in production.
+
+---
+
+## GitFlow — when it makes sense
+
+Use GitFlow only when you legitimately need:
+- Multiple supported versions (v1.x and v2.x in parallel)
+- Quarterly enterprise releases
+- A long QA cycle that pauses develop for weeks
+
+```text
+              [develop]
+                  │
+        feature/x branches → merged
+                  │
+        release/v2.0 → tested, fixed → merged to main + develop
+                  │
+                [main] tagged v2.0
+```
+
+For 95% of Android apps, GitFlow is overkill. Most teams ship more often
+than the model assumes; the ceremony wastes time.
+
+---
+
+## Feature flags — the trunk-based superpower
+
+In trunk-based, an incomplete feature ships disabled:
+
+```kotlin
+@Composable
+fun HomeScreen(featureFlags: FeatureFlags = hiltViewModel()) {
+    if (featureFlags.newCheckoutEnabled) {
+        NewCheckoutFlow()
+    } else {
+        LegacyCheckoutFlow()
+    }
+}
+```
+
+The code is on `main`, in production binaries, but invisible. When
+ready, flip the flag remotely (Firebase Remote Config — Module 07).
+
+### Flag types
+
+- **Release flags** — protect risky features during rollout. Delete
+  flag + dead code 2 weeks after full rollout.
+- **Permission flags** — long-lived; gate by user tier (free / premium /
+  admin).
+- **Experimentation flags** — A/B test variants. Cleanup once experiment
+  concludes.
+- **Kill switches** — emergency disable; permanent.
+
+Mixing types creates "flag debt." Categorize each flag at creation.
+
+---
+
+## Branch protection (GitHub)
+
+Protect `main`:
+
+```yaml
+# Settings → Branches → main
+required:
+  - Pull request review (1+ approver)
+  - Required CI checks (lint, test, build)
+  - Up-to-date with main before merge (linear history)
+  - Conversations resolved
+disallow:
+  - Force push
+  - Branch deletion
+restrict:
+  - Direct push (PR only)
+```
+
+Block force pushes. Block deletions. Require checks pass.
+
+### CODEOWNERS
+
+```text
+# .github/CODEOWNERS
+
+# Default reviewers
+* @android-team-lead
+
+# Specific files
+/build-logic/**          @platform-team
+/core/security/**        @security-team
+/feature/payments/**     @payments-team @platform-team
+
+# Compose components
+**/*.kt @android-team
+```
+
+CODEOWNERS auto-assigns reviewers based on changed files. Critical paths
+(payments, security, build config) require explicit approval from the
+owning team.
+
+---
+
+## Commit hygiene
+
+### Atomic commits
+
+One commit = one logical change. Don't mix refactor + feature in the
+same commit. Rebase to split if needed:
+
+```bash
+git reset HEAD~                            # uncommit
+git add -p                                 # stage chunks selectively
+git commit -m "refactor: extract helper"
+git add .
+git commit -m "feat: add search"
+```
+
+### Commit message structure
+
+```text
+feat(checkout): support saved payment methods
+
+Users can now select from previously-used payment methods.
+Backed by Stripe's saved cards API.
+
+Closes #1234
+```
+
+```text
+fix(home): prevent NPE when user has no orders
+
+Order list was crashing when the response was empty.
+Now returns Empty state composable.
+
+Closes #5678
+```
+
+**Conventional Commits** format covered in the next chapter.
+
+---
+
+## Stashing and switching
+
+Common scenario: working on feature A, urgent bug on main.
+
+```bash
+# Save work in progress
+git stash push -m "WIP: search feature"
+
+# Switch + fix
+git checkout main
+git checkout -b fix/urgent-crash
+# fix + commit + push + PR
+
+# Resume
+git checkout alex/add-search-box
+git stash pop
+```
+
+Or use `git worktree` for parallel branches without stashing:
+
+```bash
+git worktree add ../myapp-hotfix main
+cd ../myapp-hotfix
+git checkout -b fix/urgent-crash
+# work in this directory; original directory untouched
+```
+
+---
+
+## Rewriting history safely
+
+### Interactive rebase
+
+```bash
+git rebase -i HEAD~5
+```
+
+Edit, squash, reorder commits before pushing. **Never** rebase commits
+that have been pushed to a shared branch — rewrites history other devs
+already pulled.
+
+### Amending
+
+```bash
+git commit --amend                         # fix last commit message
+git add forgotten-file.kt
+git commit --amend --no-edit               # add to last commit
+```
+
+Safe **before** pushing. Same warning if pushed already.
+
+### Reflog — recover anything
+
+```bash
+git reflog                                  # shows every HEAD change
+git checkout HEAD@{5}                       # go back 5 changes
+git checkout -b recovered-branch
+```
+
+You can recover deleted commits from reflog for ~30 days. Even a
+hard reset isn't actually destructive immediately.
+
+---
+
+## Common Git situations
+
+### "I committed to the wrong branch"
+
+```bash
+git log --oneline -1                       # find the commit SHA
+git reset HEAD~                             # uncommit (keep changes)
+git stash                                   # save changes
+git checkout correct-branch
+git stash pop
+git commit
+```
+
+### "I need to undo a pushed commit"
+
+```bash
+git revert <commit-sha>                    # creates a new commit that undoes
+git push
+```
+
+Safer than rewriting. Anyone who pulled the bad commit still has it
+locally; the revert undoes its effects.
+
+### "I need to combine my last 3 commits"
+
+```bash
+git rebase -i HEAD~3
+# Mark commits 2 and 3 with 'squash' (or 's')
+# Save and exit; combined commit message editor opens
+```
+
+### "I want to bring a single commit from another branch"
+
+```bash
+git cherry-pick <commit-sha>
+```
+
+Common for hotfixes — fix on `release/v2.5`, cherry-pick to `main`.
+
+### "I accidentally committed a secret"
+
+```bash
+# Don't just delete the file — git history still has it
+# Use BFG or git-filter-repo to scrub
+brew install bfg
+bfg --delete-files 'secrets.json'
+git push --force                            # rewrites remote history
+```
+
+**Then rotate the secret.** Anyone who cloned still has it; assume it's
+public.
+
+---
+
+## Tags and releases
+
+```bash
+# Annotated tag with message
+git tag -a v2.5.0 -m "Release 2.5.0"
+git push origin v2.5.0
+
+# All tags
+git push --tags
+
+# Delete a tag (if pushed)
+git tag -d v2.5.0
+git push origin --delete v2.5.0
+```
+
+For Android releases, tag the commit shipped to Play Store. Use the tag
+to drive CI deployment workflows (see [GitHub Actions](/docs/cicd-devops/github-actions)).
+
+### Semver
+
+`MAJOR.MINOR.PATCH`:
+- MAJOR — breaking changes (rare for shipped apps; almost always 1.x)
+- MINOR — new features
+- PATCH — bug fixes only
+
+App versionCode is monotonic (computed from git commits or build
+number). versionName follows semver.
+
+---
+
+## Monorepo or multi-repo?
+
+| | Monorepo | Multi-repo |
+|-|----------|------------|
+| Code sharing | Trivial — direct import | Via published artifacts |
+| Refactoring | Atomic — change everything in one PR | Multiple PRs, version coordination |
+| CI speed | Slower — bigger trees | Faster per repo |
+| Tooling | Bazel / Pants / Gradle composite builds | Standard each-repo CI |
+| Best for | Multiple Android apps + shared modules | Separate teams / products |
+
+Most Android organizations end up with a monorepo for the app + shared
+libraries. KMP repos that ship to iOS too lean monorepo.
+
+---
+
+## Git Large File Storage (LFS)
+
+For Android-specific large files (Lottie animations, model files, large
+images), use LFS:
+
+```bash
+git lfs track "*.json" "*.tflite" "assets/heroes/*.webp"
+git add .gitattributes
+git add asset.tflite
+git commit
+```
+
+LFS stores pointers in git, blobs on a separate server. Saves clone time
+for new developers.
+
+For models > 50 MB, prefer **Firebase ML model hosting** or app bundle
+asset packs instead of LFS (Module 11).
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'Git workflow problems',
+    variant: 'old',
+    points: [
+      'Long-lived feature branches (weeks)',
+      'Merging without code review',
+      'Force-pushing to shared branches',
+      'Committing secrets to history',
+      'Vague commit messages ("fix bug")',
+      'GitFlow when you ship weekly'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Modern Git',
+    variant: 'new',
+    points: [
+      'Short-lived branches; feature flags for incomplete work',
+      'Branch protection + required reviews',
+      'Rebase only on private branches',
+      'Pre-commit hooks (detect-secrets) + scrub on accident',
+      'Conventional commits with scope + body',
+      'Trunk-based or GitHub Flow for most apps'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Git workflow rules">
+- **Trunk-based or GitHub Flow** for most Android teams.
+- **GitFlow** only when you need multiple supported versions or quarterly releases.
+- **Short-lived branches** (< 1 day); **feature flags** for incomplete features.
+- **Branch protection + CODEOWNERS** for `main` and release branches.
+- **Squash merge** for clean history; **cherry-pick** for hotfix back-ports.
+- **Tag releases**; trigger CI from tags.
+- **Pre-commit hooks** to catch secrets before they hit history.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Set up branch protection', description: 'Configure main with required reviews, required status checks, no force-push. Try to push directly — verify it\'s blocked.' },
+  { title: 'CODEOWNERS', description: 'Add a CODEOWNERS file that requires platform-team review for build-logic/ changes and security-team for core/security/.' },
+  { title: 'Cherry-pick a hotfix', description: 'Create a release/v2.0 branch from main. Make a fix on it. Cherry-pick the fix to main. Verify both branches have the change.' },
+  { title: 'Add a feature flag', description: 'Implement a feature with code on main but disabled. Use Remote Config or a hardcoded BuildConfig flag. Enable at flip-time.' },
+  { title: 'Recover from reflog', description: 'Make a commit, reset --hard HEAD~, then use git reflog + checkout to recover the commit.' }
+]} />
+
+## Next
+
+Continue to **[Code Review & Conventional Commits](./code-review)** for
+PR best practices and changelog automation.

@@ -1,0 +1,518 @@
+---
+id: migration-playbooks
+title: Migration Playbooks
+sidebar_label: Migration Playbooks
+description: Step-by-step playbooks for Java→Kotlin, XML→Compose, kapt→KSP, Dagger→Hilt, LiveData→StateFlow, RxJava→Coroutines, AsyncTask→Coroutines, and Gradle Groovy→Kotlin DSL.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Migration Playbooks
+
+Real migrations are rarely "rip and replace" — they're incremental,
+verified at every step, and reversible if production breaks. Each
+playbook below has been used at scale; together they cover the legacy
+debt every Android team eventually faces.
+
+<Callout type="warning">
+Before any migration: lock down baseline metrics (crash-free rate,
+cold-start P50, build time, test pass rate). Compare each phase against
+those baselines. **A migration that improves architecture but degrades
+metrics is a failed migration.**
+</Callout>
+
+---
+
+## 1. Java → Kotlin
+
+### Why migrate
+
+- Null safety eliminates ~30% of NPEs.
+- Data classes, smart casts, extension functions cut boilerplate
+  dramatically.
+- Coroutines / Flow are Kotlin-native — bolt-on for Java.
+- Google's first-party SDKs (Compose, Room KTX, Lifecycle) ship
+  Kotlin-first APIs.
+
+### Strategy: file-by-file, leaf-up
+
+Kotlin and Java interoperate seamlessly. Convert leaf classes (no
+inbound Java callers) first, then percolate up.
+
+<StepList steps={[
+  { title: 'Enable Kotlin in the module', description: 'apply plugin: "org.jetbrains.kotlin.android" — adds the Kotlin stdlib and compiler.' },
+  { title: 'Pick a file with few callers', description: 'Models, sealed enums, utility classes, and POJOs are perfect starters.' },
+  { title: 'Right-click → Convert Java File to Kotlin File', description: 'Android Studio runs J2K. Review every TODO comment it leaves.' },
+  { title: 'Re-run unit tests for the module', description: 'Catches J2K mistakes around platform types (T! → expected non-null vs nullable).' },
+  { title: 'Hand-tune the result', description: 'J2K is conservative: replace getter/setter with property syntax, lift companion objects, use data class for POJOs.' },
+  { title: 'Update Java callers if needed', description: '@JvmStatic, @JvmField, @JvmOverloads keep Java call sites tidy.' },
+  { title: 'Commit one file per PR while learning', description: 'Once your team is fluent, bundle them by feature.' }
+]} />
+
+### Pitfalls
+
+| Pitfall | Fix |
+|---------|-----|
+| `Platform type T!` causes runtime NPE | Explicitly annotate with `@NonNull` / `@Nullable` in Java, or check at the Kotlin boundary |
+| Java code calls `getName()` after Kotlin migrated to property | Add `@get:JvmName("getName")` or just keep the method name |
+| Static fields become companion `const val` | Add `@JvmField` for direct field access from Java |
+| Java callers of `vararg fn(args: String)` break | Add `@JvmName` or wrap with overload |
+| Default arguments lost from Java | Use `@JvmOverloads` on the Kotlin function |
+
+### J2K cleanup checklist
+
+After every conversion, scan for:
+
+- `!!` operators (J2K loves them — replace with safe calls or explicit nullability).
+- `Companion` blocks containing only constants → `const val` at file level.
+- Manual `equals`/`hashCode` → `data class`.
+- `Object` declarations passed as listeners → `fun interface` + lambda.
+- `Singleton` patterns → `object`.
+
+### Verification
+
+```bash
+# Ensure no regressions per module
+./gradlew :feature-x:test :feature-x:assembleDebug
+# Track Kotlin coverage
+./gradlew :feature-x:kotlinFilesReport
+```
+
+---
+
+## 2. XML Views → Jetpack Compose
+
+### Why migrate
+
+- Compose is 30-50% less code for typical screens.
+- State-driven UI eliminates a whole class of "view out of sync with model" bugs.
+- Modern Android features (Predictive Back, edge-to-edge, large-screen
+  windowing) are easier in Compose.
+- Compose Multiplatform unlocks shared UI with iOS/desktop.
+
+### Strategy: bottom-up, screen-by-screen
+
+Start with leaf composables, then build up to whole screens, then
+replace the host Fragment/Activity.
+
+<StepList steps={[
+  { title: 'Add Compose to the module', description: 'buildFeatures.compose = true, composeOptions, compose-bom + ui + material3 + tooling dependencies.' },
+  { title: 'Identify a leaf view', description: 'Custom Views or small reusable layouts (badges, cards, empty states) are ideal first conversions.' },
+  { title: 'Wrap with ComposeView in the existing XML', description: 'Embed Compose into the current Fragment without a full rewrite.' },
+  { title: 'Convert one row / cell / card at a time', description: 'A RecyclerView item with 3-5 views is the canonical first target.' },
+  { title: 'Migrate the list to LazyColumn', description: 'Once items are composable, replace RecyclerView with LazyColumn — typically a 70% LoC reduction.' },
+  { title: 'Replace the host Fragment with a setContent { }', description: 'Once every child is composable, drop the XML host entirely.' },
+  { title: 'Move navigation to Navigation Compose', description: 'After 60-80% of screens are converted, swap NavController.' }
+]} />
+
+### Interop primitives
+
+<ComparisonCard
+  title="Compose ↔ Views Interop"
+  left={{
+    title: 'Compose inside Views',
+    points: [
+      'ComposeView in your XML',
+      'AbstractComposeView for fully custom views',
+      'setContent { } sets the composition',
+      'Use viewModels() / Hilt as normal'
+    ]
+  }}
+  right={{
+    title: 'Views inside Compose',
+    points: [
+      'AndroidView(factory = { CustomView(it) }) { /* update */ }',
+      'AndroidViewBinding for ViewBinding-generated classes',
+      'remember an updateBlock to flow state into the view',
+      'Useful for Google Maps, WebView, AdView'
+    ]
+  }}
+/>
+
+### Mapping cheat sheet
+
+| Views | Compose |
+|-------|---------|
+| `LinearLayout(vertical)` | `Column` |
+| `LinearLayout(horizontal)` | `Row` |
+| `FrameLayout` | `Box` |
+| `ConstraintLayout` | `ConstraintLayout` (or just `Row`/`Column` for simple layouts) |
+| `RecyclerView` + Adapter | `LazyColumn` / `LazyRow` with `items()` |
+| `ViewPager2` | `HorizontalPager` (Compose Foundation) |
+| `Fragment` | `@Composable` screen + `NavHost` route |
+| `findViewById` | hoisted state + parameters |
+| `View.OnClickListener` | `Modifier.clickable { }` |
+| `TextView` | `Text` |
+| `EditText` | `TextField` |
+| `Toolbar` | `TopAppBar` (material3) |
+| `BottomNavigationView` | `NavigationBar` (material3) |
+| `DialogFragment` | `Dialog` + `AlertDialog` |
+| `Snackbar.make` | `SnackbarHostState.showSnackbar` |
+
+### Gotchas
+
+- **Theme bridging**: Material Views themes don't auto-flow into Compose.
+  Use `MdcTheme()` (Accompanist, deprecated) or hand-map XML attrs to a
+  `MaterialTheme { }` block during transition.
+- **System back**: Compose uses `BackHandler { }`. If your Fragment had
+  custom back behavior, port it.
+- **Insets**: `WindowCompat.setDecorFitsSystemWindows(window, false)` +
+  `Modifier.windowInsetsPadding(...)`. Don't mix XML `fitsSystemWindows`
+  with Compose insets.
+- **Saved state**: `rememberSaveable` for everything that should survive
+  process death. View state restoration via `BundleSavedStateRegistry`
+  works but is rarely needed if you adopt ViewModel + `rememberSaveable`.
+
+### Validation
+
+- Visual regression: run Paparazzi/Roborazzi screenshots on both
+  versions and diff.
+- Macrobenchmark: cold-start and scroll-jank must not regress.
+- TalkBack: re-test accessibility — Compose semantics need explicit
+  `contentDescription` / `Modifier.semantics`.
+
+---
+
+## 3. kapt → KSP
+
+### Why migrate
+
+- KSP is 2-3× faster than kapt for the same processors.
+- kapt is in maintenance mode; new Jetpack libraries ship KSP only.
+- KSP plays nicer with incremental compilation and K2.
+
+### Compatibility check
+
+| Library | KSP support |
+|---------|-------------|
+| Room | ✅ (since 2.5) |
+| Hilt | ✅ (since 2.48) |
+| Moshi | ✅ |
+| Glide | ✅ |
+| Dagger | ✅ (since 2.48) |
+| Realm Kotlin | ✅ |
+| AutoValue | ❌ (kapt only — but rarely needed in Kotlin) |
+| AndroidAnnotations | ❌ (deprecated anyway) |
+
+### Steps
+
+<StepList steps={[
+  { title: 'Add KSP plugin to root build', description: 'id("com.google.devtools.ksp") version "2.0.21-1.0.27" — match Kotlin version.' },
+  { title: 'Apply ksp plugin to feature modules', description: 'plugins { id("com.google.devtools.ksp") }' },
+  { title: 'Replace kapt(...) with ksp(...) in deps', description: 'kapt("androidx.room:room-compiler:X") → ksp("androidx.room:room-compiler:X")' },
+  { title: 'Remove kapt configuration', description: 'Delete the kapt { } block and the kotlin-kapt plugin once nothing remains.' },
+  { title: 'Run a clean build', description: './gradlew clean assembleDebug — compare build time before/after.' },
+  { title: 'Verify generated code', description: 'Look in build/generated/ksp/ — generated classes should match what kapt produced (in build/generated/source/kapt/).' }
+]} />
+
+### Common errors
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `unresolved reference: Dao_Impl` | One module still uses kapt for Room, another uses ksp | Migrate all Room consumers together |
+| Slow first build after migration | KSP rebuilds cache | Normal — subsequent builds will be fast |
+| `Cannot find symbol …_Factory` | Hilt processor not migrated | Replace `kapt("com.google.dagger:hilt-android-compiler")` with `ksp(...)` |
+
+---
+
+## 4. Dagger 2 → Hilt
+
+### Why migrate
+
+- Hilt removes ~80% of Dagger boilerplate (no manual component graph).
+- Standard scopes (`@Singleton`, `@ActivityRetainedScoped`,
+  `@ViewModelScoped`) cover real-world cases without custom wiring.
+- Hilt has Compose, WorkManager, and testing integrations out of the box.
+
+### Strategy: bridge with hiltViewModel
+
+You can migrate one feature module at a time. Dagger and Hilt coexist
+because Hilt *is* Dagger under the hood — same `@Module`, `@Inject`,
+`@Provides`.
+
+<StepList steps={[
+  { title: 'Add Hilt plugin and dependencies', description: 'hilt-android, hilt-android-gradle-plugin, ksp(hilt-android-compiler), hilt-navigation-compose.' },
+  { title: 'Annotate Application with @HiltAndroidApp', description: 'Generates the top-level component, replacing your custom AppComponent.' },
+  { title: 'Migrate one feature Activity / Fragment', description: 'Replace AndroidInjection with @AndroidEntryPoint. ViewModels get @HiltViewModel.' },
+  { title: 'Port Modules', description: 'Add @InstallIn(SingletonComponent::class) (or the right scope). Most @Module classes work unchanged.' },
+  { title: 'Replace custom @Components with predefined scopes', description: 'AppComponent → SingletonComponent, ActivityComponent → ActivityComponent, etc.' },
+  { title: 'Migrate tests to @HiltAndroidTest', description: 'Use TestInstallIn to swap modules. Replace custom test components.' }
+]} />
+
+### Mapping
+
+| Dagger 2 | Hilt |
+|----------|------|
+| `@Component(modules = [...])` | `@HiltAndroidApp` on Application |
+| `@Subcomponent` per Activity | `@AndroidEntryPoint` |
+| `AndroidInjector` boilerplate | Auto-generated |
+| Custom `ViewModelFactory` | `@HiltViewModel` + `hiltViewModel()` in Compose |
+| `DispatchingAndroidInjector` | Removed entirely |
+| Manual scope annotations | `@Singleton`, `@ActivityRetainedScoped`, `@ViewModelScoped`, etc. |
+
+---
+
+## 5. LiveData → StateFlow
+
+### Why migrate
+
+- StateFlow is part of `kotlinx.coroutines` — no Android dependency, works
+  in KMP common code.
+- Operators (`map`, `combine`, `flatMapLatest`) compose better than
+  LiveData transforms.
+- Lifecycle-aware collection (`collectAsStateWithLifecycle`,
+  `repeatOnLifecycle`) gives you the same safety as LiveData.
+
+### Steps
+
+<StepList steps={[
+  { title: 'Replace MutableLiveData with MutableStateFlow', description: 'val state = MutableStateFlow(initial) — same .value getter, .value setter.' },
+  { title: 'Replace .observe(this) { } in Fragments', description: 'Use viewLifecycleOwner.lifecycleScope.launch { repeatOnLifecycle(STARTED) { vm.state.collect { ... } } }' },
+  { title: 'Replace .observeAsState() in Compose', description: 'val state by vm.state.collectAsStateWithLifecycle()' },
+  { title: 'Replace LiveData transforms', description: 'Transformations.map { x -> y } → state.map { it.y }.stateIn(scope, SharingStarted.Eagerly, initial)' },
+  { title: 'Drop LiveData KTX dependencies', description: 'Once no LiveData remains, remove androidx.lifecycle:lifecycle-livedata-ktx' }
+]} />
+
+### Interop bridges
+
+While migrating, you'll need both APIs:
+
+```kotlin
+// StateFlow → LiveData (for legacy Fragment Java)
+val stateLive: LiveData<UiState> = state.asLiveData()
+
+// LiveData → Flow (rare; usually go straight to StateFlow)
+val flow: Flow<UiState> = legacyLiveData.asFlow()
+```
+
+### Single-shot events: SharedFlow
+
+LiveData → StateFlow is straightforward for *state*. For *events*
+(navigate, show toast), use `Channel.receiveAsFlow()` or `SharedFlow`
+with `extraBufferCapacity` and `replay = 0`. See
+[Compose & State](/docs/jetpack-compose/state-side-effects).
+
+---
+
+## 6. RxJava → Coroutines & Flow
+
+### Why migrate
+
+- Coroutines are Kotlin-native — better tooling, simpler stack traces.
+- Flow has operators for every Rx primitive worth keeping.
+- Structured concurrency makes cancellation deterministic.
+- Halves the dependency footprint (no more `rxjava3-core`, `rxjava3-android`, `rxkotlin`, `rxbinding`).
+
+### Mapping
+
+| RxJava | Coroutines / Flow |
+|--------|-------------------|
+| `Single<T>` | `suspend fun foo(): T` |
+| `Maybe<T>` | `suspend fun foo(): T?` |
+| `Completable` | `suspend fun foo(): Unit` |
+| `Observable<T>` | `Flow<T>` |
+| `Flowable<T>` (backpressure) | `Flow<T>` (cooperative cancellation) |
+| `BehaviorSubject` | `MutableStateFlow` |
+| `PublishSubject` | `MutableSharedFlow(replay = 0)` |
+| `ReplaySubject` | `MutableSharedFlow(replay = N)` |
+| `subscribeOn(Schedulers.io())` | `withContext(Dispatchers.IO) { }` |
+| `observeOn(AndroidSchedulers.mainThread())` | `Dispatchers.Main` (already main for collect) |
+| `map { }` | `map { }` |
+| `flatMap { }` | `flatMapConcat { }` / `flatMapMerge { }` |
+| `switchMap { }` | `flatMapLatest { }` |
+| `combineLatest` | `combine` |
+| `zip` | `zip` |
+| `throttleFirst` | `sample` / custom |
+| `debounce` | `debounce` |
+| `Disposable` | `Job` (cancel with `.cancel()`) |
+| `CompositeDisposable` | `CoroutineScope` + structured concurrency |
+
+### Strategy
+
+Migrate from the *edges* inward:
+
+1. Convert public ViewModel APIs that return `Single<T>` to `suspend fun`.
+   The Compose UI calls them inside `LaunchedEffect` / `lifecycleScope`.
+2. Convert Repository methods next.
+3. Leave deepest Rx chains in place initially — wrap them with
+   `await()` / `asFlow()` from `kotlinx-coroutines-rx3`.
+4. Finally, replace the Rx core: when no `Single`/`Observable` remain in
+   public APIs, drop the RxJava dependency.
+
+### Interop
+
+```kotlin
+// Rx → Coroutine
+suspend fun fetchUser(): User = userSingle.await()
+
+// Coroutine → Rx
+val userSingle: Single<User> = rxSingle { fetchUser() }
+
+// Observable → Flow
+val flow: Flow<Event> = observable.asFlow()
+```
+
+---
+
+## 7. AsyncTask → Coroutines
+
+### Why migrate
+
+- `AsyncTask` was deprecated in API 30. It leaks the host activity, has
+  no cancellation guarantees, and runs on a serial executor (slow).
+- One-line replacement with `lifecycleScope.launch { withContext(IO) { ... } }`.
+
+### Replacement template
+
+```kotlin
+// Before
+private class LoadTask(val view: WeakReference<TextView>) : AsyncTask<Void, Void, String>() {
+  override fun doInBackground(vararg params: Void?): String = api.fetch()
+  override fun onPostExecute(result: String) {
+    view.get()?.text = result
+  }
+}
+LoadTask(WeakReference(textView)).execute()
+
+// After
+lifecycleScope.launch {
+  val result = withContext(Dispatchers.IO) { api.fetch() }
+  textView.text = result
+}
+```
+
+In Compose:
+
+```kotlin
+LaunchedEffect(key) {
+  val result = withContext(Dispatchers.IO) { api.fetch() }
+  state.value = result
+}
+```
+
+### Things `AsyncTask` users forget
+
+- Cancellation is automatic when the scope dies.
+- No need for `WeakReference` — the scope is tied to the lifecycle.
+- Exceptions are not swallowed — wrap with try/catch or use
+  `CoroutineExceptionHandler`.
+
+---
+
+## 8. Gradle Groovy DSL → Kotlin DSL
+
+### Why migrate
+
+- Type-safe accessors and IDE auto-complete.
+- Build script refactoring works with Find Usages / Rename.
+- Convention plugins (best practice for multi-module setups) require
+  Kotlin DSL.
+
+### Steps
+
+<StepList steps={[
+  { title: 'Rename settings.gradle → settings.gradle.kts', description: 'And convert Groovy syntax: rootProject.name = "..." (no semicolons), include(":app").' },
+  { title: 'Convert top-level build.gradle next', description: 'plugins { id("com.android.application") version "X" apply false } — version goes in strings.' },
+  { title: 'Module by module: app first, then libs', description: 'plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }. android { } block uses Kotlin syntax — = assignments, lambdas, no parens for properties.' },
+  { title: 'Convert dependencies to function calls', description: 'implementation \"androidx.core:core-ktx:1.13.1\" → implementation(\"androidx.core:core-ktx:1.13.1\")' },
+  { title: 'Move versions to libs.versions.toml', description: 'Use the Version Catalog — works identically from Groovy and Kotlin DSL, and is required for convention plugins.' },
+  { title: 'Build convention plugins in buildSrc/ or build-logic/', description: 'Now your app modules apply id(\"myteam.android.application\") with all defaults included.' }
+]} />
+
+### Common syntax differences
+
+| Groovy | Kotlin DSL |
+|--------|-----------|
+| `apply plugin: 'kotlin-android'` | `plugins { id("org.jetbrains.kotlin.android") }` |
+| `compileSdkVersion 35` | `compileSdk = 35` |
+| `minSdkVersion 24` | `minSdk = 24` |
+| `buildConfigField "String", "X", "\"y\""` | `buildConfigField("String", "X", "\"y\"")` |
+| `implementation 'a:b:1'` | `implementation("a:b:1")` |
+| `signingConfigs { release { ... } }` | `signingConfigs { create("release") { ... } }` |
+| `buildTypes { release { ... } }` | `buildTypes { getByName("release") { ... } }` or `release { ... }` |
+
+---
+
+## 9. SharedPreferences → DataStore
+
+### Why migrate
+
+- DataStore uses Flow — read latest values reactively, no callbacks.
+- Asynchronous writes avoid main-thread I/O.
+- Type-safe with Proto variant.
+- SharedPreferences is on the way out for new code.
+
+### Steps
+
+<StepList steps={[
+  { title: 'Add datastore-preferences dependency', description: 'androidx.datastore:datastore-preferences:1.1.X' },
+  { title: 'Create a single Context.dataStore', description: 'val Context.prefs by preferencesDataStore(name = "settings")' },
+  { title: 'Read flows for each key', description: 'val theme: Flow<String> = ctx.prefs.data.map { it[stringPreferencesKey("theme")] ?: "system" }' },
+  { title: 'Write with edit { }', description: 'ctx.prefs.edit { it[stringPreferencesKey("theme")] = "dark" }' },
+  { title: 'Use SharedPreferencesMigration during transition', description: 'preferencesDataStore(name = "settings", produceMigrations = { ctx -> listOf(SharedPreferencesMigration(ctx, "legacy_prefs")) })' },
+  { title: 'Drop the legacy file once migration runs in production', description: 'Wait at least 2 releases before removing the SharedPreferences migration.' }
+]} />
+
+<Callout type="warning">
+DataStore reads are async. Code that previously did
+`prefs.getString("key", null)` synchronously needs restructuring —
+either hoist the value to a ViewModel `StateFlow`, or use `runBlocking
+{ prefs.data.first()[key] }` *only* in CLI / test code, never UI.
+</Callout>
+
+---
+
+## 10. WorkManager from JobScheduler / AlarmManager / SyncAdapter
+
+### Why migrate
+
+- WorkManager is the unified, future-proof background scheduler.
+- Handles Doze, Battery Saver, network constraints, retry, and
+  cross-device sync via the same API.
+- Survives reboots and process death; persistent queue stored in Room.
+
+### Mapping
+
+| Old API | WorkManager replacement |
+|---------|------------------------|
+| `JobScheduler` + `JobService` | `WorkManager` + `Worker` / `CoroutineWorker` |
+| `AlarmManager` (deferrable) | `WorkManager` with `setInitialDelay` |
+| `AlarmManager` (exact, user-facing) | Stays as `AlarmManager` (`setExactAndAllowWhileIdle`) |
+| `SyncAdapter` | `WorkManager` periodic + `Constraints.requiredNetworkType` |
+| `Service` (background, deferrable) | `WorkManager` |
+| `Service` (user-facing) | Foreground service (with WorkManager `setForeground`) |
+
+### Steps
+
+<StepList steps={[
+  { title: 'Identify the work', description: 'Is it user-visible (foreground service), exact-time (AlarmManager), or deferrable (WorkManager)?' },
+  { title: 'Rewrite the job as CoroutineWorker', description: 'override suspend fun doWork(): Result — return success/retry/failure.' },
+  { title: 'Define constraints', description: 'NetworkType, requiresCharging, requiresBatteryNotLow — chained constraints replace lots of legacy checks.' },
+  { title: 'Enqueue', description: 'WorkManager.getInstance(ctx).enqueueUniqueWork(name, ExistingWorkPolicy.KEEP, request)' },
+  { title: 'Migrate state', description: 'Cancel any old JobScheduler / AlarmManager jobs from the old codepath on first launch after upgrade.' }
+]} />
+
+---
+
+## Universal migration principles
+
+1. **Lock baselines first.** You cannot prove a migration was worth it
+   without before/after numbers.
+2. **Migrate one module at a time.** Reversibility beats velocity.
+3. **Bridge with adapters during the long tail.** `asFlow()`,
+   `asLiveData()`, `await()`, `rxSingle { }` — there's an interop
+   bridge for every transition.
+4. **Don't mix concerns.** Migrate Java→Kotlin *or* Views→Compose in a
+   single PR, never both.
+5. **Update CI gates before code.** Add lint rules / detekt config /
+   Konsist tests that *forbid* the old API for new code, so the
+   migration only ever moves forward.
+6. **Communicate the cost.** Migrations slow down feature work for
+   weeks. Stakeholders need to understand *why* (build time, crash
+   rate, developer productivity gains) and *when* they'll see returns.
+
+## Where to next
+
+- [Glossary](/docs/reference/glossary)
+- [Cheat Sheets](/docs/reference/cheat-sheets)
+- [Interview Question Bank](/docs/reference/interview-question-bank)

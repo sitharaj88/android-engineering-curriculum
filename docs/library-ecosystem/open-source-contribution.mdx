@@ -1,0 +1,504 @@
+---
+id: open-source-contribution
+title: Open Source Contribution
+sidebar_label: Open Source
+description: Contributing to AOSP, AndroidX/Jetpack, and third-party libraries. Issue triage, PR etiquette, becoming a committer.
+---
+
+import { Callout, StepList, ComparisonCard } from '@site/src/components/Doc';
+
+# Open Source Contribution
+
+Contributing to a library you use is the highest-leverage learning
+activity in software. You read the source of something widely used,
+understand a real problem, and ship a fix that benefits everyone. It's
+also one of the strongest signals on a resume — but the path looks
+intimidating from the outside. This chapter demystifies it.
+
+## The three tiers
+
+<ComparisonCard
+  left={{
+    label: 'Approachable',
+    title: 'Start here',
+    variant: 'new',
+    points: [
+      'Third-party libraries on GitHub (Coil, OkHttp, Retrofit)',
+      'Jetpack libraries via androidx Gerrit',
+      'AOSP UI / settings / non-core',
+      'Documentation fixes anywhere',
+      'Translation contributions'
+    ]
+  }}
+  right={{
+    label: 'Advanced',
+    title: 'Years in',
+    variant: 'old',
+    points: [
+      'AOSP framework (View, WindowManager, ART)',
+      'Kotlin compiler / stdlib',
+      'Hardware abstraction layer (HAL)',
+      'Becoming a Jetpack committer',
+      'Kotlin Evolution & Enhancement Proposals (KEEP)'
+    ]
+  }}
+/>
+
+Start with third-party. Earn confidence; then graduate to AOSP / Jetpack.
+
+---
+
+## Finding a first issue
+
+### Labels to search for
+
+Most projects label first-friendly issues:
+
+- `good first issue`
+- `help wanted`
+- `up for grabs`
+- `documentation`
+- `easy`
+
+### Recommended starting projects
+
+For Android developers:
+- **Coil** — Kotlin-first, well-organized, friendly maintainers
+- **OkHttp** — interceptor / cache / web socket internals
+- **Retrofit** — converter and adapter contributions
+- **Compose libraries** — many community libs (Accompanist, Lottie Compose)
+- **AndroidX** — full Jetpack via Gerrit
+- **Kotlin** — compiler, stdlib, kotlinx libraries
+
+### Reading the contributing guide
+
+Every repo has `CONTRIBUTING.md`. Read it before opening any PR. Specific
+asks (CLA, formatting, commit message format, test requirements) vary.
+
+```bash
+git clone https://github.com/coil-kt/coil.git
+cd coil
+cat CONTRIBUTING.md
+```
+
+Following the contributing guide signals you respect the maintainers'
+time.
+
+---
+
+## The contribution workflow
+
+<StepList steps={[
+  { title: 'Find an issue', description: 'Look for `good first issue` labels OR a bug you\'re hitting OR a doc gap. Comment "I\'d like to take this" to claim it.' },
+  { title: 'Confirm scope', description: 'Briefly summarize your understanding of the change. Wait for maintainer ack. Prevents wasted work on the wrong solution.' },
+  { title: 'Fork + branch', description: 'Fork the repo on GitHub. Clone your fork. Branch from main (or `dev` for some projects).' },
+  { title: 'Write the change + tests', description: 'Follow the repo\'s code style. Add tests covering both the bug and the fix. Run the existing tests.' },
+  { title: 'Sign the CLA (if required)', description: 'Google projects (AOSP, AndroidX) require a one-time Contributor License Agreement. Sign at cla.developers.google.com.' },
+  { title: 'Open the PR', description: 'Title + description match the repo\'s template. Link the issue. Tag relevant reviewers (most repos auto-assign).' },
+  { title: 'Address review', description: 'Be responsive. Update your PR via additional commits (not force-push) unless asked. Discuss disagreements politely.' },
+  { title: 'Wait for merge', description: 'Big projects can take weeks. Don\'t ping daily. If silent for 2+ weeks, a polite check-in is fine.' }
+]} />
+
+---
+
+## AOSP contribution (Gerrit)
+
+AOSP doesn't use GitHub — it uses **Gerrit**. Different workflow:
+
+### Setup
+
+```bash
+# Install Repo (the AOSP frontend)
+mkdir ~/bin
+curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+chmod a+rx ~/bin/repo
+
+# Initialize a workspace
+mkdir aosp-work
+cd aosp-work
+repo init -u https://android.googlesource.com/platform/manifest -b main
+repo sync -j8                                                # downloads ~100 GB
+
+# Set up git review
+sudo apt install git-review                                  # Debian / Ubuntu
+brew install git-review                                       # macOS
+```
+
+### Make a change
+
+```bash
+cd frameworks/base
+repo start my-bug-fix .
+# Edit files
+git add .
+git commit -m "Fix: NPE in SomeManager when locale is null
+
+Bug: 12345
+Test: atest some_test
+Change-Id: I1234567890abcdef..."
+
+# Push to Gerrit
+repo upload .
+```
+
+Two key bits:
+- **Bug:** an Android issue tracker (Issue Tracker / Buganizer ID)
+- **Change-Id:** auto-generated via commit-msg hook; identifies the
+  patchset across revisions
+
+Reviewers (Google engineers + community) comment on Gerrit. You update
+via:
+
+```bash
+git commit --amend
+repo upload .
+```
+
+Re-uploads as **patchset 2** of the same Change-Id. Iterate until +2
+approval and **Verified** label.
+
+### Best AOSP entry points
+
+- **frameworks/support** (now AndroidX) — easier than `frameworks/base`
+- **tools** — developer tools (logcat, layoutlib)
+- **packages/apps** — system apps (Settings, Calculator) with friendlier
+  review than core framework
+
+Avoid jumping straight into `frameworks/base` View hierarchy or
+WindowManager — review bar is very high.
+
+---
+
+## AndroidX / Jetpack contribution
+
+AndroidX is the modern path. Maintained on **Gerrit** at
+android-review.googlesource.com but with a more developer-friendly
+review process than AOSP core.
+
+```bash
+mkdir androidx
+cd androidx
+repo init -u https://android.googlesource.com/platform/frameworks/support \
+    -b androidx-main \
+    --partial-clone
+repo sync -c -j8
+
+# Make changes in (e.g.) paging/paging-runtime
+cd paging/paging-runtime
+# Edit, commit, repo upload .
+```
+
+Specific guides at [androidx.dev](https://androidx.dev/).
+
+Many Jetpack libraries also mirror to GitHub (e.g., Compose Multiplatform).
+Check each library's README for the canonical contribution path.
+
+---
+
+## Issue triage — the unsung contribution
+
+You don't have to code to contribute. Triaging issues is incredibly
+valuable to maintainers:
+
+- **Reproduce** reported bugs and confirm steps work
+- **Close** duplicates or invalid issues with a polite explanation
+- **Label** untagged issues
+- **Answer** support questions in issue threads
+
+A maintainer with 1000 open issues is drowning. Triagers cut that to 200.
+
+Most projects gladly promote prolific triagers to committer / triage
+permission within a few months.
+
+---
+
+## PR etiquette
+
+### Title
+
+Follow the project's conventions. Often:
+
+```text
+feat: support custom retry policies
+fix: NPE in NetworkBoundResource when cache is empty
+docs: clarify usage of GlideListener
+```
+
+### Description
+
+```markdown
+## What
+
+One sentence: what changed.
+
+## Why
+
+Link to the issue. Brief context.
+
+## How
+
+Bullet list of technical approach if non-obvious.
+
+## Testing
+
+- Added unit test for the fix
+- Verified no regression in existing tests
+- Tested locally with sample app
+```
+
+### Commits
+
+- Atomic — one commit per logical change
+- Conventional Commits format
+- No "WIP" or "fix typo" commits (squash before push)
+
+### Force-push or not
+
+- **Force-push** for cleaning up before initial review
+- **Add commits** after reviewers have looked — they want to see the
+  delta
+- **Final squash** at merge time (maintainer's choice; sometimes
+  automated)
+
+---
+
+## Handling reviewer feedback
+
+### When you agree
+
+Make the change, push, comment "Done — see [commit-sha]."
+
+### When you disagree
+
+Explain why with technical reasoning:
+
+> "I considered using `Mutex` here, but it would serialize all reads.
+> Since reads dominate writes (~99%), I chose `ReentrantReadWriteLock`.
+> Happy to switch if you've benchmarked otherwise."
+
+Reviewers are humans. Some are wrong. Make your case; let them respond.
+If they still disagree, defer (it's their codebase) unless the issue is
+substantive.
+
+### When you don't understand
+
+Ask. "Can you point me to an example of this pattern elsewhere in the
+codebase?" or "I'm not sure I follow — could you elaborate?"
+
+Better to ask once than guess wrong.
+
+### When review goes slow
+
+- Wait 2 weeks before pinging
+- Polite check-in: "Hi, friendly ping — any feedback on this PR?"
+- If still silent after another week, ping in the project's Slack /
+  Discord / mailing list
+
+Don't escalate by tagging executives. Bad look.
+
+---
+
+## Becoming a committer
+
+Repeated quality contributions earn:
+- **Committer / Member** status (varies by project)
+- Direct push access to specific paths
+- Review privileges
+- Recognition in release notes / docs
+
+Typical timeline: 3-6 months of consistent contributions for smaller
+projects; 1-2 years for AOSP / Jetpack.
+
+The pattern:
+1. Open 5-10 high-quality PRs over a few months
+2. Review others' PRs constructively
+3. Help with triage and support questions
+4. Be active in chat / issues
+5. Maintainer invites you
+
+Don't ask "how do I become a committer?" — it's awarded, not requested.
+
+---
+
+## Maintaining your own OSS project
+
+The flip side: when your library has 100+ stars, **you** become the
+maintainer.
+
+### Set expectations
+
+```markdown
+## Maintenance
+
+This project is maintained by me on weekends. I respond to issues
+within 7 days and PRs within 14 days.
+
+If you need faster turnaround, consider sponsoring or contributing PRs
+directly.
+```
+
+Set the expectations in README. Underpromise; overdeliver.
+
+### Issue templates
+
+```yaml
+# .github/ISSUE_TEMPLATE/bug_report.yml
+name: Bug Report
+description: Report a bug
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Library version
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations: { required: true }
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations: { required: true }
+```
+
+Templates reduce "I have a bug" → 100 back-and-forth messages.
+
+### Automate everything
+
+- **CI**: lint + test + build on every PR
+- **Release**: tag → GitHub Action publishes to Maven Central + creates
+  changelog
+- **Stale bot**: auto-close issues with no activity for 90 days
+
+Maintainers burn out on toil. Automate it.
+
+### Saying no
+
+Not every feature request fits. Polite decline:
+
+> "Thanks for the proposal. This is interesting, but it would expand the
+> library's scope significantly. I'm focused on keeping the API small
+> and learning curve low. If you have a strong use case, consider
+> wrapping this library in your own."
+
+Explain why; don't ghost. Closed issues with reasoning preserve the
+decision history.
+
+### Handing off
+
+If you can't maintain anymore:
+
+1. Find a successor in your active contributors
+2. Hand over the GitHub repo + Maven Central account
+3. Announce the transition clearly
+4. Archive if no successor — "this library is no longer maintained"
+
+Better than letting it rot with security vulnerabilities.
+
+---
+
+## Documentation contributions
+
+The lowest-friction contribution:
+- Fix typos
+- Add missing examples
+- Clarify confusing API docs
+- Translate to other languages
+- Improve README quickstart
+
+Maintainers love doc PRs. Reviewers approve quickly. Great way to start.
+
+---
+
+## Talk / blog about your contributions
+
+Once you've contributed:
+
+- Tweet about the PR (tag the project's account)
+- Write a blog post about the bug + fix
+- Submit a conference talk about the area you contributed to
+
+Compounds your visibility. Future employers see contributions; future
+interviewers ask about them.
+
+---
+
+## Where to find help
+
+- **Project's Slack / Discord / Gitter** — usually linked from README
+- **Stack Overflow** — tag your question with the library
+- **#android-developers** on Twitter / Bluesky
+- **Reddit r/androiddev**
+- **Kotlin Slack** — kotlinlang.slack.com
+
+Read the room — `#android-internals` on Kotlin Slack is for deep
+discussion; r/androiddev is more general.
+
+---
+
+## Common contribution anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'What hurts',
+    variant: 'old',
+    points: [
+      'Massive first PR (5000 lines, new feature)',
+      'Not reading CONTRIBUTING.md',
+      'Ignoring code review feedback',
+      'Pinging maintainers daily',
+      'Arguing aggressively in PR comments',
+      'Force-pushing after review started'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Good contributor',
+    variant: 'new',
+    points: [
+      'Small first PR (< 100 lines, doc fix or simple bug)',
+      'Following the guide to the letter',
+      'Responding to all comments respectfully',
+      '2-week wait between pings',
+      'Disagree with reasoning, then defer',
+      'Add commits after initial review; squash at merge'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="Open source contribution rules">
+- **Start small** — doc fix or first-issue label. Build credibility.
+- **Read CONTRIBUTING.md** before any PR.
+- **Confirm scope** via issue comment before coding.
+- **AOSP / AndroidX use Gerrit + Repo + CLA**; third-party libraries use GitHub.
+- **Triage is contribution** — issue management is hugely valuable.
+- **Respond promptly + politely** to feedback; disagree with reasoning.
+- **Becoming a committer** is awarded over months of quality work, not requested.
+- **Maintainers**: set expectations, automate, learn to say no kindly.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Find a `good first issue`', description: 'Browse Coil, OkHttp, or your favorite library\'s issues. Find one labelled `good first issue`. Comment to claim it.' },
+  { title: 'First PR', description: 'Open a small PR — a doc fix or simple test addition. Follow the contributing guide exactly. Be patient through review.' },
+  { title: 'Triage 10 issues', description: 'On a project you use, reproduce 10 reported bugs. Comment on each with your findings. Close duplicates.' },
+  { title: 'AOSP setup', description: 'Set up Repo + sync `frameworks/support`. Find one androidx library to read. Identify a small improvement.' },
+  { title: 'Talk about it', description: 'After your first merged PR, tweet about it. Write a short blog post explaining the bug + fix. Submit to Android Weekly.' }
+]} />
+
+## Next
+
+Return to **[Library & Open Source overview](/docs/library-ecosystem)**.

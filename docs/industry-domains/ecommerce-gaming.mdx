@@ -1,0 +1,623 @@
+---
+id: ecommerce-gaming
+title: E-Commerce & Gaming Patterns
+sidebar_label: E-Commerce & Gaming
+description: Patterns specific to shopping (cart, search, recommendations, checkout) and gaming (real-time state, anti-cheat, in-app purchases, leaderboards).
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# E-Commerce & Gaming Patterns
+
+Different verticals, similar challenges: real-time state, smart caching,
+high-frequency interactions, anti-abuse. This chapter covers both —
+they have surprisingly overlapping patterns.
+
+## E-Commerce
+
+### Cart — the most-touched data
+
+```kotlin
+@Entity(tableName = "cart_items")
+data class CartItemEntity(
+    @PrimaryKey val id: String,                                // client-generated UUID
+    val productId: String,
+    val quantity: Int,
+    val unitPriceCents: Long,
+    val variantId: String?,
+    val addedAt: Long,
+    val syncedAt: Long?                                         // null = not yet synced to backend
+)
+
+class CartRepository @Inject constructor(
+    private val dao: CartDao,
+    private val syncWorker: SyncWorker,
+    @IoDispatcher private val io: CoroutineDispatcher
+) {
+    fun observe(): Flow<List<CartItem>> = dao.observeAll()
+        .map { it.map(CartItemEntity::toDomain) }
+
+    suspend fun add(product: Product, quantity: Int = 1) = withContext(io) {
+        val existing = dao.findByProductAndVariant(product.id, product.variantId)
+        if (existing != null) {
+            dao.update(existing.copy(quantity = existing.quantity + quantity, syncedAt = null))
+        } else {
+            dao.insert(CartItemEntity(
+                id = UUID.randomUUID().toString(),
+                productId = product.id,
+                quantity = quantity,
+                unitPriceCents = product.priceCents,
+                variantId = product.variantId,
+                addedAt = System.currentTimeMillis(),
+                syncedAt = null
+            ))
+        }
+        syncWorker.enqueue()
+    }
+
+    suspend fun updateQuantity(itemId: String, quantity: Int) {
+        if (quantity == 0) dao.delete(itemId)
+        else dao.updateQuantity(itemId, quantity, syncedAt = null)
+        syncWorker.enqueue()
+    }
+}
+```
+
+Cart is **offline-first** — see [Offline-First Architecture](/docs/architecture-patterns/offline-first).
+Updates apply locally immediately; sync happens via WorkManager.
+
+### Cart abandonment
+
+Track abandonment to drive marketing:
+
+```kotlin
+class CartAnalytics @Inject constructor(
+    private val analytics: Analytics,
+    cartRepo: CartRepository
+) {
+    init {
+        cartRepo.observe()
+            .map { it.size }
+            .distinctUntilChanged()
+            .onEach { size ->
+                if (size > 0) {
+                    // Schedule abandonment reminder via FCM if no checkout in 1 hour
+                    scheduleReminder(delayHours = 1)
+                } else {
+                    cancelReminder()
+                }
+            }
+            .launchIn(GlobalScope)
+    }
+}
+```
+
+Backend cron checks for stale carts; sends FCM push. Some teams report
+30-40% recovery rate from well-timed abandonment emails.
+
+### Search
+
+```kotlin
+@HiltViewModel
+class SearchViewModel @Inject constructor(
+    private val searchApi: SearchApi
+) : ViewModel() {
+    private val _query = MutableStateFlow("")
+
+    @OptIn(FlowPreview::class)
+    val results: Flow<PagingData<Product>> = _query
+        .debounce(300)                                         // typing pause
+        .distinctUntilChanged()
+        .flatMapLatest { query ->
+            if (query.length < 2) flowOf(PagingData.empty())
+            else Pager(PagingConfig(pageSize = 20)) {
+                SearchPagingSource(searchApi, query)
+            }.flow
+        }
+        .cachedIn(viewModelScope)
+
+    fun onQuery(query: String) { _query.value = query }
+}
+```
+
+Standard search pattern from [Paging 3](/docs/networking-api/paging-3).
+Server-side search (Algolia, Typesense, Elasticsearch) is usually
+required — Room FTS is OK for small catalogs but doesn't handle
+typos / synonyms / facets at scale.
+
+### Personalized recommendations
+
+For "you might also like":
+
+```kotlin
+class RecommendationsRepository @Inject constructor(
+    private val mlKit: ProductEmbedder,                        // TF Lite text embedder
+    private val productDao: ProductDao
+) {
+    suspend fun similar(productId: String, topK: Int = 10): List<Product> {
+        val product = productDao.get(productId) ?: return emptyList()
+        val queryEmbedding = mlKit.embed("${product.name} ${product.description}")
+
+        val candidates = productDao.recentlyViewed(limit = 1000)
+        return candidates
+            .map { it to cosineSimilarity(queryEmbedding, it.embedding) }
+            .sortedByDescending { it.second }
+            .take(topK)
+            .map { it.first.toDomain() }
+    }
+}
+```
+
+Combined with server-side collaborative filtering (e.g., AWS Personalize,
+Tencent Personalize), you get product recommendations without a custom
+ML team.
+
+### Filtering & sorting
+
+```kotlin
+data class CatalogFilter(
+    val categories: Set<String> = emptySet(),
+    val priceRange: ClosedFloatingPointRange<Float>? = null,
+    val sortBy: SortOrder = SortOrder.Relevance,
+    val sizes: Set<String> = emptySet(),
+    val colors: Set<String> = emptySet(),
+    val inStock: Boolean = false
+)
+
+enum class SortOrder {
+    Relevance, PriceAsc, PriceDesc, NewestFirst, BestSelling, TopRated
+}
+
+class CatalogViewModel @Inject constructor(
+    private val repo: ProductRepository
+) : ViewModel() {
+    private val _filter = MutableStateFlow(CatalogFilter())
+
+    val products: Flow<PagingData<Product>> = _filter
+        .flatMapLatest { filter ->
+            Pager(PagingConfig(pageSize = 20)) {
+                CatalogPagingSource(repo, filter)
+            }.flow
+        }
+        .cachedIn(viewModelScope)
+
+    fun updateFilter(transform: (CatalogFilter) -> CatalogFilter) {
+        _filter.update(transform)
+    }
+}
+```
+
+Same Paging 3 + flatMapLatest pattern as search. Filter state in
+`StateFlow`; the source re-paginates when it changes.
+
+### Checkout state machine
+
+```kotlin
+sealed interface CheckoutState {
+    data object Initial : CheckoutState
+    data class Address(val saved: List<Address>, val selected: Address?) : CheckoutState
+    data class Shipping(val address: Address, val options: List<ShippingOption>, val selected: ShippingOption?) : CheckoutState
+    data class Payment(val context: CheckoutContext, val methods: List<PaymentMethod>) : CheckoutState
+    data class Review(val context: CheckoutContext) : CheckoutState
+    data class Submitting(val context: CheckoutContext) : CheckoutState
+    data class Confirmed(val orderId: OrderId) : CheckoutState
+    data class Failed(val context: CheckoutContext, val error: CheckoutError) : CheckoutState
+}
+```
+
+Pure FSM — each phase has clear inputs / outputs / allowed transitions.
+See [MVI & State Machines](/docs/architecture-patterns/mvi-state-machines)
+for the full pattern.
+
+### Inventory race conditions
+
+Two users buy the last unit at the same time:
+
+```kotlin
+suspend fun completeCheckout(cart: Cart): Outcome<Order, CheckoutError> {
+    val idempotencyKey = UUID.randomUUID().toString()
+    return apiCall {
+        api.createOrder(
+            CreateOrderRequest(
+                items = cart.items,
+                idempotencyKey = idempotencyKey
+            )
+        )
+    }
+}
+```
+
+Server-side: atomically decrement inventory + create order in one
+transaction. If inventory check fails, return `INVENTORY_INSUFFICIENT`.
+Client shows "Out of stock" and lets the user remove the item.
+
+Idempotency keys prevent double-orders on retry. Server-side is
+authoritative — never trust client-side inventory state.
+
+---
+
+## Gaming patterns
+
+### Real-time game state
+
+```kotlin
+class GameSession @Inject constructor(
+    private val webSocket: GameSocket
+) {
+    private val _state = MutableStateFlow<GameState>(GameState.Connecting)
+    val state: StateFlow<GameState> = _state.asStateFlow()
+
+    suspend fun start(roomId: String) {
+        webSocket.connect(roomId)
+
+        webSocket.incoming
+            .filterIsInstance<ServerMessage.StateUpdate>()
+            .map { it.state }
+            .onEach { newState ->
+                _state.value = applyServerState(newState)
+            }
+            .launchIn(scope)
+
+        webSocket.incoming
+            .filterIsInstance<ServerMessage.PlayerAction>()
+            .onEach { action ->
+                _state.update { currentState ->
+                    applyPlayerAction(currentState, action)
+                }
+            }
+            .launchIn(scope)
+    }
+
+    suspend fun sendInput(input: PlayerInput) {
+        // Client-side prediction
+        _state.update { current -> predictLocally(current, input) }
+
+        // Send to server for authoritative resolution
+        webSocket.send(ClientMessage.Input(input))
+    }
+}
+```
+
+**Client-side prediction** + **server reconciliation**: apply input
+locally for instant feedback; server is authoritative. When server
+disagrees, replay corrections — the visible state may briefly correct
+but feels much smoother than waiting for server round-trip.
+
+### Game loop on Android
+
+For real-time games (rhythm, racing):
+
+```kotlin
+class GameLoop(private val onUpdate: (deltaMs: Long) -> Unit) {
+    private val choreographer = Choreographer.getInstance()
+    private var lastFrame = 0L
+    private val callback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (lastFrame == 0L) {
+                lastFrame = frameTimeNanos
+            }
+            val delta = (frameTimeNanos - lastFrame) / 1_000_000
+            lastFrame = frameTimeNanos
+            onUpdate(delta)
+            choreographer.postFrameCallback(this)
+        }
+    }
+
+    fun start() { choreographer.postFrameCallback(callback) }
+    fun stop() { choreographer.removeFrameCallback(callback) }
+}
+```
+
+Choreographer-driven loop runs at display refresh rate (60/90/120/144
+Hz). Decouple **update logic** from **render** — update at fixed delta,
+render every frame.
+
+### Anti-cheat
+
+```kotlin
+class IntegrityVerifier @Inject constructor(
+    private val playIntegrity: StandardIntegrityChecker,
+    private val antiTamper: TamperDetector
+) {
+    suspend fun verifyTrustworthy(): Boolean {
+        // 1. Play Integrity (Module 16)
+        val token = runCatching { playIntegrity.getToken("game_session") }.getOrNull()
+        if (token == null) return false
+
+        // 2. Detect Frida / Xposed / root
+        if (antiTamper.isInstrumented()) return false
+
+        // 3. Server-side verifies the token + the request
+        return true
+    }
+}
+```
+
+Plus:
+- **Authoritative server** — never trust client state
+- **Replay analysis** — server detects impossible inputs (e.g., 1000 actions/second)
+- **Anomaly detection** — flag accounts with statistical outliers
+- **Reporting tools** — users report cheaters → human review
+
+Don't ship a multiplayer game without server-authoritative state. The
+client will be hacked; it's not a question of if.
+
+### In-app purchases & virtual currency
+
+```kotlin
+class GameStore @Inject constructor(
+    private val billing: BillingClient,
+    private val entitlements: EntitlementRepository
+) {
+    suspend fun buyCoins(activity: Activity, productId: String): Outcome<Long, BillingError> {
+        val product = billing.queryProductDetails(productId)
+        val launchResult = billing.launchBillingFlow(activity, product)
+
+        if (launchResult is Outcome.Err) return launchResult
+
+        val purchase = billing.purchasesFlow.first { it.products.contains(productId) }
+
+        // Server-side verification
+        val verified = backend.verifyPurchase(purchase.purchaseToken, productId)
+        if (!verified) return Outcome.Err(BillingError.VerificationFailed)
+
+        // Acknowledge (mandatory)
+        billing.acknowledge(purchase.purchaseToken)
+
+        // Grant
+        val coins = productToCoins(productId)
+        entitlements.addCoins(coins)
+        return Outcome.Ok(coins)
+    }
+}
+```
+
+See [Play Billing](/docs/publishing/play-billing) for the full IAP
+guide.
+
+For free-to-play monetization:
+- **Soft currency** — earned in-game; not buyable. Server-tracked.
+- **Hard currency** — bought with real money via Play Billing.
+- **Conversion** — soft → hard discouraged (regulators see this as
+  gambling-like). Hard → soft fine.
+
+### Leaderboards
+
+```kotlin
+implementation("com.google.android.gms:play-services-games-v2:20.1.2")
+```
+
+```kotlin
+class LeaderboardService @Inject constructor(
+    @ApplicationContext context: Context
+) {
+    private val client = PlayGames.getLeaderboardsClient(context)
+
+    suspend fun submitScore(leaderboardId: String, score: Long) {
+        client.submitScore(leaderboardId, score)
+    }
+
+    suspend fun getTopScores(leaderboardId: String, limit: Int = 25): List<LeaderboardEntry> {
+        val result = client.loadTopScores(
+            leaderboardId,
+            LeaderboardVariant.TIME_SPAN_ALL_TIME,
+            LeaderboardVariant.COLLECTION_PUBLIC,
+            limit
+        ).await()
+
+        return result.toEntries()
+    }
+
+    fun showUI(activity: Activity, leaderboardId: String) {
+        client.getLeaderboardIntent(leaderboardId)
+            .addOnSuccessListener { intent ->
+                activity.startActivityForResult(intent, RC_LEADERBOARD_UI)
+            }
+    }
+}
+```
+
+Play Games Services provides:
+- Cross-device leaderboards (signed in with Google)
+- Achievements
+- Cloud save
+- Multiplayer matchmaking (Quickplay)
+
+Free + Play Store integration. Saves you from building all of this.
+
+### Save game state
+
+For single-player progression:
+
+```kotlin
+class SaveGameService @Inject constructor(
+    @ApplicationContext context: Context
+) {
+    private val client = PlayGames.getSnapshotsClient(context)
+
+    suspend fun save(saveName: String, data: ByteArray, description: String) {
+        val open = client.open(saveName, true).await()
+        val snapshot = open.data ?: return
+
+        snapshot.snapshotContents.writeBytes(data)
+        val metadata = SnapshotMetadataChange.Builder()
+            .setDescription(description)
+            .setPlayedTimeMillis(playTime)
+            .build()
+
+        client.commitAndClose(snapshot, metadata).await()
+    }
+
+    suspend fun load(saveName: String): ByteArray? {
+        val open = client.open(saveName, false).await()
+        val bytes = open.data?.snapshotContents?.readFully()
+        open.data?.let { client.discardAndClose(it).await() }
+        return bytes
+    }
+}
+```
+
+Up to 3 MB per snapshot. Synced across devices via the user's Google
+Play Games account. No backend needed.
+
+### Push notifications for re-engagement
+
+Classic gaming pattern:
+
+```kotlin
+class GameNotifications @Inject constructor(
+    private val workManager: WorkManager
+) {
+    fun scheduleEnergyRefilled(delayMinutes: Long) {
+        val work = OneTimeWorkRequestBuilder<EnergyRefillNotifier>()
+            .setInitialDelay(delayMinutes, TimeUnit.MINUTES)
+            .build()
+        workManager.enqueueUniqueWork(
+            "energy_refill",
+            ExistingWorkPolicy.REPLACE,
+            work
+        )
+    }
+}
+
+class EnergyRefillNotifier @AssistedInject constructor(
+    @Assisted context: Context,
+    @Assisted params: WorkerParameters
+) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
+        showNotification(
+            title = "Your energy is refilled!",
+            body = "Tap to play"
+        )
+        return Result.success()
+    }
+}
+```
+
+Energy systems, daily rewards, event windows — all schedule
+notifications to drive return visits.
+
+---
+
+## Common patterns across both
+
+### Offline-first
+
+Both e-commerce carts and game state need to work offline. Same pattern
+— local store as source of truth, sync via WorkManager / WebSocket.
+
+### Optimistic UI
+
+Adding to cart, submitting a move, clicking buy — apply locally
+immediately. Roll back if server rejects.
+
+### Real-time updates
+
+E-commerce: inventory updates, price drops, abandoned cart pushes.
+Gaming: opponent moves, leaderboard updates, friend status.
+
+WebSocket / FCM push handles both.
+
+### Frequent small writes
+
+Cart updates per tap; game moves per second. Both benefit from:
+- Local-first writes
+- Debounced / batched sync
+- Idempotency keys
+
+### Image-heavy
+
+Product photos, game thumbnails, character art. Both need:
+- Aggressive caching
+- Size-aware loading (don't load 4K hero on a card thumbnail)
+- WebP / AVIF where possible
+
+See [Image Loading](/docs/networking-api/image-loading).
+
+---
+
+## E-commerce metrics worth tracking
+
+- **Conversion rate** — visits → purchases. Per screen + funnel step.
+- **Cart abandonment** — % carts not checked out
+- **Time to first product view** — discoverability
+- **Search → click rate** — search quality
+- **Average order value (AOV)** — basket size
+- **Repeat purchase rate** — retention
+- **Crash-free during checkout** — money lost per crash
+
+Each ties to revenue. Optimize systematically.
+
+## Gaming metrics worth tracking
+
+- **DAU / WAU / MAU**
+- **D1 / D7 / D30 retention**
+- **ARPU / ARPDAU**
+- **Average session length**
+- **Sessions per day**
+- **Crash-free** (gaming users are intolerant of crashes mid-match)
+- **Frame rate distribution** — jank is gameplay-ending
+- **Player skill rating distribution** — matchmaking quality
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Anti-patterns',
+    title: 'E-commerce + gaming hazards',
+    variant: 'old',
+    points: [
+      'Client-trusted prices / inventory / scores',
+      'Cart in volatile memory (lost on restart)',
+      'No idempotency on order submission',
+      'Blocking UI for every cart update (server roundtrip)',
+      'Gaming logic on client (cheatable)',
+      'No server-side fraud / cheat detection'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Production patterns',
+    variant: 'new',
+    points: [
+      'Server-authoritative on price / inventory / score',
+      'Cart in Room with WorkManager sync',
+      'Idempotency keys on every order',
+      'Optimistic UI; sync in background',
+      'Server-authoritative game state; client predicts',
+      'Play Integrity + server-side anomaly detection'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="E-commerce & gaming rules">
+- **Offline-first carts** — Room as source of truth; WorkManager syncs.
+- **Server-authoritative** prices, inventory, scores, game state. Always.
+- **Idempotency keys** on orders / payments / state mutations.
+- **Optimistic UI** for instant feedback; revert on server rejection.
+- **Real-time** via WebSocket + FCM push for both verticals.
+- **Anti-cheat / fraud**: Play Integrity + server-side detection + reports.
+- **Play Games Services** for leaderboards, achievements, cloud save.
+- **In-app purchases** with server verification — never grant on client only.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Offline cart', description: 'Implement a Cart with Room + WorkManager sync. Verify it works in airplane mode and syncs on reconnect.' },
+  { title: 'Search with debounce + paging', description: 'Wire SearchPagingSource with debounce(300) + flatMapLatest. Type fast; confirm only the final query hits the server.' },
+  { title: 'Checkout FSM', description: 'Model checkout as a sealed-class state machine with idempotency keys on order submit.' },
+  { title: 'Game loop', description: 'Build a Choreographer-driven game loop. Implement a simple physics simulation (ball bouncing). Measure frame timing.' },
+  { title: 'Leaderboard', description: 'Integrate Play Games Services. Submit a score on game completion; show top-25 leaderboard UI.' }
+]} />
+
+## Next
+
+Return to **[Industry Domains overview](/docs/industry-domains)** or
+continue to the next section.

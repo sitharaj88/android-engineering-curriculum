@@ -1,0 +1,582 @@
+---
+id: ab-testing-experimentation
+title: A/B Testing & Experimentation
+sidebar_label: A/B Testing
+description: Hypothesis-driven product development — power analysis, sample size, statistical significance, multi-arm tests, segmentation, and shipping with evidence.
+---
+
+import { Callout, ComparisonCard, StepList } from '@site/src/components/Doc';
+
+# A/B Testing & Experimentation
+
+A/B testing turns product decisions from opinions into evidence. "Does
+the new checkout flow improve conversion?" stops being a 1-hour meeting
+and becomes a 2-week experiment with a definitive answer. This chapter
+covers the methodology, not just the tooling.
+
+## When to A/B test
+
+<ComparisonCard
+  left={{
+    label: 'Good for A/B testing',
+    title: 'High-leverage tests',
+    variant: 'new',
+    points: [
+      'Feature launches with uncertain impact',
+      'Pricing / paywall variations',
+      'Onboarding flow changes',
+      'Search algorithm tweaks',
+      'Notification copy / timing',
+      'UI redesigns of critical screens'
+    ]
+  }}
+  right={{
+    label: 'Not worth A/B testing',
+    title: 'Skip the experiment',
+    variant: 'old',
+    points: [
+      'Bug fixes (just ship)',
+      'Tiny visual tweaks (font size 14→16)',
+      'Regulatory / compliance changes (no choice)',
+      'Tests with no clear hypothesis',
+      'Sample size you can\'t reach in months',
+      'Changes affecting < 1% of users'
+    ]
+  }}
+/>
+
+Reserve experimentation budget for **decisions you can't intuit**. Don't
+test "should the button be blue or green" — that's bikeshedding.
+
+---
+
+## The experimentation framework
+
+<StepList steps={[
+  { title: 'Hypothesis', description: '\"If we [change], then [metric] will [direction] by [magnitude] because [reason].\" Specific, measurable, falsifiable.' },
+  { title: 'Power analysis', description: 'Compute the sample size needed to detect your hypothesized effect at p<0.05 with 80% power. Skip this and your test is theatre.' },
+  { title: 'Implementation', description: 'Code both variants. Gate via Remote Config (Module 07). Allocate users randomly + stably (deterministic hash).' },
+  { title: 'Pre-registration', description: 'Document hypothesis, metric, sample size, runtime, success criteria BEFORE running. Prevents post-hoc rationalization.' },
+  { title: 'Run', description: 'Let it run for the planned duration. Don\'t peek and stop early at the first significant result (p-hacking).' },
+  { title: 'Analysis', description: 'Compute confidence intervals + p-values. Check guardrail metrics (no crash spike, no engagement drop on adjacent flows).' },
+  { title: 'Decision + ship', description: 'Ship the winner; document the loser. Update the team\'s mental model.' }
+]} />
+
+---
+
+## Power analysis — sample size
+
+You need enough users to detect the effect. **Underpowered tests waste
+time** — they may show "no significant difference" when there actually
+is one but you didn't have the sample size to see it.
+
+### The four levers
+
+```text
+Sample size  ←  needed to detect
+  ↑
+Effect size (magnitude of change)
+Statistical significance (typical: 95% confidence)
+Statistical power (typical: 80%)
+Baseline conversion rate
+```
+
+Standard tools (Optimizely, Statsig, Eppo) provide calculators. Or
+manually:
+
+```kotlin
+fun sampleSizePerVariant(
+    baselineRate: Double,                          // e.g., 0.05 (5% conversion)
+    minimumDetectableEffect: Double,               // e.g., 0.01 (1pp absolute)
+    significance: Double = 0.05,
+    power: Double = 0.80
+): Int {
+    // Approximate formula for two-proportion z-test
+    val z_a = 1.96         // 95% confidence (two-sided)
+    val z_b = 0.84         // 80% power
+    val p1 = baselineRate
+    val p2 = baselineRate + minimumDetectableEffect
+    val p_pooled = (p1 + p2) / 2
+    val numerator = (z_a * Math.sqrt(2 * p_pooled * (1 - p_pooled))) +
+                    (z_b * Math.sqrt(p1 * (1 - p1) + p2 * (1 - p2)))
+    return Math.ceil(Math.pow(numerator, 2.0) / Math.pow(p2 - p1, 2.0)).toInt()
+}
+
+// 5% baseline → 6% target → ~7,800 users per variant
+// Total: ~15,600 users
+```
+
+### Example sample sizes
+
+| Baseline | Target | Detectable | Users per variant |
+|----------|--------|------------|-------------------|
+| 5% | 5.5% | 0.5pp | ~25,000 |
+| 5% | 6% | 1pp | ~7,800 |
+| 5% | 7% | 2pp | ~2,200 |
+| 5% | 10% | 5pp | ~600 |
+| 50% | 55% | 5pp | ~1,200 |
+
+**Smaller effects need way more users.** Most "tiny tweak" A/B tests
+are underpowered without realizing it.
+
+---
+
+## Stable assignment
+
+Users must land in the same variant every time:
+
+```kotlin
+fun assignVariant(userId: String, experimentKey: String): Variant {
+    val hash = sha256("$experimentKey:$userId").take(8)
+    val bucket = hash.toInt(16) % 100
+    return when {
+        bucket < 50 -> Variant.Control
+        else -> Variant.Treatment
+    }
+}
+```
+
+Deterministic hash → same user, same variant, every session. Critical
+for:
+- Consistent UX (no flicker between sessions)
+- Cohort analysis (user A in treatment for the full experiment)
+- Recovery from app crashes (no re-randomization)
+
+### Firebase Remote Config + A/B testing
+
+```kotlin
+val remoteConfig = Firebase.remoteConfig
+remoteConfig.setDefaultsAsync(mapOf(
+    "checkout_variant" to "control"
+))
+
+val variant = remoteConfig.getString("checkout_variant")
+analytics.setUserProperty("experiment_checkout", variant)
+```
+
+Firebase A/B Testing UI:
+1. Pick an experiment goal metric (e.g., `checkout_completed`)
+2. Define variants (control 50%, treatment 50%)
+3. Pick activation event (e.g., `screen_view: checkout_started`)
+4. Pick target audience
+5. Set runtime
+6. Run; Firebase auto-stops at significance
+
+Limitations: Firebase's significance threshold is fixed; complex
+multi-arm tests harder. For sophisticated teams, **Statsig**,
+**Optimizely**, or **LaunchDarkly** are richer.
+
+---
+
+## Guardrail metrics
+
+Don't just track the primary metric. Track guardrails:
+
+```text
+Primary:
+- Conversion rate (target metric)
+
+Guardrails:
+- App crash rate (must not regress)
+- App ANR rate (must not regress)
+- Engagement on adjacent screens (e.g., did treatment hurt search use?)
+- D1 / D7 retention (long-term health)
+- Revenue per user (overall)
+```
+
+A treatment that lifts conversion 5% but kills retention 10% is **net
+negative**. Catch this with guardrails.
+
+```kotlin
+class ExperimentMetrics @Inject constructor(
+    private val analytics: Analytics
+) {
+    fun logCheckoutFunnel(userId: String, step: CheckoutStep, variant: String) {
+        analytics.logEvent("checkout_step", bundleOf(
+            "user_id" to userId,
+            "step" to step.name,
+            "variant" to variant,
+            "timestamp_ms" to System.currentTimeMillis()
+        ))
+    }
+}
+```
+
+Log every funnel step. The analysis tool (Amplitude, Mixpanel, your
+warehouse) computes funnel conversion per variant.
+
+---
+
+## Statistical significance
+
+p-value: probability the observed difference is due to random chance.
+
+- p < 0.05: typically considered "significant"
+- p < 0.01: stronger evidence
+- p < 0.001: very strong evidence
+
+```text
+Control:   50,000 users  →  2,500 conversions  (5.0%)
+Treatment: 50,000 users  →  2,650 conversions  (5.3%)
+
+Z = (0.053 - 0.050) / sqrt((0.0515 * 0.9485) / 50000 * 2)
+  ≈ 1.96
+p ≈ 0.05 (right at the threshold)
+```
+
+Don't celebrate p < 0.05 if the experiment was underpowered — small
+sample + small effect produces noisy estimates.
+
+### Confidence intervals
+
+More informative than p-values:
+
+```text
+Treatment lift: +6% [+2%, +10%] @ 95% CI
+```
+
+"We're 95% confident the true lift is between +2% and +10%." If the
+interval contains 0, the effect is uncertain.
+
+### The Lindley paradox
+
+With huge samples (millions of users), even tiny / meaningless effects
+become "statistically significant." Always check **effect size** too:
+
+> "Treatment increased conversion by 0.001 percentage points (p < 0.001)"
+
+Statistically significant; practically meaningless. Set a **minimum
+detectable effect** threshold up front to avoid shipping noise.
+
+---
+
+## Multi-arm experiments
+
+A/B/C/D tests test multiple variants simultaneously:
+
+```text
+Control (33%)
+Treatment A (33%) — bigger button
+Treatment B (33%) — different copy
+```
+
+Compares each treatment against control. Bonferroni-corrected p-value
+threshold: divide α by number of comparisons.
+
+- 2 variants → p < 0.05 each
+- 3 variants → p < 0.025 each (0.05 / 2 comparisons vs control)
+
+Or use a **multi-arm bandit** algorithm — automatically allocate more
+traffic to the winning variant during the experiment.
+
+---
+
+## Multi-variant experiments
+
+Different from multi-arm. Tests **combinations**:
+
+```text
+Button: red OR blue
+Copy:   "Buy now" OR "Get it"
+
+4 cells: red+Buy now, red+Get it, blue+Buy now, blue+Get it
+```
+
+Tests:
+- Main effect of color
+- Main effect of copy
+- **Interaction** — does the best copy depend on the color?
+
+Requires more sample size; analyzed via ANOVA. For most teams, sequential
+A/B tests are simpler than full multi-variant designs.
+
+---
+
+## Segmentation
+
+Effects often differ per segment:
+
+```text
+Overall: +2% conversion
+  iOS users: -1%
+  Android users: +4%
+```
+
+Treatment hurts iOS, helps Android. Average masks the truth.
+
+Pre-register segments to analyze:
+- Platform (iOS / Android / Web)
+- Country / region
+- User tenure (new / week 1 / week 4+)
+- Tier (free / premium)
+- Network type (Wi-Fi / cellular)
+
+```kotlin
+class SegmentedAnalytics @Inject constructor(
+    private val firebase: FirebaseAnalytics
+) {
+    fun setSegments(user: User) {
+        firebase.setUserProperty("platform", "android")
+        firebase.setUserProperty("tier", user.tier.name)
+        firebase.setUserProperty("country", user.country)
+        firebase.setUserProperty("tenure_bucket", user.tenureBucket())
+    }
+}
+```
+
+Analysis tools (Amplitude, Looker) slice the experiment by user property.
+
+### Sample size per segment
+
+If you want to detect a +1pp effect within iOS-only users (35% of your
+base), you need **3× the total sample size** to reach the iOS subgroup
+adequately.
+
+Pre-plan: which segments matter? Allocate budget accordingly.
+
+---
+
+## Common experimentation mistakes
+
+### Peeking + early stopping
+
+Looking at the p-value during the test and stopping at the first
+significance:
+
+```text
+Day 3: p = 0.06 (close!)
+Day 4: p = 0.04 (significant! ship!)
+```
+
+But if you continue: Day 7: p = 0.12 (back to non-significant).
+
+Random walks cross the significance line multiple times. Pre-register
+the runtime + don't peek.
+
+### Selection bias
+
+The "activation event" (when a user enters the experiment) matters:
+
+```text
+❌ "Users who VIEWED CHECKOUT" — already engaged, skewed sample
+✓ "Users who STARTED A SESSION" — full population
+```
+
+Be conservative about who's "in" the experiment.
+
+### Novelty effect
+
+New things drive engagement just by being new. A 5% lift in week 1 may
+shrink to 1% by week 4. **Run for 2-4 weeks** for sustainable effects.
+
+### Sample ratio mismatch (SRM)
+
+If you allocated 50/50, but observe 48/52 split, your randomization is
+broken. Common causes:
+- One variant crashes more (users with crashes don't return → lower
+  count)
+- Targeting filter applied unevenly
+- Bug in the experiment SDK
+
+Check sample sizes against expected ratios. Significant deviation =
+analysis invalid; fix and re-run.
+
+### Multiple hypothesis testing
+
+Running 100 experiments simultaneously, 5 will reach p < 0.05 by chance
+alone. Use:
+
+- **Bonferroni correction**: p < 0.05 / N
+- **False Discovery Rate (FDR)**: more lenient; controls expected
+  proportion of false positives
+
+For high-throughput experimentation programs (Google, Netflix), this is
+a dedicated team's job.
+
+---
+
+## Building an experimentation culture
+
+### Documentation
+
+Every experiment gets a **doc**:
+
+```markdown
+# Experiment: New Checkout Flow
+
+## Hypothesis
+If we replace the 3-step checkout with a single-page flow, then
+checkout completion will increase by 2pp, because users currently
+abandon between steps.
+
+## Implementation
+- `checkout_v2_enabled` Remote Config flag
+- 50/50 split among users in `users_with_cart_intent` audience
+- Activation: `checkout_started` event
+
+## Metric
+- Primary: `checkout_completed` / `checkout_started`
+- Guardrails: D7 retention, crash rate, revenue per user
+
+## Sample size
+~10k users per variant, calculated for 80% power, p < 0.05, baseline
+4%, target 6%.
+
+## Runtime
+~2 weeks. Stop early only if guardrails regress > 5%.
+
+## Result (filled in post-experiment)
+Conversion: 4.1% → 5.8% (+1.7pp, p < 0.001, 95% CI [+1.1pp, +2.3pp])
+D7 retention: -0.2pp (within guardrail)
+Crash rate: unchanged
+
+Decision: SHIP TO 100%
+```
+
+Library of past experiments is a learning artifact for the team.
+
+### Experiment registry
+
+A wiki / spreadsheet listing every active + past experiment:
+- Owner
+- Status (designing, running, analyzing, shipped, killed)
+- Date range
+- Metric + result
+
+Prevents:
+- Two teams running conflicting experiments on the same surface
+- Decisions made on results nobody remembers
+
+### Killing losers honestly
+
+The hardest part of experimentation is **shipping the loser** —
+sometimes your shiny new idea is worse. Engineering culture must
+celebrate killing bad ideas.
+
+```text
+Outcome: Treatment regressed conversion by 1.5pp (p = 0.003)
+Decision: REVERT — keep control variant
+```
+
+A team that runs 10 experiments and ships 3 is doing better than one that
+runs 3 and ships all 3 — the loser revert prevented bad ideas from
+spreading.
+
+---
+
+## Holdouts
+
+For high-stakes apps, keep a **persistent holdout** — a 1% sample
+that never sees new experiments:
+
+```kotlin
+fun isInHoldout(userId: String): Boolean {
+    val hash = sha256("holdout:$userId").take(8).toInt(16) % 100
+    return hash < 1
+}
+```
+
+Holdout cohort serves as the "no changes" baseline. After a year:
+
+```text
+Treatment cohort: +12% retention
+Holdout cohort:   baseline
+```
+
+Quantifies the total impact of your experimentation program. Helps
+budget arguments ("we delivered $X in incremental revenue").
+
+---
+
+## Server-side vs client-side experimentation
+
+Client-side (Remote Config): variant applied in the app.
+- Pros: any UI / behavior; rich client metrics
+- Cons: only Android users; flag must be in the binary
+
+Server-side: variant decided on the server; backend returns different
+data.
+- Pros: cross-platform; can affect pricing / inventory / ranking
+- Cons: client code must accept arbitrary server responses
+
+Most companies do both. Server-side for backend / cross-platform tests;
+client-side for UI tests.
+
+---
+
+## Tooling landscape
+
+| Tool | Best for | Notes |
+|------|----------|-------|
+| **Firebase A/B Testing** | Small / mid teams | Free; Remote Config based; limited stats |
+| **Statsig** | Growing teams | Powerful; free tier; modern API |
+| **Optimizely** | Enterprise | Mature; expensive |
+| **LaunchDarkly** | Feature flags + experiments | Feature-flag heavy |
+| **GrowthBook** | Self-hosted | OSS option; SQL-based metrics |
+| **Eppo** | Data-warehouse-first | Reads from BigQuery / Snowflake |
+| **In-house** | Mega-scale (Meta, Google) | Custom because off-the-shelf doesn't scale |
+
+Start with Firebase (free). Outgrow → Statsig. At 10M+ users with
+dozens of concurrent experiments → bigger tools or in-house.
+
+---
+
+## Common anti-patterns
+
+<ComparisonCard
+  left={{
+    label: 'Experimentation anti-patterns',
+    title: 'Common mistakes',
+    variant: 'old',
+    points: [
+      'No hypothesis — \"let\'s see what happens\"',
+      'No sample-size calculation — underpowered tests',
+      'Peeking + early stopping',
+      'No guardrail metrics',
+      'p-hacking until something is significant',
+      'Shipping non-significant results because \"it felt better\"'
+    ]
+  }}
+  right={{
+    label: 'Best practices',
+    title: 'Rigorous experiments',
+    variant: 'new',
+    points: [
+      'Pre-registered hypothesis + metric + runtime',
+      'Power analysis BEFORE running',
+      'Stick to the runtime; analyze once at the end',
+      'Primary metric + 3-5 guardrails',
+      'Bonferroni / FDR for multiple comparisons',
+      'Ship per pre-registered criteria; document losers'
+    ]
+  }}
+/>
+
+---
+
+## Key takeaways
+
+<Callout kind="success" title="A/B testing rules">
+- **Hypothesis-driven**: every experiment has a measurable, falsifiable hypothesis.
+- **Power analysis up front** — underpowered tests waste weeks.
+- **Pre-register** runtime + metrics + criteria; no peeking.
+- **Guardrails** protect against second-order effects.
+- **Segments matter** — overall lift can hide subgroup harm.
+- **Holdout cohorts** measure cumulative impact of experimentation.
+- **Kill losers honestly** — celebrating null results builds rigor.
+- **Tooling**: Firebase free → Statsig / Eppo at scale.
+</Callout>
+
+## Practice exercises
+
+<StepList steps={[
+  { title: 'Design an experiment', description: 'Pick a feature in your app. Write a one-page experiment doc: hypothesis, metric, sample size, runtime, guardrails. Get peer review.' },
+  { title: 'Implement variant assignment', description: 'Build the SHA-256-based assignment function. Verify same userId + experiment key produces same variant every call.' },
+  { title: 'Firebase A/B test', description: 'Set up an experiment in Firebase. Wire your app to read variant from Remote Config. Log activation events.' },
+  { title: 'Run + analyze', description: 'Run the experiment for 2 weeks. Compute lift + confidence interval. Decide ship / no-ship per your pre-registered criteria.' },
+  { title: 'Document a loser', description: 'Write a post-mortem on an experiment that didn\'t win. What was the hypothesis, what went wrong, what did the team learn?' }
+]} />
+
+## Next
+
+Return to **[Developer Productivity overview](/docs/developer-productivity)**.

@@ -1,0 +1,517 @@
+---
+id: glossary
+title: Android & Kotlin Glossary
+sidebar_label: Glossary
+description: Alphabetical reference for the terms, acronyms, APIs, and concepts used throughout the curriculum — Kotlin, Compose, architecture, tooling, and platform.
+---
+
+import { Callout } from '@site/src/components/Doc';
+
+# Android & Kotlin Glossary
+
+A working reference for the terms you'll encounter across the curriculum.
+Use it to disambiguate jargon, look up an acronym, or get a one-line
+definition before diving into a chapter.
+
+<Callout type="info">
+Bold terms link to the chapter where the concept is taught in depth.
+Search this page (`Cmd/Ctrl + F`) to jump quickly.
+</Callout>
+
+---
+
+## A
+
+**AAB (Android App Bundle)** — Google Play's publishing format. The bundle
+contains all code and resources; Play generates per-device APKs at install
+time (smaller downloads).
+
+**AAOS (Android Automotive OS)** — full Android stack running on the
+in-vehicle infotainment head unit (not Android Auto).
+
+**ABI (Application Binary Interface)** — CPU architecture target like
+`arm64-v8a`, `armeabi-v7a`, `x86_64`. App Bundles split APKs per ABI.
+
+**ADB (Android Debug Bridge)** — the command-line bridge between your
+machine and a device/emulator. `adb shell`, `adb logcat`, `adb install`
+are the daily-driver commands.
+
+**AGP (Android Gradle Plugin)** — the Gradle plugin that adds the Android
+build pipeline. Versioned independently from Gradle itself.
+
+**AGSL (Android Graphics Shading Language)** — Android's runtime shader
+language (Android 13+), close to GLSL. Powers `RuntimeShader` and Compose
+`Modifier.graphicsLayer`.
+
+**AICore** — Android 14+ system service that hosts on-device foundation
+models (Gemini Nano) and exposes them to apps.
+
+**AOSP (Android Open Source Project)** — the open-source Android codebase.
+Source of truth for platform behavior.
+
+**APK** — the legacy install artifact. Still used for sideloading; Play
+prefers AAB.
+
+**ART (Android Runtime)** — the managed runtime that executes Android apps
+(replaced Dalvik in Android 5.0).
+
+---
+
+## B
+
+**Baseline Profile** — a list of methods AOT-compiled at install time to
+reduce cold-start jank. Generated via the Baseline Profile Gradle Plugin.
+
+**Binder** — Android's IPC mechanism; the kernel driver behind every
+`Service`, `ContentProvider`, and system API call.
+
+**BoM (Bill of Materials)** — a Gradle artifact pinning a set of versioned
+libraries together (e.g., `compose-bom`, `firebase-bom`). You depend on
+the BoM, then declare libraries without versions.
+
+**Bound Service** — a service exposing a binder interface to other
+processes. Largely superseded by AIDL + Binder or system APIs.
+
+---
+
+## C
+
+**CameraX** — the modern Jetpack camera library. Abstracts vendor quirks,
+provides preview/capture/analysis use cases.
+
+**Capability** — in App Actions / Assistant, a declared verb your app
+supports (`actions.intent.START_EXERCISE`).
+
+**Channel** *(Kotlin)* — a coroutine-friendly queue for streaming values
+between coroutines. Used by Flow's hot variants and concurrency patterns.
+
+**Clean Architecture** — layered architecture with strict dependency rules:
+domain at the center, application/data wrapped around it. See
+[Clean Architecture](/docs/architecture/clean-architecture).
+
+**ColdFlow / HotFlow** — Cold flows produce values per-collector and stop
+when nobody collects. Hot flows (StateFlow, SharedFlow, Channel) run
+independent of collectors.
+
+**Compose Compiler** — Kotlin compiler plugin that rewrites `@Composable`
+functions to support positional memoization and recomposition.
+
+**Compose Runtime** — the recomposition engine. Manages the slot table,
+gap buffer, and recomposer scopes.
+
+**Coroutine** — a suspendable computation. Lightweight thread alternative
+managed by a `CoroutineDispatcher`.
+
+**CSP (Coroutine Structured Concurrency)** — invariant that parents wait
+for children, exceptions propagate, cancellation propagates. Achieved via
+`CoroutineScope`.
+
+---
+
+## D
+
+**Dalvik** — the predecessor to ART. Used register-based bytecode (`.dex`)
+optimized for low-memory devices. Replaced in Android 5.0.
+
+**DataStore** — Jetpack key-value or typed persistence library. Two
+flavors: `Preferences DataStore` (key-value) and `Proto DataStore` (typed
+via protobuf). Replaces `SharedPreferences`.
+
+**DCS (Dependency Constraint Set)** — Gradle mechanism enforcing library
+version alignment across modules.
+
+**DevEx (Developer Experience)** — qualitative measure of how productive
+your tooling, build, and review processes are.
+
+**DI (Dependency Injection)** — providing dependencies from outside rather
+than constructing them inside. See [Dependency Injection](/docs/architecture/dependency-injection).
+
+**Doze** — power-saving state when the device is unplugged and stationary.
+Background work is batched into maintenance windows.
+
+**Dynamic Feature Module (DFM)** — Play-delivered module installed
+on-demand. Useful for large optional features (e.g., AR mode).
+
+---
+
+## E
+
+**EditText** — legacy text input view. Use `TextField` in Compose.
+
+**Either / Result / Outcome** — value types for typed error returns. See
+[Error Handling](/docs/architecture/error-handling).
+
+**EncryptedSharedPreferences** — Jetpack Security wrapper around
+`SharedPreferences` using Tink + Keystore.
+
+**Espresso** — instrumented UI testing framework. Runs on a real device or
+emulator, synchronizes with the main thread.
+
+---
+
+## F
+
+**Fastlane** — Ruby tool that automates the release pipeline (screenshots,
+Play upload, signing, changelogs). See [Fastlane](/docs/cicd-devops/fastlane).
+
+**FCM (Firebase Cloud Messaging)** — Google's push notification service.
+Foundation for any real-time messaging.
+
+**Flow** *(Kotlin)* — asynchronous cold stream of values. Backbone of
+reactive data in modern Android. See
+[Coroutines & Flow deep-dive](/docs/kotlin-foundation/coroutines-deep-dive).
+
+**Fragment** — UI controller with its own lifecycle. Largely replaced by
+Navigation Compose, but still used in legacy stacks and bottom-sheet
+patterns.
+
+---
+
+## G
+
+**Gemini Nano** — Google's on-device LLM, accessed via AICore. Optimized
+for Pixel 8+ tensor chips.
+
+**GMS (Google Mobile Services)** — proprietary Google APIs (Play Services,
+Maps, etc.) that ship on certified devices. Not on AOSP-only forks.
+
+**GPS (Generic Provider Sandbox)** — emerging Android privacy primitive
+for app-shared identifiers.
+
+**Gradle** — JVM build tool with declarative DSL (Kotlin or Groovy). The
+Android build system.
+
+---
+
+## H
+
+**Hilt** — Jetpack's opinionated Dagger wrapper. Provides standard scopes
+(`@Singleton`, `@ActivityRetainedScoped`, etc.) and component generation.
+See [Dependency Injection](/docs/architecture/dependency-injection).
+
+**HSM (Hardware Security Module)** — secure element used for key storage.
+On Android, the Trusted Execution Environment / StrongBox.
+
+---
+
+## I
+
+**IDE Inspections** — Android Studio's static analysis. Custom inspections
+let teams enforce conventions. See
+[Android Studio Mastery](/docs/developer-productivity/android-studio-mastery).
+
+**Idling Resource** — Espresso mechanism for telling the test framework
+"I'm still busy, wait." Use sparingly; prefer dispatchers under test.
+
+**Immutable** — values that cannot change after construction. Compose
+relies on immutable inputs to skip recomposition.
+
+**Inline class** — Kotlin's zero-cost value wrapper (`@JvmInline value
+class`). Useful for typed primitives without boxing.
+
+**Intent** — message describing an operation to perform. Explicit intents
+target a class; implicit intents target a verb (`ACTION_VIEW`).
+
+**IPC (Inter-Process Communication)** — see Binder.
+
+---
+
+## J
+
+**JankStats** — Jetpack library that surfaces frame drops to your code
+(and Crashlytics) in production. See [Jank Hunting](/docs/performance/jank-hunting).
+
+**JetBrains Compose** — Compose Multiplatform — Compose for desktop, iOS,
+web (in preview).
+
+**JVM** — Java Virtual Machine. Kotlin compiles to JVM bytecode on
+Android, then to DEX for ART.
+
+---
+
+## K
+
+**kapt** — Kotlin Annotation Processing Tool. Slow legacy preprocessor.
+Migrate to KSP. See [Migration Playbooks](/docs/reference/migration-playbooks).
+
+**Keystore** — Android's hardware-backed key storage. Use for any
+long-lived secret.
+
+**KMP (Kotlin Multiplatform)** — Kotlin's cross-platform technology.
+Share `commonMain` code across Android, iOS, JVM, JS, native. See
+[KMP deep-dive](/docs/advanced-trending/kmp-deep-dive).
+
+**Konsist** — static analysis library that enforces architecture rules in
+Kotlin tests (e.g., "domain layer must not import Android").
+
+**Kotlin DSL** — Gradle build scripts in Kotlin (`.kts`) instead of
+Groovy.
+
+**KSP (Kotlin Symbol Processing)** — fast, modern annotation processor
+from JetBrains. Replaces kapt.
+
+**ktlint / detekt** — code formatters / static analyzers for Kotlin.
+
+---
+
+## L
+
+**LaunchedEffect** — Compose side-effect API that runs a coroutine tied to
+composition lifecycle and a key set.
+
+**LayoutNode** — Compose's internal node type representing a composable's
+position in the layout tree.
+
+**LeakCanary** — runtime memory-leak detector. Drop-in dependency, dumps
+heap when retained references are found. See
+[Memory & Leaks](/docs/performance/memory-leakcanary).
+
+**Lifecycle (Jetpack)** — observable state machine for activities,
+fragments, and arbitrary owners (`LifecycleOwner`).
+
+**Logcat** — Android's log buffer. Filtered with tag/priority/package.
+`adb logcat -s MyTag` from CLI.
+
+---
+
+## M
+
+**Macrobenchmark** — Jetpack library that measures cold-start, scroll
+jank, and other UX metrics in CI. See [Baseline Profiles](/docs/performance/baseline-profiles).
+
+**Material 3 (M3)** — Google's current design system. Compose has
+first-class `material3` artifacts.
+
+**Media3** — Jetpack media stack (ExoPlayer + MediaSession + Cast). See
+[Media3](/docs/graphics-media/media3-exoplayer).
+
+**MASVS (Mobile Application Security Verification Standard)** — OWASP
+standard for mobile app security. See
+[Security & Compliance](/docs/security-compliance/overview).
+
+**MVI (Model-View-Intent)** — UDF pattern with explicit intents and a
+single state object. See [MVI & State Machines](/docs/architecture-patterns/mvi-state-machines).
+
+**MVP / MVVM** — earlier UI patterns. Compose strongly favors MVVM with
+StateFlow.
+
+---
+
+## N
+
+**NavController** — the Navigation library's central state holder for the
+back stack.
+
+**Navigation Compose** — type-safe routing on top of Compose. Latest
+versions support `@Serializable` route types.
+
+**NDK (Native Development Kit)** — toolchain for C/C++ on Android. Used
+for performance-critical code and porting native libraries.
+
+**Notification Channel** — required since Android 8.0 (Oreo). Users can
+mute per-channel.
+
+---
+
+## O
+
+**OkHttp** — Square's HTTP client. The default networking stack on
+Android. Foundation for Retrofit.
+
+**OpenTelemetry (OTel)** — vendor-neutral observability standard (traces,
+metrics, logs). See [OpenTelemetry](/docs/observability/opentelemetry).
+
+**OWASP** — Open Web Application Security Project. Producers of MASVS,
+MSTG, etc.
+
+---
+
+## P
+
+**Paging 3** — Jetpack pagination library. Compose has `LazyPagingItems`.
+See [Paging](/docs/networking-api/paging-3).
+
+**Paparazzi** — Square's screenshot testing library that runs without an
+emulator (renders to PNG via host-side LayoutLib).
+
+**PendingIntent** — wrapped intent given to another process to execute on
+your behalf (notifications, alarms, widgets).
+
+**Play Integrity API** — Google's anti-tampering / device-attestation
+service. See [Play Integrity](/docs/security-compliance/play-integrity).
+
+**Process** — OS-level process. Most apps run in a single process, but
+services can specify `android:process` for isolation.
+
+**ProGuard / R8** — bytecode shrinkers. R8 is the modern default; merges
+with the build and supports D8 desugaring.
+
+**Provisioned** — device state: fully set up by user (vs. setup wizard).
+
+---
+
+## Q
+
+**Quick Settings Tile** — tile in the system pull-down. Implemented as a
+`TileService`.
+
+---
+
+## R
+
+**R8** — Android's modern code shrinker, optimizer, and obfuscator.
+Supersedes ProGuard.
+
+**Recomposition** — Compose's process of re-running parts of the UI tree
+when state changes. The unit is the *composable invocation*, not the
+function.
+
+**Recomposer** — the Compose runtime object that schedules recomposition
+work.
+
+**remember** — Compose API that stores a value across recompositions.
+
+**rememberSaveable** — `remember` variant that survives configuration
+changes / process death.
+
+**Renderscript** — deprecated GPU compute API. Replaced by AGSL and Vulkan
+compute.
+
+**Retrofit** — Square's type-safe HTTP client. Generates implementations
+from interfaces. See [Retrofit deep-dive](/docs/networking-api/retrofit-okhttp-deep-dive).
+
+**Room** — Jetpack's SQLite abstraction. Compile-time SQL validation,
+Flow integration, migration tooling.
+
+---
+
+## S
+
+**SAF (Storage Access Framework)** — system file picker / document
+provider model. Required for cross-app file access on modern Android.
+
+**Scoped Storage** — Android 10+ model isolating apps to their own
+sandboxed storage. Reads to shared media go via MediaStore.
+
+**SDK Version** — `minSdk`, `targetSdk`, `compileSdk` in `build.gradle`.
+
+**Service** — long-running background component. Use WorkManager for
+deferrable work; foreground services for user-visible work.
+
+**SideEffect** — Compose API for synchronizing composition with the
+outside world after a successful composition.
+
+**Slot Table** — Compose's gap-buffer-backed structure storing
+composition state.
+
+**StateFlow** — hot, conflated, observable state holder. The Compose-era
+default for UI state.
+
+**StrongBox** — keystore implementation backed by tamper-resistant
+hardware (Titan M / equivalent).
+
+**Stable** — Compose annotation hinting that a type's equality is
+consistent — enables skipping recomposition.
+
+---
+
+## T
+
+**Tab Layout** — material tab bar (legacy `TabLayout` view or Compose
+`ScrollableTabRow`).
+
+**TalkBack** — Android's screen reader. Test every release against it.
+
+**TFLite (TensorFlow Lite)** — on-device ML runtime. See
+[ML Kit & TFLite](/docs/ai-ml/ml-kit-tensorflow).
+
+**Tink** — Google's cryptography library. Powers
+EncryptedSharedPreferences and EncryptedFile.
+
+**Toolchain** — set of tools used to build (JDK, Kotlin compiler, AGP,
+NDK).
+
+---
+
+## U
+
+**UDF (Unidirectional Data Flow)** — events flow up, state flows down.
+Universal in Compose architectures.
+
+**UI Automator** — system-level instrumentation framework. Used by
+Macrobenchmark.
+
+---
+
+## V
+
+**Vector Drawable** — XML-based scalable graphic. Build into M3 icons.
+For animated, use `AnimatedVectorDrawable`.
+
+**ViewModel (Jetpack)** — lifecycle-aware state holder, survives config
+changes. Hosts `viewModelScope` for coroutines.
+
+**VPN Service** — abstract service implementing a system VPN. Used by
+privacy / firewall apps.
+
+---
+
+## W
+
+**Wear OS** — Google's wearable platform, since Wear 3 also Compose-based.
+See [Wear & Health](/docs/advanced-trending/wear-health).
+
+**WebSocket** — full-duplex network connection. OkHttp ships first-class
+support.
+
+**WorkManager** — Jetpack's deferrable, guaranteed background job
+scheduler. Handles Doze, constraint chains, retry.
+
+---
+
+## X
+
+**XML Layouts** — legacy view-based UI definition format. Compose is the
+modern replacement; both interop. See
+[XML→Compose migration](/docs/reference/migration-playbooks).
+
+---
+
+## Y, Z
+
+*(reserved for future additions)*
+
+---
+
+## Cross-domain acronyms
+
+| Acronym | Stands for |
+|---------|-----------|
+| API     | Application Programming Interface |
+| BFF     | Backend For Frontend |
+| CDN     | Content Delivery Network |
+| CI/CD   | Continuous Integration / Continuous Delivery |
+| CRUD    | Create / Read / Update / Delete |
+| DAG     | Directed Acyclic Graph |
+| DTO     | Data Transfer Object |
+| GDPR    | General Data Protection Regulation |
+| GraphQL | Graph Query Language |
+| HIPAA   | Health Insurance Portability and Accountability Act |
+| JWT     | JSON Web Token |
+| LRU     | Least Recently Used |
+| MAU/DAU | Monthly / Daily Active Users |
+| OIDC    | OpenID Connect |
+| PII     | Personally Identifiable Information |
+| REST    | Representational State Transfer |
+| RPC     | Remote Procedure Call |
+| SLA/SLO/SLI | Service Level Agreement / Objective / Indicator |
+| SSL/TLS | Secure Sockets Layer / Transport Layer Security |
+| WCAG    | Web Content Accessibility Guidelines |
+
+---
+
+## Where to next
+
+- [Interview Question Bank](/docs/reference/interview-question-bank) — 130 questions across the curriculum
+- [Cheat Sheets](/docs/reference/cheat-sheets) — quick references for Compose, Coroutines, OkHttp, etc.
+- [Migration Playbooks](/docs/reference/migration-playbooks) — step-by-step migrations

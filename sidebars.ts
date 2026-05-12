@@ -83,7 +83,10 @@ const sidebars: SidebarsConfig = {
       collapsed: true,
       items: [
         'networking-api/overview',
+        'networking-api/retrofit-okhttp-deep-dive',
         'networking-api/graphql-websocket-grpc',
+        'networking-api/paging-3',
+        'networking-api/image-loading',
       ],
     },
     {
@@ -134,6 +137,9 @@ const sidebars: SidebarsConfig = {
       items: [
         'performance/overview',
         'performance/baseline-profiles',
+        'performance/memory-leakcanary',
+        'performance/jank-hunting',
+        'performance/apk-size',
       ],
     },
     {
@@ -163,7 +169,11 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Module 13 — Version Control',
       collapsed: true,
-      items: ['version-control/overview'],
+      items: [
+        'version-control/overview',
+        'version-control/git-workflows',
+        'version-control/code-review',
+      ],
     },
     {
       type: 'html',
@@ -205,6 +215,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'cicd-devops/overview',
         'cicd-devops/github-actions',
+        'cicd-devops/fastlane',
       ],
     },
     {
@@ -214,6 +225,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'observability/overview',
         'observability/opentelemetry',
+        'observability/crashlytics-performance',
       ],
     },
     {
@@ -233,6 +245,8 @@ const sidebars: SidebarsConfig = {
       items: [
         'career-interview/overview',
         'career-interview/system-design-walkthroughs',
+        'career-interview/coding-interview-patterns',
+        'career-interview/behavioral-negotiation',
       ],
     },
     {
@@ -259,6 +273,53 @@ const sidebars: SidebarsConfig = {
         'graphics-media/graphics-rendering',
         'graphics-media/media3-exoplayer',
         'graphics-media/battery-power',
+      ],
+    },
+    {
+      type: 'html',
+      value: '<div class="sidebar-divider"><span>Library & Open Source</span></div>',
+      defaultStyle: true,
+    },
+    {
+      type: 'category',
+      label: 'Library & Open Source',
+      collapsed: true,
+      items: [
+        'library-ecosystem/overview',
+        'library-ecosystem/publishing-libraries',
+        'library-ecosystem/open-source-contribution',
+      ],
+    },
+    {
+      type: 'html',
+      value: '<div class="sidebar-divider"><span>Industry Domains</span></div>',
+      defaultStyle: true,
+    },
+    {
+      type: 'category',
+      label: 'Industry-Specific Patterns',
+      collapsed: true,
+      items: [
+        'industry-domains/overview',
+        'industry-domains/fintech',
+        'industry-domains/healthcare',
+        'industry-domains/ecommerce-gaming',
+        'industry-domains/case-studies',
+      ],
+    },
+    {
+      type: 'html',
+      value: '<div class="sidebar-divider"><span>Developer Productivity</span></div>',
+      defaultStyle: true,
+    },
+    {
+      type: 'category',
+      label: 'Developer Productivity',
+      collapsed: true,
+      items: [
+        'developer-productivity/overview',
+        'developer-productivity/android-studio-mastery',
+        'developer-productivity/ab-testing-experimentation',
       ],
     },
     {
@@ -313,6 +374,18 @@ const sidebars: SidebarsConfig = {
         'patterns/kotlin-idiomatic-patterns',
         'patterns/state-patterns',
         'patterns/component-patterns',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Quick Reference',
+      collapsed: true,
+      items: [
+        'reference/overview',
+        'reference/interview-question-bank',
+        'reference/cheat-sheets',
+        'reference/glossary',
+        'reference/migration-playbooks',
       ],
     },
   ],

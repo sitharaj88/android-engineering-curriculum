@@ -1,0 +1,59 @@
+---
+id: overview
+title: Reference
+sidebar_label: Overview
+description: Quick references for working Android engineers — interview question bank, cheat sheets, glossary, and migration playbooks.
+slug: /reference
+---
+
+import { Callout, FeatureGrid } from '@site/src/components/Doc';
+
+<div className="module-info">
+  <span><strong>Section:</strong> Reference</span>
+  <span><strong>Topics:</strong> 4 living docs</span>
+  <span><strong>Use:</strong> Daily lookup</span>
+</div>
+
+# Reference
+
+This section is the **daily-driver** part of the curriculum: short
+lookups, not long-form reading. Bookmark the pages you reach for during
+interviews, migrations, or pair-programming.
+
+<FeatureGrid columns={2} features={[
+  { icon: '🎯', title: 'Interview Question Bank', description: '130 questions across Kotlin, Compose, architecture, networking, data, performance, security, testing, system design, and behavioral.' },
+  { icon: '📋', title: 'Cheat Sheets', description: 'Compose state APIs, side effects, Coroutines, Flow operators, Hilt scopes, Modifier order, Room, OkHttp/Retrofit, WorkManager, ADB, Android Studio shortcuts.' },
+  { icon: '📖', title: 'Glossary', description: 'Alphabetical reference for every acronym and API name used across the curriculum.' },
+  { icon: '🔀', title: 'Migration Playbooks', description: 'Step-by-step: Java→Kotlin, XML→Compose, kapt→KSP, Dagger→Hilt, LiveData→StateFlow, RxJava→Coroutines, Gradle Groovy→Kotlin DSL.' }
+]} />
+
+## How to use this section
+
+<Callout type="tip">
+These pages are designed for **scan-reading**, not start-to-finish. Use
+`Cmd/Ctrl + F` to jump straight to what you need.
+</Callout>
+
+- **Preparing for interviews?** Work the [Question Bank](/docs/reference/interview-question-bank)
+  cover-to-cover; expect each question to take 3-5 minutes of out-loud
+  practice.
+- **Stuck on a syntax?** The [Cheat Sheets](/docs/reference/cheat-sheets)
+  are the fastest path to the right incantation.
+- **Don't know what a term means?** [Glossary](/docs/reference/glossary)
+  has one-line definitions plus links to the chapter that teaches it.
+- **Modernizing a legacy codebase?** [Migration Playbooks](/docs/reference/migration-playbooks)
+  walk you through the safe sequence — and the gotchas — for each common
+  migration.
+
+## Living documents
+
+These pages evolve faster than the curriculum chapters. When a new
+Compose API ships or a deprecation lands, the cheat sheets get patched
+first. Treat them as the most current source of truth.
+
+## Pages
+
+- **[Interview Question Bank](/docs/reference/interview-question-bank)** — 130 questions with talking-point answers across every domain.
+- **[Cheat Sheets](/docs/reference/cheat-sheets)** — Compose, Coroutines, Flow, Hilt, Room, OkHttp, WorkManager, ADB, Android Studio.
+- **[Glossary](/docs/reference/glossary)** — A through W, every acronym used in the curriculum, plus a cross-domain acronym table.
+- **[Migration Playbooks](/docs/reference/migration-playbooks)** — Java→Kotlin, XML→Compose, kapt→KSP, Dagger→Hilt, LiveData→StateFlow, RxJava→Coroutines, AsyncTask, Gradle DSL, SharedPreferences, WorkManager.
